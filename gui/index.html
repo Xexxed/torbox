@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Torbox Downloader - Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" width="24" height="24">
+                        <path fill="#04BF8A" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+                    </svg>
+                </div>
+                <div class="logo-text">
+                    <h2>Torbox</h2>
+                    <span>v1.0.4</span>
+                </div>
+            </div>
+            
+            <nav class="sidebar-menu">
+                <a href="#" class="menu-item active" onclick="switchTab('dashboard')">
+                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+                    <span>Dashboard</span>
+                </a>
+                <a href="#" class="menu-item" onclick="switchTab('completed')">
+                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                    <span>Completed</span>
+                </a>
+                <a href="#" class="menu-item" onclick="switchTab('logs')">
+                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M13 3H6c-1.1 0-2 .9-2 2v14c0 1.1.89 2 1.99 2H19c1.1 0 2-.9 2-2V8l-6-6zm4 16H7v-2h10v2zm0-4H7v-2h10v2zm-3-4H7V9h7v2zm-1.5-6v4.5h4.5L12.5 5z"/></svg>
+                    <span>System Logs</span>
+                </a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="menu-item" id="account-status">
+                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
+                    <span>Account</span>
+                </div>
+                <a href="#" class="menu-item logout" onclick="triggerLogout()">
+                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+                    <span>Logout</span>
+                </a>
+            </div>
+        </aside>
+
+        <!-- Main Body -->
+        <main class="main-content">
+            <!-- Header section -->
+            <header class="app-header">
+                <div class="header-left">
+                    <h1 id="page-title">Torbox Downloader</h1>
+                </div>
+                
+                <div class="header-center">
+                    <div class="cookie-input-box">
+                        <label for="session-token-input">Cookie / Session Token</label>
+                        <div class="input-wrapper">
+                            <input type="password" id="session-token-input" placeholder="Enter Torbox session token..." />
+                            <button id="login-btn" onclick="saveSettings()">Login</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="header-right">
+                    <div class="icon-btn" title="Help"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="#9CA3AF" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg></div>
+                    <div class="icon-btn" title="Settings"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="#9CA3AF" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0-.44-.17-.47-.41l-.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></div>
+                </div>
+            </header>
+
+            <!-- Page Views (Tab Content) -->
+            <div class="tab-content" id="dashboard-view">
+                <div class="dashboard-grid">
+                    <!-- Left Column: Queue Management -->
+                    <div class="card torrent-queue-card">
+                        <div class="card-header">
+                            <h3>Torrent Queue</h3>
+                            <span class="badge" id="queue-count">0 TOTAL</span>
+                        </div>
+                        
+                        <div class="queue-list" id="queue-container">
+                            <div class="empty-state">
+                                <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                                <p>No torrents in queue.</p>
+                                <span>Paste a session token, then click "Start Download" to scan your Torbox downloads list and begin downloading completed torrent folders.</span>
+                            </div>
+                        </div>
+
+                        <div class="card-footer">
+                            <button class="btn btn-primary btn-large" id="start-btn" onclick="toggleDownloadProcess()">
+                                <svg viewBox="0 0 24 24" width="18" height="18" class="btn-icon"><path d="M8 5v14l11-7z"/></svg>
+                                <span id="start-btn-text">Start Download</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Right Column: System Status, Path & Real-time Console -->
+                    <div class="right-column">
+                        <!-- Path Card -->
+                        <div class="card path-card">
+                            <div class="card-header">
+                                <h3><svg viewBox="0 0 24 24" width="18" height="18" class="header-icon"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg> Destination Management</h3>
+                            </div>
+                            <div class="card-body">
+                                <label for="download-path-input">Local PC Download Path</label>
+                                <div class="path-input-wrapper">
+                                    <input type="text" id="download-path-input" value="downloads" placeholder="E.g., D:\Downloads\torbox" />
+                                    <button class="btn btn-secondary" onclick="saveSettings()">Change Location</button>
+                                </div>
+                                <div style="display: flex; gap: 16px; margin-top: 14px; margin-bottom: 14px;">
+                                    <div style="flex: 1;">
+                                        <label for="parallel-downloads-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Parallel Files</label>
+                                        <select id="parallel-downloads-input" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;">
+                                            <option value="1">1 (Sequential)</option>
+                                            <option value="2">2 Files</option>
+                                            <option value="3">3 Files</option>
+                                            <option value="4">4 Files</option>
+                                            <option value="5">5 Files</option>
+                                        </select>
+                                    </div>
+                                    <div style="flex: 1;">
+                                        <label for="delay-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Delay Between Files (s)</label>
+                                        <input type="number" id="delay-input" min="0" max="60" value="5" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;" />
+                                    </div>
+                                </div>
+                                <div class="path-stats">
+                                    <span class="stat-item"><span class="dot emerald"></span> Free Space: <strong id="free-space-val">Scanning...</strong></span>
+                                    <span class="stat-item"><span class="dot blue"></span> Mount Point: Local PC</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Console Logs Card -->
+                        <div class="card console-card">
+                            <div class="card-header flex-header">
+                                <div class="tabs-sub">
+                                    <span class="sub-tab active" id="sub-tab-currently" onclick="switchConsoleTab('currently')">Currently downloading</span>
+                                    <span class="sub-tab" id="sub-tab-system" onclick="switchConsoleTab('system')">System Logs</span>
+                                </div>
+                                <div class="window-controls">
+                                    <span class="w-dot red"></span>
+                                    <span class="w-dot yellow"></span>
+                                    <span class="w-dot green"></span>
+                                </div>
+                            </div>
+                            <div class="console-body" id="console-logs">
+                                <div class="console-line text-muted">[2026-07-04 12:00:00] INFO: Torbox Downloader dashboard initialized.</div>
+                            </div>
+                            <div class="console-footer">
+                                <div class="console-actions">
+                                    <button onclick="clearConsoleLogs()" class="clear-btn">Clear Console</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Completed View -->
+            <div class="tab-content hidden" id="completed-view">
+                <div class="card full-width-card">
+                    <div class="card-header">
+                        <h3>Completed Downloads</h3>
+                    </div>
+                    <div class="card-body">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Filename</th>
+                                    <th>Folder / Path</th>
+                                    <th>Size</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="completed-table-body">
+                                <tr>
+                                    <td colspan="4" class="text-center text-muted">No completed downloads in this session yet.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logs View -->
+            <div class="tab-content hidden" id="logs-view">
+                <div class="card full-width-card logs-full-card">
+                    <div class="card-header flex-header">
+                        <h3>Full Raw System Logs</h3>
+                        <button onclick="clearConsoleLogs()" class="btn btn-secondary btn-sm">Clear All Logs</button>
+                    </div>
+                    <div class="console-body full-height" id="full-raw-logs">
+                        <div class="console-line text-muted">No raw logs collected yet.</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <div id="toast-container"></div>
+    <script src="app.js"></script>
+</body>
+</html>
