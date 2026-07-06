@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class AppState:
     def __init__(self):
         self.lock = threading.Lock()
+        self.fetch_lock = threading.Lock()  # Serialize fetch_structure browser launches
         self.token = ""
         self.dest_dir = "downloads"
         self.delay = 5
@@ -207,13 +208,33 @@ def scan_torrents_background(token, browser_type, headless):
             context = browser.new_context(viewport={'width': 1280, 'height': 800})
             page = context.new_page()
             
-            # Inject token
-            page.goto("https://torbox.app/login", wait_until="load", timeout=30000)
+            def route_blocker(route):
+                req_url = route.request.url.lower()
+                if "torbox.app" in req_url:
+                    route.continue_()
+                    return
+                if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
+                    route.abort()
+                else:
+                    route.continue_()
+            page.route("**/*", route_blocker)
+            
+            # Inject token fast via commit wait
+            page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
             page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
             page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
             
-            page.goto("https://torbox.app/download", wait_until="load", timeout=60000)
-            page.wait_for_timeout(4000)
+            page.goto("https://torbox.app/download", wait_until="domcontentloaded", timeout=60000)
+            
+            # Handle auth handshake redirect
+            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                page.wait_for_timeout(2000)
+                page.goto("https://torbox.app/download", wait_until="domcontentloaded", timeout=60000)
+                
+            try:
+                page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
+            except Exception:
+                pass
             
             html = page.content()
             detector = TorboxDetector(html)
@@ -229,7 +250,7 @@ def scan_torrents_background(token, browser_type, headless):
     except Exception as e:
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")
 
-def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1):
+def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None):
     app_state.set_status("scanning")
     app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Initializing Torbox Engine...")
     
@@ -267,7 +288,8 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             file_scraped_callback=file_scraped_cb,
             status_update_callback=status_update_cb,
             target_torrent_name=target_torrent_name,
-            max_parallel_files=max_parallel_files
+            max_parallel_files=max_parallel_files,
+            selected_files=selected_files
         )
         app_state.set_status("finished")
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")
@@ -363,6 +385,47 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
             return
 
+        elif self.path == "/api/fetch_structure":
+            url = params.get("url", "https://torbox.app/download")
+            torrent_name = params.get("torrent_name")
+            token = params.get("token") or app_state.token
+            
+            if not token or not torrent_name:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Missing token or torrent_name"}).encode("utf-8"))
+                return
+                
+            from main import get_torrent_files_structure
+            # Serialize browser launches to prevent concurrent Chromium instances from crashing
+            if not app_state.fetch_lock.acquire(blocking=False):
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Another fetch is in progress. Please wait."}).encode("utf-8"))
+                return
+            try:
+                files = get_torrent_files_structure(
+                    token=token,
+                    url=url,
+                    target_torrent_name=torrent_name,
+                    browser_type=app_state.browser_type,
+                    headless=app_state.headless
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "files": files}).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+            finally:
+                app_state.fetch_lock.release()
+            return
+
         elif self.path == "/api/start":
             if app_state.status in ["scanning", "downloading"]:
                 self.send_response(400)
@@ -374,8 +437,8 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             app_state.error_message = ""
             url = params.get("url", "https://torbox.app/download")
             torrent_name = params.get("torrent_name", None)
+            selected_files = params.get("selected_files", None)
             
-            # Start background scraping/download thread
             t = threading.Thread(
                 target=downloader_worker,
                 args=(
@@ -386,7 +449,8 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     app_state.browser_type,
                     app_state.token,
                     torrent_name,
-                    app_state.max_parallel_files
+                    app_state.max_parallel_files,
+                    selected_files
                 ),
                 daemon=True
             )

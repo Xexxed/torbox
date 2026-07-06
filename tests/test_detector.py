@@ -201,5 +201,27 @@ class TestDashboardExclusion(unittest.TestCase):
         self.assertEqual(files[1]['name'], "read me.txt")
         self.assertEqual(files[1]['path'], ["Bob Hearts Abishola S01"])
 
+class TestSelectiveDownloads(unittest.TestCase):
+    def test_selected_files_path_filtering(self):
+        # Mock file list as returned by TorboxDetector.parse_structure()
+        files = [
+            {"name": "file1.txt", "path": ["TorrentFolder"]},
+            {"name": "file2.txt", "path": ["TorrentFolder", "Subdir"]},
+            {"name": "file3.txt", "path": ["TorrentFolder", "Subdir", "Nested"]},
+        ]
+        
+        # Test 1: select only file2.txt by its relative path
+        selected_files_1 = ["TorrentFolder/Subdir/file2.txt"]
+        filtered_1 = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files_1]
+        self.assertEqual(len(filtered_1), 1)
+        self.assertEqual(filtered_1[0]['name'], "file2.txt")
+        
+        # Test 2: select multiple files
+        selected_files_2 = ["TorrentFolder/file1.txt", "TorrentFolder/Subdir/Nested/file3.txt"]
+        filtered_2 = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files_2]
+        self.assertEqual(len(filtered_2), 2)
+        self.assertEqual(filtered_2[0]['name'], "file1.txt")
+        self.assertEqual(filtered_2[1]['name'], "file3.txt")
+
 if __name__ == '__main__':
     unittest.main()

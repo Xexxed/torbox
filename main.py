@@ -230,7 +230,91 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
     executor.shutdown(wait=False)
     return torrent_success
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1):
+def get_torrent_files_structure(token, url, target_torrent_name, browser_type='chromium', headless=True):
+    from playwright.sync_api import sync_playwright
+    from torbox_downloader.detector import TorboxDetector
+    
+    with sync_playwright() as p:
+        browser_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled"
+        ]
+        engine = getattr(p, browser_type)
+        launch_args = browser_args if browser_type == 'chromium' else []
+        
+        try:
+            browser = engine.launch(headless=headless, args=launch_args)
+        except Exception:
+            browser = engine.launch(headless=headless)
+            
+        context = browser.new_context(
+            viewport={'width': 1280, 'height': 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        
+        page = context.new_page()
+        
+        def route_blocker(route):
+            req_url = route.request.url.lower()
+            if "torbox.app" in req_url:
+                route.continue_()
+                return
+            if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
+                route.abort()
+            else:
+                route.continue_()
+        page.route("**/*", route_blocker)
+        
+        if token:
+            try:
+                page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
+                page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
+                page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
+            except Exception as e:
+                print(f"Failed to inject session token during fetch: {e}")
+                
+        print(f"Fetch structure - Navigating to: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        
+        # Handle auth handshake redirect
+        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+            if token:
+                page.wait_for_timeout(2000)
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        
+        try:
+            page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
+        except Exception:
+            pass
+            
+        html_content = page.content()
+        detector = TorboxDetector(html_content)
+        
+        # Locate the card download button directly via the target torrent name
+        title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=target_torrent_name).last
+        card = title_el
+        for _ in range(10):
+            card = card.locator("..")
+            if card.locator("button[title='Download files']").count() > 0:
+                break
+        btn_to_click = card.locator("button[title='Download files']").first
+        
+        if btn_to_click.count() > 0:
+            btn_to_click.evaluate("el => el.click()")
+            try:
+                page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
+            except Exception:
+                pass
+                
+        html_content = page.content()
+        detector.set_html(html_content)
+        files = detector.parse_structure()
+        
+        browser.close()
+        return files
+
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None):
     """
     Runs the full automation workflow:
     1. Launches Playwright browser context.
@@ -256,18 +340,10 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
         launch_args = browser_args if browser_type == 'chromium' else []
         
         try:
-            if browser_type == 'chromium':
-                browser = engine.launch(
-                    headless=headless,
-                    channel="chrome",
-                    args=launch_args
-                )
-                print("Successfully launched system Google Chrome.")
-            else:
-                browser = engine.launch(headless=headless)
-                print(f"Successfully launched {browser_type}.")
+            browser = engine.launch(headless=headless, args=launch_args)
+            print(f"Successfully launched {browser_type}.")
         except Exception as e:
-            logger.warning(f"Could not launch browser with default channel: {e}. Falling back to default launch.")
+            logger.warning(f"Could not launch browser: {e}. Falling back to default launch.")
             browser = engine.launch(headless=headless)
         
         context = browser.new_context(
@@ -278,11 +354,21 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
         
         page = context.new_page()
         
+        def route_blocker(route):
+            req_url = route.request.url.lower()
+            if "torbox.app" in req_url:
+                route.continue_()
+                return
+            if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
+                route.abort()
+            else:
+                route.continue_()
+        page.route("**/*", route_blocker)
+        
         if token:
             print(f"Injecting session token into localStorage for Torbox...")
             try:
-                page.goto("https://torbox.app/login", wait_until="load", timeout=30000)
-                page.wait_for_timeout(1000)
+                page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
                 
                 page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
                 page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
@@ -298,42 +384,20 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                 print(f"Failed to inject session token: {e}")
                 
         print(f"Navigating to: {url}")
-        page.goto(url, wait_until="load", timeout=60000)
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
         
-        if token:
-            print("Waiting for authentication handshake...")
-            page.wait_for_timeout(3000)
-        
-        # Check if we are on login page
+        # Handle auth handshake redirect
         if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
             if token:
-                print("[*] Detected redirect to login page. Attempting token authentication reload...")
                 page.wait_for_timeout(2000)
-                # Try navigating to target url again
-                print(f"Re-navigating to: {url}")
-                page.goto(url, wait_until="load", timeout=60000)
-                page.wait_for_timeout(2000)
-                
-        # Check if we are still on login page
-        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-            print("\n[!] Detected Torbox Login Page.")
-            if headless:
-                print("Cannot log in headlessly. Re-run this command with the --no-headless flag to log in manually first.")
-                browser.close()
-                return
-            else:
-                print("[*] Please log in to your Torbox account in the opened browser window.")
-                print("[*] After logging in and navigating back to the torrent files page, press ENTER here to continue...")
-                input()
-                # Re-check URL
-                if "login" in page.url.lower():
-                    print("Still on login page. Exiting.")
-                    browser.close()
-                    return
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
         
-        # Wait for the files container or content list to render
+        # Wait for either the dashboard list or active files list to render
         print("Analyzing current page state...")
-        page.wait_for_timeout(2000)
+        try:
+            page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
+        except Exception:
+            pass
         
         # Get active page HTML
         html_content = page.content()
@@ -367,22 +431,17 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                     print(f"\n[{idx + 1}/{len(torrents)}] Expanding torrent: {torrent['name']}")
                     btn_to_click = None
                     try:
-                        # Locate correct card button by finding ancestor containing torrent name
-                        buttons = page.locator("button[title='Download files']")
-                        count = buttons.count()
-                        for b_idx in range(count):
-                            candidate_btn = buttons.nth(b_idx)
-                            ancestor = candidate_btn.locator("xpath=ancestor::div[contains(@class, 'flex')][3]")
-                            if ancestor.count() > 0:
-                                ancestor_text = ancestor.first.inner_text()
-                                if torrent['name'].lower() in ancestor_text.lower():
-                                    btn_to_click = candidate_btn
-                                    break
-                                    
-                        if btn_to_click:
+                        title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent['name']).last
+                        card = title_el
+                        for _ in range(10):
+                            card = card.locator("..")
+                            if card.locator("button[title='Download files']").count() > 0:
+                                break
+                        btn_to_click = card.locator("button[title='Download files']").first
+                        if btn_to_click.count() > 0:
                             btn_to_click.evaluate("el => el.click()")
                             try:
-                                page.locator("button[title*='options'], button[title*='Options']").first.wait_for(state="visible", timeout=10000)
+                                page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
                             except Exception as wait_err:
                                 print(f"Timeout waiting for torrent details page: {wait_err}")
                         else:
@@ -394,12 +453,15 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                     detector.set_html(card_html)
                     files = detector.parse_structure()
                     
+                    if selected_files is not None:
+                        files = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files]
+                        
                     if not files:
-                        print(f"No files found inside torrent: {torrent['name']}")
+                        print(f"No matching files selected inside torrent: {torrent['name']}")
                         if status_update_callback:
                             status_update_callback(torrent['name'], 'failed', 0, 100, 0)
                         continue
-                    print(f"Scraped {len(files)} files inside {torrent['name']}.")
+                    print(f"Scraped {len(files)} matching/selected files inside {torrent['name']}.")
                     files_with_local_paths = create_folder_structure(dest_dir, files)
                     
                     torrent_success = download_files_pipeline(
@@ -452,10 +514,12 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                     detector.set_html(html_content)
                     files = detector.parse_structure()
                 
+        if selected_files is not None and files:
+            files = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files]
+            
         if not files:
-            print("[!] Could not detect any files on the page.")
-            print("Please make sure you are on the Torbox torrent download detail page (files list visible).")
-            # Let's save page HTML for debugging
+            print("[!] Could not detect any matching/selected files on the page.")
+            print("Please make sure you are on the Torbox torrent download detail page (files list visible) and have valid file selections.")
             debug_file = "torbox_debug.html"
             with open(debug_file, "w", encoding="utf-8") as f:
                 f.write(html_content)
@@ -463,7 +527,7 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             browser.close()
             return
             
-        print(f"Detected {len(files)} files and folder structures:")
+        print(f"Detected {len(files)} matching/selected files and folder structures:")
         for idx, f in enumerate(files):
             path_str = " / ".join(f['path'])
             print(f"  [{idx + 1}] {path_str} / {f['name']} ({f['size']})")

@@ -202,6 +202,46 @@
             </div>
         </main>
     </div>
+
+    <!-- Torrent Files Selection Modal -->
+    <div id="files-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Select Files to Download</h3>
+                <span class="close-modal" onclick="closeFilesModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="modal-loading-state" class="modal-loading-overlay">
+                    <div class="spinner"></div>
+                    <p>Scraping torrent files structure...</p>
+                </div>
+                <div id="modal-error-state" class="modal-error-container" style="display: none;">
+                    <div class="error-icon">⚠️</div>
+                    <p id="modal-error-msg">Failed to load files structure.</p>
+                    <button class="btn btn-secondary btn-sm" onclick="retryFetchStructure()">Retry</button>
+                </div>
+                <div id="modal-tree-content" style="display: none;">
+                    <div class="torrent-modal-details">
+                        <p>Torrent Name: <strong id="modal-torrent-name"></strong></p>
+                    </div>
+                    <div class="modal-actions-bar">
+                        <label class="select-all-label">
+                            <input type="checkbox" id="modal-select-all" checked onchange="toggleSelectAllFiles(this)" />
+                            <span>Select All Files</span>
+                        </label>
+                    </div>
+                    <div class="files-tree-container" id="modal-files-tree">
+                        <!-- Dynamic collapsible tree -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeFilesModal()">Cancel</button>
+                <button class="btn btn-primary" id="modal-download-btn" onclick="startSelectedDownload()" style="display: none;">Download Selected</button>
+            </div>
+        </div>
+    </div>
+
     <div id="toast-container"></div>
     <script src="app.js"></script>
 </body>

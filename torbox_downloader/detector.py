@@ -18,14 +18,13 @@ class TorboxDetector:
         
         for btn in self.soup.find_all('button', title='Download files'):
             parent = btn.parent
-            for _ in range(6):
-                if parent and parent.name == 'div':
+            while parent and parent.name not in ['body', 'html', '[document]']:
+                if parent.name == 'div':
                     title_el = parent.find('p', class_=re.compile(r'text-base|text-lg|font-semibold'))
                     if title_el:
                         card_containers.append((parent, btn, title_el))
                         break
-                if parent:
-                    parent = parent.parent
+                parent = parent.parent
                     
         seen_names = set()
         for container, btn, title_el in card_containers:
@@ -68,18 +67,18 @@ class TorboxDetector:
         for tag in self.soup.find_all(['style', 'script']):
             tag.decompose()
 
-        self.excluded_nodes = set()
+        # Use id()-based sets for O(1) identity lookups instead of O(N) deep equality
+        self._excluded_node_ids = set()
         for btn in self.soup.find_all('button', title='Download files'):
             parent = btn.parent
-            for _ in range(6):
-                if parent and parent.name == 'div':
+            while parent and parent.name not in ['body', 'html', '[document]']:
+                if parent.name == 'div':
                     title_el = parent.find(['p', 'span', 'div'], class_=re.compile(r'text-base|text-lg|font-semibold|truncate'))
                     if title_el or parent.find('button', title='Download files'):
-                        self.excluded_nodes.add(parent)
+                        self._excluded_node_ids.add(id(parent))
                         for desc in parent.descendants:
-                            self.excluded_nodes.add(desc)
-                if parent:
-                    parent = parent.parent
+                            self._excluded_node_ids.add(id(desc))
+                parent = parent.parent
 
         main_title = self._detect_main_title()
         
@@ -89,15 +88,23 @@ class TorboxDetector:
                 if self._is_file_row(el):
                     file_elements.append(el)
                     
-        leaf_file_elements = []
+        # Use id()-based set for O(1) leaf filtering
+        file_ids = set(id(el) for el in file_elements)
+        parent_ids = set()
         for el in file_elements:
-            is_leaf = True
-            for other in file_elements:
-                if other != el and other in el.descendants:
-                    is_leaf = False
-                    break
-            if is_leaf:
-                leaf_file_elements.append(el)
+            p = el.parent
+            while p and p.name not in ['body', 'html', '[document]']:
+                if id(p) in file_ids:
+                    parent_ids.add(id(p))
+                p = p.parent
+                
+        leaf_file_elements = [el for el in file_elements if id(el) not in parent_ids]
+
+        # Pre-compute file_row_ids for subfolder container checks
+        self._file_row_ids = set(id(el) for el in file_elements)
+        
+        # Cache subfolder container results by element id
+        self._subfolder_cache = {}
 
         files = []
         for el in leaf_file_elements:
@@ -149,7 +156,7 @@ class TorboxDetector:
         Determines if a DOM element represents a single file row without recursing.
         """
         # Exclude dashboard torrent card containers and any of their descendants
-        if hasattr(self, 'excluded_nodes') and element in self.excluded_nodes:
+        if id(element) in self._excluded_node_ids:
             return False
 
         text = element.get_text(separator=' ').strip()
@@ -161,24 +168,18 @@ class TorboxDetector:
         if not size_match:
             return False
 
-        # Must contain a download button/icon
-        has_download = False
+        # Single-pass child tag scan for maximum accuracy and speed
         download_indicators = ['download', 'dl-', 'btn', 'icon', 'svg']
-        for tag in ['button', 'a', 'div', 'svg']:
-            for item in element.find_all(tag):
-                classes = item.get('class', [])
-                if any(any(ind in str(cls).lower() for ind in download_indicators) for cls in classes):
-                    has_download = True
-                    break
-                for attr in ['id', 'aria-label', 'title']:
-                    val = item.get(attr, '')
-                    if any(ind in str(val).lower() for ind in download_indicators):
-                        has_download = True
-                        break
-            if has_download:
-                break
+        for item in element.find_all(['button', 'a', 'div', 'svg']):
+            classes = item.get('class', [])
+            if any(any(ind in str(cls).lower() for ind in download_indicators) for cls in classes):
+                return True
+            for attr in ['id', 'aria-label', 'title']:
+                val = item.get(attr, '')
+                if any(ind in str(val).lower() for ind in download_indicators):
+                    return True
 
-        return has_download
+        return False
 
     def _parse_file_row(self, element, current_path):
         """
@@ -219,8 +220,19 @@ class TorboxDetector:
 
     def _is_subfolder_container(self, element):
         """
-        Determines if a DOM element represents a subfolder box/card without recursing.
+        Determines if a DOM element represents a subfolder box/card.
+        Uses id()-based caching and pre-computed file_row_ids to avoid
+        expensive recursive _is_file_row() calls.
         """
+        eid = id(element)
+        if eid in self._subfolder_cache:
+            return self._subfolder_cache[eid]
+        
+        result = self._is_subfolder_container_impl(element)
+        self._subfolder_cache[eid] = result
+        return result
+    
+    def _is_subfolder_container_impl(self, element):
         if element.name != 'div':
             return False, None
 
@@ -245,34 +257,41 @@ class TorboxDetector:
                 if header_text and len(header_text) < 100:
                     return True, header_text
 
+        _FILE_EXTS = frozenset([
+            '.bin', '.exe', '.bat', '.rar', '.zip', '.mp4', '.url',
+            '.md5', '.ini', '.txt', '.sfv', '.nfo', '.pdf', '.mkv',
+            '.avi', '.iso', '.cfg', '.dat', '.pkg', '.png', '.jpg',
+            '.jpeg', '.gif', '.mp3', '.wav', '.flac'
+        ])
+        _SIZE_RE = re.compile(r'^\d+(?:\.\d+)?\s*(?:GB|MB|KB|B)$', re.I)
+
         # Fallback to direct children tags
         for tag in ['h3', 'h4', 'h5', 'div', 'span']:
             for header in element.find_all(tag, recursive=False):
                 header_text = header.text.strip()
                 if (header_text and len(header_text) < 100 and 
-                        not any(ext in header_text.lower() for ext in [
-                            '.bin', '.exe', '.bat', '.rar', '.zip', '.mp4', '.url',
-                            '.md5', '.ini', '.txt', '.sfv', '.nfo', '.pdf', '.mkv',
-                            '.avi', '.iso', '.cfg', '.dat', '.pkg', '.png', '.jpg',
-                            '.jpeg', '.gif', '.mp3', '.wav', '.flac'
-                        ]) and
-                        not re.match(r'^\d+(?:\.\d+)?\s*(?:GB|MB|KB|B)$', header_text, re.I)):
+                        not any(ext in header_text.lower() for ext in _FILE_EXTS) and
+                        not _SIZE_RE.match(header_text)):
                     return True, header_text
 
-        # Safe recursive fallback (excluding elements that are inside file rows)
+        # Safe recursive fallback using pre-computed file_row_ids (O(1) checks)
+        # instead of calling _is_file_row() which does expensive DOM traversals
         for tag in ['h3', 'h4', 'h5', 'div', 'span']:
             for header in element.find_all(tag):
-                if any(self._is_file_row(p) for p in header.parents if p != element):
+                # Check if any parent (up to this element) is a known file row
+                skip = False
+                p = header.parent
+                while p and p is not element:
+                    if id(p) in self._file_row_ids:
+                        skip = True
+                        break
+                    p = p.parent
+                if skip:
                     continue
                 header_text = header.text.strip()
                 if (header_text and len(header_text) < 100 and 
-                        not any(ext in header_text.lower() for ext in [
-                            '.bin', '.exe', '.bat', '.rar', '.zip', '.mp4', '.url',
-                            '.md5', '.ini', '.txt', '.sfv', '.nfo', '.pdf', '.mkv',
-                            '.avi', '.iso', '.cfg', '.dat', '.pkg', '.png', '.jpg',
-                            '.jpeg', '.gif', '.mp3', '.wav', '.flac'
-                        ]) and
-                        not re.match(r'^\d+(?:\.\d+)?\s*(?:GB|MB|KB|B)$', header_text, re.I)):
+                        not any(ext in header_text.lower() for ext in _FILE_EXTS) and
+                        not _SIZE_RE.match(header_text)):
                     return True, header_text
 
         return False, None

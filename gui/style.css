@@ -792,3 +792,293 @@ body {
     from { opacity: 0; transform: translateX(40px); }
     to { opacity: 1; transform: translateX(0); }
 }
+
+/* Modal Overlay & Modal Window */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(8px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+.modal-overlay.active {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.modal-content {
+    background: linear-gradient(135deg, #18181b 0%, #09090b 100%);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    width: 90%;
+    max-width: 650px;
+    max-height: 80vh;
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.8), 0 0 20px rgba(4, 191, 138, 0.15);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transform: scale(0.95);
+    transition: transform 0.3s ease;
+}
+
+.modal-overlay.active .modal-content {
+    transform: scale(1);
+}
+
+.modal-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-panel);
+}
+
+.modal-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.close-modal {
+    color: var(--text-muted);
+    font-size: 24px;
+    font-weight: 300;
+    cursor: pointer;
+    line-height: 1;
+    transition: color 0.2s;
+}
+
+.close-modal:hover {
+    color: var(--text-primary);
+}
+
+.modal-body {
+    padding: 24px;
+    overflow-y: auto;
+    flex-grow: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 250px;
+    position: relative;
+}
+
+.modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    background: var(--bg-panel);
+}
+
+/* Spinner / Loading state */
+.modal-loading-overlay {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(9, 9, 11, 0.9);
+    z-index: 10;
+    gap: 16px;
+}
+
+.spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid rgba(4, 191, 138, 0.1);
+    border-radius: 50%;
+    border-top-color: var(--accent-emerald);
+    animation: spin 1s ease-in-out infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.modal-loading-overlay p {
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+/* Error state inside modal */
+.modal-error-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    text-align: center;
+    gap: 16px;
+}
+
+.error-icon {
+    font-size: 48px;
+}
+
+.modal-error-container p {
+    color: var(--accent-red);
+    font-size: 14px;
+    max-width: 400px;
+}
+
+/* Actions / Info Bar */
+.torrent-modal-details {
+    margin-bottom: 16px;
+}
+
+.torrent-modal-details p {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+.torrent-modal-details strong {
+    color: var(--text-primary);
+}
+
+.modal-actions-bar {
+    display: flex;
+    align-items: center;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px dashed var(--border-color);
+}
+
+.select-all-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+/* Tree Structure styling */
+.files-tree-container {
+    border: 1px solid var(--border-color);
+    background-color: var(--bg-dark);
+    border-radius: 8px;
+    padding: 12px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+/* Custom Scrollbar for Modal and Tree */
+.files-tree-container::-webkit-scrollbar, .modal-body::-webkit-scrollbar {
+    width: 6px;
+}
+
+.files-tree-container::-webkit-scrollbar-track, .modal-body::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.files-tree-container::-webkit-scrollbar-thumb, .modal-body::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+}
+
+.files-tree-container::-webkit-scrollbar-thumb:hover, .modal-body::-webkit-scrollbar-thumb:hover {
+    background: rgba(4, 191, 138, 0.3);
+}
+
+.tree-node {
+    margin-bottom: 4px;
+}
+
+.tree-row {
+    display: flex;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+    user-select: none;
+    font-size: 13px;
+}
+
+.tree-row:hover {
+    background-color: rgba(255, 255, 255, 0.03);
+}
+
+.tree-toggle-icon {
+    width: 16px;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-right: 4px;
+    transition: transform 0.2s;
+}
+
+.tree-toggle-icon.expanded {
+    transform: rotate(90deg);
+}
+
+.tree-checkbox {
+    margin-right: 8px;
+    cursor: pointer;
+    accent-color: var(--accent-emerald);
+}
+
+.tree-item-icon {
+    margin-right: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.tree-item-icon svg {
+    width: 16px;
+    height: 16px;
+}
+
+.tree-item-icon.folder svg {
+    fill: #eab308; /* folder yellow color */
+}
+
+.tree-item-icon.file svg {
+    fill: var(--text-muted);
+}
+
+.tree-node-name {
+    flex-grow: 1;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tree-node-size {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-left: 12px;
+    white-space: nowrap;
+}
+
+.tree-children {
+    padding-left: 20px;
+    margin-left: 8px;
+    border-left: 1px dashed rgba(255, 255, 255, 0.05);
+}
+
+.tree-children.hidden {
+    display: none;
+}

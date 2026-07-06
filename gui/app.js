@@ -171,10 +171,10 @@ function saveSettings() {
 }
 
 // Trigger Start/Stop queue execution
+// Trigger Start/Stop queue execution
 function toggleDownloadProcess() {
     const startBtn = document.getElementById('start-btn');
     const startText = document.getElementById('start-btn-text');
-    const urlInput = "https://torbox.app/download";
 
     if (isRunning) {
         // Send Stop signal
@@ -189,38 +189,320 @@ function toggleDownloadProcess() {
                 }
             });
     } else {
-        // Check if selection exists
         if (!selectedTorrentName) {
             alert("Please select a torrent from the queue list first by clicking on it.");
             return;
         }
 
-        // Send Start signal for selected torrent
-        fetch('/api/start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                url: urlInput,
-                torrent_name: selectedTorrentName
-            })
+        openFilesModal();
+        fetchTorrentStructure(selectedTorrentName);
+    }
+}
+
+// Files Modal Handling functions
+function openFilesModal() {
+    const modal = document.getElementById('files-modal');
+    if (modal) {
+        modal.style.display = 'flex';
+        setTimeout(() => {
+            modal.classList.add('active');
+        }, 10);
+    }
+}
+
+function closeFilesModal() {
+    const modal = document.getElementById('files-modal');
+    if (modal) {
+        modal.classList.remove('active');
+        setTimeout(() => {
+            modal.style.display = 'none';
+        }, 300);
+    }
+}
+
+function retryFetchStructure() {
+    if (selectedTorrentName) {
+        fetchTorrentStructure(selectedTorrentName);
+    }
+}
+
+function fetchTorrentStructure(name) {
+    const urlInput = "https://torbox.app/download";
+    
+    // Set loading state
+    document.getElementById('modal-loading-state').style.display = 'flex';
+    document.getElementById('modal-error-state').style.display = 'none';
+    document.getElementById('modal-tree-content').style.display = 'none';
+    document.getElementById('modal-download-btn').style.display = 'none';
+    
+    document.getElementById('modal-torrent-name').textContent = name;
+    
+    fetch('/api/fetch_structure', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            url: urlInput,
+            torrent_name: name
         })
-        .then(res => {
-            if (res.status === 400) {
-                alert("Downloader is already running!");
-                return;
+    })
+    .then(res => {
+        if (res.status === 400) {
+            throw new Error("Bad request. Please verify connection and token.");
+        }
+        if (res.status === 429) {
+            throw new Error("Another torrent is being scanned. Please wait and try again.");
+        }
+        return res.json();
+    })
+    .then(data => {
+        if (data && data.success && data.files) {
+            document.getElementById('modal-loading-state').style.display = 'none';
+            document.getElementById('modal-tree-content').style.display = 'block';
+            document.getElementById('modal-download-btn').style.display = 'inline-flex';
+            
+            renderFilesTree(data.files);
+        } else {
+            throw new Error(data ? data.error : "Failed to load structure.");
+        }
+    })
+    .catch(err => {
+        document.getElementById('modal-loading-state').style.display = 'none';
+        document.getElementById('modal-error-state').style.display = 'flex';
+        document.getElementById('modal-error-msg').textContent = err.message || "Failed to fetch files structure.";
+    });
+}
+
+function renderFilesTree(files) {
+    const container = document.getElementById('modal-files-tree');
+    if (!container) return;
+    
+    if (!files || files.length === 0) {
+        container.innerHTML = '<div class="text-center text-muted p-4">No files detected in this torrent.</div>';
+        return;
+    }
+    
+    const tree = buildTreeFromFlatList(files);
+    let html = '';
+    const keys = Object.keys(tree.children);
+    
+    // Sort keys: folders first, then files alphabetically
+    keys.sort((a, b) => {
+        const typeA = tree.children[a].type;
+        const typeB = tree.children[b].type;
+        if (typeA !== typeB) {
+            return typeA === 'folder' ? -1 : 1;
+        }
+        return a.localeCompare(b);
+    });
+    
+    keys.forEach(key => {
+        html += renderTreeNode(tree.children[key], key, 0);
+    });
+    
+    container.innerHTML = html;
+    updateSelectAllState();
+}
+
+function buildTreeFromFlatList(files) {
+    const root = { type: 'folder', children: {} };
+    files.forEach(file => {
+        let current = root;
+        const pathSegments = file.path || [];
+        pathSegments.forEach(segment => {
+            if (!current.children[segment]) {
+                current.children[segment] = {
+                    type: 'folder',
+                    name: segment,
+                    children: {}
+                };
             }
-            return res.json();
+            current = current.children[segment];
+        });
+        
+        const relPath = pathSegments.concat([file.name]).join('/');
+        current.children[file.name] = {
+            type: 'file',
+            name: file.name,
+            size: file.size,
+            id: relPath
+        };
+    });
+    return root;
+}
+
+function renderTreeNode(node, name, level) {
+    if (node.type === 'file') {
+        return `
+            <div class="tree-node file-node">
+                <div class="tree-row" style="padding-left: ${level * 20 + 8}px;">
+                    <div class="tree-toggle-icon"></div>
+                    <input type="checkbox" class="tree-checkbox file-checkbox" data-id="${node.id}" checked onchange="onFileCheckboxChange(this)" />
+                    <div class="tree-item-icon file">
+                        <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                    </div>
+                    <span class="tree-node-name">${node.name}</span>
+                    <span class="tree-node-size">${node.size}</span>
+                </div>
+            </div>
+        `;
+    }
+    
+    const keys = Object.keys(node.children || {});
+    keys.sort((a, b) => {
+        const typeA = node.children[a].type;
+        const typeB = node.children[b].type;
+        if (typeA !== typeB) {
+            return typeA === 'folder' ? -1 : 1;
+        }
+        return a.localeCompare(b);
+    });
+    
+    let childrenHTML = '';
+    keys.forEach(key => {
+        childrenHTML += renderTreeNode(node.children[key], key, level + 1);
+    });
+    
+    const toggleIcon = keys.length > 0 ? '▾' : '';
+    const hasChildren = keys.length > 0;
+    
+    return `
+        <div class="tree-node folder-node">
+            <div class="tree-row folder-row" onclick="toggleFolderCollapse(this)" style="padding-left: ${level * 20 + 8}px;">
+                <div class="tree-toggle-icon ${hasChildren ? 'expanded' : ''}">${toggleIcon}</div>
+                <input type="checkbox" class="tree-checkbox folder-checkbox" checked onclick="event.stopPropagation()" onchange="onFolderCheckboxChange(this)" />
+                <div class="tree-item-icon folder">
+                    <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                </div>
+                <span class="tree-node-name font-semibold">${name}</span>
+            </div>
+            <div class="tree-children">
+                ${childrenHTML}
+            </div>
+        </div>
+    `;
+}
+
+function toggleFolderCollapse(row) {
+    const node = row.parentElement;
+    const toggleIcon = row.querySelector('.tree-toggle-icon');
+    const childrenContainer = node.querySelector('.tree-children');
+    
+    if (childrenContainer) {
+        childrenContainer.classList.toggle('hidden');
+        if (toggleIcon) {
+            toggleIcon.classList.toggle('expanded');
+            toggleIcon.textContent = childrenContainer.classList.contains('hidden') ? '▸' : '▾';
+        }
+    }
+}
+
+function onFolderCheckboxChange(checkbox) {
+    const folderNode = checkbox.closest('.folder-node');
+    const childCheckboxes = folderNode.querySelectorAll('.tree-checkbox');
+    childCheckboxes.forEach(cb => {
+        cb.checked = checkbox.checked;
+    });
+    updateParentFolderCheckbox(folderNode);
+    updateSelectAllState();
+}
+
+function onFileCheckboxChange(checkbox) {
+    updateParentFolderCheckbox(checkbox);
+    updateSelectAllState();
+}
+
+function updateParentFolderCheckbox(element) {
+    const parentChildrenContainer = element.closest('.tree-children');
+    if (!parentChildrenContainer) return;
+    const folderNode = parentChildrenContainer.closest('.folder-node');
+    if (!folderNode) return;
+    
+    const folderRow = folderNode.querySelector('.folder-row');
+    const folderCheckbox = folderRow ? folderRow.querySelector('.folder-checkbox') : null;
+    if (folderCheckbox) {
+        const siblingCheckboxes = parentChildrenContainer.querySelectorAll('.tree-row > .tree-checkbox');
+        let allChecked = true;
+        for (let cb of siblingCheckboxes) {
+            if (!cb.checked) {
+                allChecked = false;
+                break;
+            }
+        }
+        folderCheckbox.checked = allChecked;
+        updateParentFolderCheckbox(folderNode);
+    }
+}
+
+function toggleSelectAllFiles(checkbox) {
+    const allCheckboxes = document.querySelectorAll('#modal-files-tree .tree-checkbox');
+    allCheckboxes.forEach(cb => {
+        cb.checked = checkbox.checked;
+    });
+}
+
+function updateSelectAllState() {
+    const allFileCheckboxes = document.querySelectorAll('#modal-files-tree .file-checkbox');
+    const selectAllCheckbox = document.getElementById('modal-select-all');
+    if (allFileCheckboxes.length === 0 || !selectAllCheckbox) return;
+    
+    let allChecked = true;
+    for (let cb of allFileCheckboxes) {
+        if (!cb.checked) {
+            allChecked = false;
+            break;
+        }
+    }
+    selectAllCheckbox.checked = allChecked;
+}
+
+function startSelectedDownload() {
+    const checkedFiles = [];
+    const checkboxes = document.querySelectorAll('#modal-files-tree .file-checkbox:checked');
+    checkboxes.forEach(cb => {
+        checkedFiles.push(cb.getAttribute('data-id'));
+    });
+    
+    if (checkedFiles.length === 0) {
+        alert("Please select at least one file to download.");
+        return;
+    }
+    
+    closeFilesModal();
+    
+    const startBtn = document.getElementById('start-btn');
+    const startText = document.getElementById('start-btn-text');
+    const urlInput = "https://torbox.app/download";
+    
+    fetch('/api/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+            url: urlInput,
+            torrent_name: selectedTorrentName,
+            selected_files: checkedFiles
         })
-        .then(data => {
-            if (data && data.success) {
-                isRunning = true;
+    })
+    .then(res => {
+        if (res.status === 400) {
+            alert("Downloader is already running!");
+            return;
+        }
+        return res.json();
+    })
+    .then(data => {
+        if (data && data.success) {
+            isRunning = true;
+            if (startBtn) {
                 startBtn.classList.remove('btn-primary');
                 startBtn.classList.add('btn-secondary');
+            }
+            if (startText) {
                 startText.textContent = 'Stop Download';
             }
-        })
-        .catch(err => console.error("Error starting downloads:", err));
-    }
+            showToast("success", "Queue Started", "Downloading only selected files and folders.");
+        }
+    })
+    .catch(err => console.error("Error starting selected downloads:", err));
 }
 
 // Clear session storage and log out
@@ -424,7 +706,7 @@ function renderLogs(logs, activeDownloads) {
                 const downloadedStr = formatBytes(fileState.downloaded);
                 const totalStr = formatBytes(fileState.total);
                 
-                let barColor = 'var(--emerald-color)';
+                let barColor = 'var(--accent-emerald)';
                 let statusLabel = speed;
                 if (fileState.status === 'completed') {
                     barColor = '#04BF8A';
