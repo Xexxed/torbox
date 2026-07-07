@@ -258,20 +258,33 @@ class TorboxDetector:
                 if header_text and len(header_text) < 100:
                     return True, header_text
 
+        _SIZE_RE = re.compile(r'^\d+(?:\.\d+)?\s*(?:GB|MB|KB|B)$', re.I)
+        # Match a file extension like .mp4, .doi, .bin, .exe.
+        # To handle cases where size is concatenated (e.g. "data1.doi7GB"), we allow size suffix or word boundary.
+        _FILE_EXT_RE = re.compile(r'\.[a-z][a-z0-9]{1,4}(?:\b|\d+(?:\.\d+)?\s*(?:GB|MB|KB|B)\b|$)', re.I)
+
         _FILE_EXTS = frozenset([
             '.bin', '.exe', '.bat', '.rar', '.zip', '.mp4', '.url',
             '.md5', '.ini', '.txt', '.sfv', '.nfo', '.pdf', '.mkv',
             '.avi', '.iso', '.cfg', '.dat', '.pkg', '.png', '.jpg',
-            '.jpeg', '.gif', '.mp3', '.wav', '.flac'
+            '.jpeg', '.gif', '.mp3', '.wav', '.flac', '.doi'
         ])
-        _SIZE_RE = re.compile(r'^\d+(?:\.\d+)?\s*(?:GB|MB|KB|B)$', re.I)
+
+        def _looks_like_filename(text):
+            return (
+                any(ext in text.lower() for ext in _FILE_EXTS) or 
+                bool(_FILE_EXT_RE.search(text))
+            )
 
         # Fallback to direct children tags
         for tag in ['h3', 'h4', 'h5', 'div', 'span']:
             for header in element.find_all(tag, recursive=False):
+                # Skip if the header element itself is a known file row
+                if id(header) in self._file_row_ids:
+                    continue
                 header_text = header.text.strip()
                 if (header_text and len(header_text) < 100 and 
-                        not any(ext in header_text.lower() for ext in _FILE_EXTS) and
+                        not _looks_like_filename(header_text) and
                         not _SIZE_RE.match(header_text)):
                     return True, header_text
 
@@ -279,6 +292,9 @@ class TorboxDetector:
         # instead of calling _is_file_row() which does expensive DOM traversals
         for tag in ['h3', 'h4', 'h5', 'div', 'span']:
             for header in element.find_all(tag):
+                # Skip if the header element itself is a known file row
+                if id(header) in self._file_row_ids:
+                    continue
                 # Check if any parent (up to this element) is a known file row
                 skip = False
                 p = header.parent
@@ -291,7 +307,7 @@ class TorboxDetector:
                     continue
                 header_text = header.text.strip()
                 if (header_text and len(header_text) < 100 and 
-                        not any(ext in header_text.lower() for ext in _FILE_EXTS) and
+                        not _looks_like_filename(header_text) and
                         not _SIZE_RE.match(header_text)):
                     return True, header_text
 
