@@ -21,19 +21,264 @@ except ImportError:
     logger.error("Playwright is not installed. Please run: pip install playwright && playwright install")
     sys.exit(1)
 
-def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None):
+def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None):
     from threading import Lock
     from concurrent.futures import ThreadPoolExecutor
     from torbox_downloader.downloader import parse_size_to_bytes
+    import re
     
     torrent_success = True
     progress_lock = Lock()
+    _MAX_LINK_RETRIES = 2  # Retry failed link generations up to 2 times
     
+    # --- Route-based interception setup ---
+    # Shared variable to capture the download URL from the requestdl API response.
+    # Using a list so the route handler closure can mutate it.
+    _intercepted_download_url = [None]
+    
+    def _capture_requestdl(route):
+        """Intercept the requestdl API call, fetch the response ourselves,
+        extract the CDN download URL, then fulfill the page's request normally."""
+        try:
+            response = route.fetch()
+            try:
+                body = response.json()
+                if body.get("success") and body.get("data"):
+                    _intercepted_download_url[0] = body["data"]
+            except Exception:
+                pass
+            # Fulfill with original response (page JS will try to navigate to CDN URL,
+            # but our CDN blocker below will prevent that)
+            route.fulfill(response=response)
+        except Exception:
+            # If fetch fails, let the request proceed normally
+            try:
+                route.continue_()
+            except Exception:
+                pass
+    
+    def _block_cdn_navigation(route):
+        """Block the page from navigating to CDN download URLs.
+        This prevents the chrome-error:// crash that occurs when Chromium
+        tries to render a binary download as a web page."""
+        route.abort("blockedbyclient")
+    
+    # Register route handlers (LIFO order: last registered = checked first)
+    # These must be registered BEFORE entering the download loop
+    _routes_installed = False
+    try:
+        page.route("**/requestdl*", _capture_requestdl)
+        page.route("**tb-cdn**", _block_cdn_navigation)
+        _routes_installed = True
+    except Exception as route_err:
+        print(f"    Warning: Could not install route interceptors: {route_err}")
+    
+    # --- Page recovery helper (safety net) ---
+    def _recover_page_if_crashed():
+        """Detect if the browser tab has crashed and recover."""
+        try:
+            current_url = page.url
+        except Exception:
+            current_url = ""
+        
+        is_crashed = (
+            "chrome-error://" in current_url
+            or current_url == "about:blank"
+            or not current_url
+        )
+        
+        if not is_crashed:
+            return True
+        
+        nav_url = url or "https://torbox.app/download"
+        print(f"    Page crashed (URL: {current_url}). Recovering...")
+        
+        try:
+            if token:
+                page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
+                page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
+                page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
+            
+            page.goto(nav_url, wait_until="domcontentloaded", timeout=60000)
+            
+            if "login" in page.url.lower():
+                page.wait_for_timeout(2000)
+                page.goto(nav_url, wait_until="domcontentloaded", timeout=60000)
+            
+            try:
+                page.wait_for_selector("button[title='Download files'], button[title*='Download']", timeout=15000)
+            except Exception:
+                pass
+            
+            if torrent_name_for_status:
+                try:
+                    title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name_for_status).last
+                    card = title_el
+                    for _ in range(10):
+                        card = card.locator("..")
+                        if card.locator("button[title='Download files']").count() > 0:
+                            break
+                    btn = card.locator("button[title='Download files']").first
+                    if btn.count() > 0:
+                        btn.evaluate("el => el.click()")
+                        try:
+                            page.locator("button[title*='Options'], button[title*='options']").first.wait_for(state="visible", timeout=10000)
+                        except Exception:
+                            pass
+                        print(f"    Recovery successful: re-expanded torrent card.")
+                except Exception as re_err:
+                    print(f"    Recovery warning: could not re-expand torrent card: {re_err}")
+            
+            return True
+        except Exception as nav_err:
+            print(f"    Recovery navigation failed: {nav_err}")
+            return False
+    
+    # --- Link generation helper ---
+    def _generate_download_link(name, size, selector):
+        """Attempt to generate a download link for a single file.
+        Returns the CDN download URL string, or None on failure."""
+        row_locator = None
+        
+        def is_row_size_matching(row_text, expected_size_str):
+            if not expected_size_str:
+                return True
+            match = re.search(r'(\d+(?:\.\d+)?\s*(?:GB|MB|KB|B))', row_text, re.I)
+            if not match:
+                return False
+            row_size_str = match.group(1)
+            expected_bytes = parse_size_to_bytes(expected_size_str)
+            row_bytes = parse_size_to_bytes(row_size_str)
+            if not expected_bytes or not row_bytes:
+                return False
+            ratio = row_bytes / expected_bytes
+            return 0.7 <= ratio <= 1.3
+
+        try:
+            # Dismiss any previously open dropdown
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
+            
+            # 1. Find the exact filename element
+            file_label = page.locator("p, span, div").filter(has_text=re.compile(rf"^\s*{re.escape(name)}\s*$")).last
+            if file_label.count() == 0:
+                file_label = page.locator("p, span, div", has_text=name).last
+            
+            # Walk up to find the row container
+            row = file_label
+            found_container = False
+            for _ in range(8):
+                row = row.locator("..")
+                if row.locator("button[title*='options'], button[title*='Options'], button[title*='download'], button[title*='Download']").count() > 0:
+                    row_locator = row.locator("..")
+                    found_container = True
+                    break
+            
+            if not found_container:
+                row_locator = row
+            
+            # 2. Size validation
+            if size and row_locator.count() > 0:
+                row_text = row_locator.text_content()
+                if not is_row_size_matching(row_text, size):
+                    candidates = page.locator("p, span, div", has_text=name)
+                    cand_count = candidates.count()
+                    for c_idx in range(cand_count):
+                        cand_label = candidates.nth(c_idx)
+                        cand_row = cand_label
+                        found_cand = False
+                        for _ in range(8):
+                            cand_row = cand_row.locator("..")
+                            if cand_row.locator("button[title*='options'], button[title*='Options']").count() > 0:
+                                cand_row_container = cand_row.locator("..")
+                                found_cand = True
+                                break
+                        if not found_cand:
+                            cand_row_container = cand_row
+                            
+                        if is_row_size_matching(cand_row_container.text_content(), size):
+                            row_locator = cand_row_container
+                            break
+        except Exception as find_err:
+            print(f"    Failed to locate row using exact matching: {find_err}. Falling back to defaults...")
+            
+        # Fallback to CSS selector
+        if not row_locator or row_locator.count() == 0:
+            if selector:
+                row_locator = page.locator(selector)
+                if row_locator.count() > 1:
+                    row_locator = page.locator("div", has_text=name).last
+            
+        if not row_locator or row_locator.count() == 0:
+            print(f"    Could not locate row for file: {name} (Current URL: {page.url})")
+            return None
+            
+        # 3. Find and click the options button
+        dl_btn = row_locator.locator("button[title*='options'], button[title*='Options']").first
+        if dl_btn.count() == 0:
+            dl_btn = row_locator.locator("button[title*='download'], button[title*='Download']").first
+        if dl_btn.count() == 0:
+            buttons = row_locator.locator("button")
+            btn_count = buttons.count()
+            for b_idx in range(btn_count):
+                btn_item = buttons.nth(b_idx)
+                btn_html = btn_item.inner_html().lower()
+                btn_title = (btn_item.get_attribute("title") or "").lower()
+                if any(x in btn_html or x in btn_title for x in ['play', 'stream', 'watch', 'video']):
+                    continue
+                if "download" in btn_html or "svg" in btn_html or "icon" in btn_html or "dl" in btn_html:
+                    dl_btn = btn_item
+                    break
+                    
+        if not dl_btn or dl_btn.count() == 0:
+            print(f"    Could not locate download options button for: {name}")
+            return None
+            
+        dl_btn.evaluate("el => el.click()")
+        page.wait_for_timeout(1000)
+        
+        # 4. Find and click the Direct Download button
+        direct_dl_btn = row_locator.locator("button:visible, a:visible", has_text="Direct Download").first
+        if direct_dl_btn.count() == 0:
+            print(f"    Could not find 'Direct Download' button for: {name}")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
+        
+        direct_dl_btn.wait_for(state="visible", timeout=10000)
+        
+        # 5. Click Direct Download and wait for route-intercepted URL
+        _intercepted_download_url[0] = None
+        direct_dl_btn.evaluate("el => el.click()")
+        
+        # Poll for the intercepted URL (route handler fills it asynchronously)
+        for _ in range(75):  # 75 * 200ms = 15 seconds max wait
+            page.wait_for_timeout(200)
+            if _intercepted_download_url[0]:
+                break
+        
+        result_url = _intercepted_download_url[0]
+        _intercepted_download_url[0] = None  # Reset for next file
+        
+        # Dismiss dropdown
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+        
+        if not result_url:
+            print(f"    Could not retrieve download link for: {name}")
+        
+        return result_url
+    
+    # --- Progress tracking setup ---
     downloaded_bytes = {}
     total_bytes_map = {}
     speeds = {}
     
-    # Pre-populate sizes for accurate total percentage calculations
     for f_info in files_with_local_paths:
         fname = f_info['name']
         fsize = parse_size_to_bytes(f_info['size']) or 0
@@ -49,7 +294,6 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
                 speeds[fname] = sp
                 
                 if status_update_callback:
-                    # Notify GUI server of individual file progress
                     try:
                         status_update_callback(fname, 'downloading_file', dl, tot, sp)
                     except Exception as e:
@@ -63,7 +307,6 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
                         percent = int((overall_dl / overall_tot * 100)) if overall_tot > 0 else 0
                         status_update_callback(torrent_name_for_status, 'downloading', percent, 100, overall_speed)
                     else:
-                        # Fallback for single-file details view
                         status_update_callback(fname, 'downloading', dl, tot, sp)
         return cb
 
@@ -71,7 +314,6 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
         nonlocal torrent_success
         name, local_path, d_url, size = item
         
-        # Check abort flag before starting download
         if status_update_callback:
             try:
                 status_update_callback("", "check_abort", 0, 0, 0)
@@ -99,12 +341,13 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
                 if not torrent_name_for_status:
                     status_update_callback(name, 'failed', 0, 0, 0)
 
-    # Producer-consumer: main thread generates links, pool downloads them
+    # --- Main producer-consumer loop ---
     max_workers = min(max_parallel_files, len(files_with_local_paths))
     print(f"\nProcessing {len(files_with_local_paths)} files (Max {max_workers} parallel downloads)...")
     
     executor = ThreadPoolExecutor(max_workers=max_workers)
     futures = []
+    failed_files = []  # Track files that failed link generation for retry
     
     for f_idx, file_info in enumerate(files_with_local_paths):
         name = file_info['name']
@@ -112,6 +355,7 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
         selector = file_info['selector']
         size = file_info['size']
         
+        # Check abort
         if status_update_callback:
             try:
                 status_update_callback("", "check_abort", 0, 0, 0)
@@ -121,9 +365,28 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
                     torrent_success = False
                     break
         
+        # Check page health / recover from crash
+        if not _recover_page_if_crashed():
+            print(f"  [{f_idx + 1}/{len(files_with_local_paths)}] Skipping {name} (page unrecoverable).")
+            torrent_success = False
+            if status_update_callback and not torrent_name_for_status:
+                status_update_callback(name, 'failed', 0, 0, 0)
+            continue
+        
+        # Check for token expiry
+        try:
+            current_page_url = page.url.lower()
+        except Exception:
+            current_page_url = ""
+        if "login" in current_page_url or page.locator("input[type='password']").count() > 0:
+            print("Session token has expired or is invalid. Aborting download pipeline.")
+            torrent_success = False
+            raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
+            
         if status_update_callback and torrent_name_for_status:
             status_update_callback(torrent_name_for_status, 'downloading', int((f_idx / len(files_with_local_paths)) * 100), 100, sum(speeds.values()))
         
+        # Skip already downloaded files
         if os.path.exists(local_path):
             local_size = os.path.getsize(local_path)
             expected_bytes = parse_size_to_bytes(size)
@@ -137,88 +400,63 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
         
         print(f"  [{f_idx + 1}/{len(files_with_local_paths)}] Generating link for: {name} ({size})")
         
-        download_url = None
-        try:
-            row_locator = None
-            if selector:
-                row_locator = page.locator(selector)
-            if not row_locator or row_locator.count() == 0:
-                row_locator = page.locator("div", has_text=name).last
-                
-            if row_locator.count() == 0:
-                print(f"    Could not locate row for file: {name}")
-                torrent_success = False
-                if status_update_callback and not torrent_name_for_status:
-                    status_update_callback(name, 'failed', 0, 0, 0)
-                continue
-                
-            dl_btn = row_locator.locator("button[title*='options'], button[title*='download'], button[title*='Options']").first
-            if dl_btn.count() == 0:
-                dl_btn = None
-                
-            if not dl_btn:
-                buttons = row_locator.locator("button")
-                btn_count = buttons.count()
-                for b_idx in range(btn_count):
-                    btn_item = buttons.nth(b_idx)
-                    btn_html = btn_item.inner_html().lower()
-                    btn_title = (btn_item.get_attribute("title") or "").lower()
-                    if any(x in btn_html or x in btn_title for x in ['play', 'stream', 'watch', 'video']):
-                        continue
-                    if "download" in btn_html or "svg" in btn_html or "icon" in btn_html or "dl" in btn_html:
-                        dl_btn = btn_item
-                        break
-                        
-            if not dl_btn:
-                dl_btn = row_locator.locator("svg").last
-                
-            if not dl_btn:
-                print(f"    Could not locate download options button for: {name}")
-                torrent_success = False
-                if status_update_callback and not torrent_name_for_status:
-                    status_update_callback(name, 'failed', 0, 0, 0)
-                continue
-                
-            dl_btn.evaluate("el => el.click()")
-            page.wait_for_timeout(1000)
-            
-            direct_dl_btn = page.locator("button:visible, a:visible", has_text="Direct Download").first
-            if direct_dl_btn.count() > 0:
-                direct_dl_btn.wait_for(state="visible", timeout=10000)
-                with page.expect_download(timeout=60000) as download_info:
-                    direct_dl_btn.evaluate("el => el.click()")
-                download = download_info.value
-                download_url = download.url
-                download.cancel()
-                
-            if not download_url:
-                print("    Could not retrieve download link.")
-                torrent_success = False
-                if status_update_callback and not torrent_name_for_status:
-                    status_update_callback(name, 'failed', 0, 0, 0)
-                try:
-                    dl_btn.evaluate("el => el.click()")
-                    page.wait_for_timeout(500)
-                except:
-                    pass
-                continue
-                
-            try:
-                dl_btn.evaluate("el => el.click()")
-                page.wait_for_timeout(500)
-            except:
-                pass
-                
-        except Exception as e:
-            print(f"    Failed to generate download link: {e}")
+        download_url = _generate_download_link(name, size, selector)
+        
+        if not download_url:
+            # Queue for retry instead of failing immediately
+            failed_files.append((f_idx, file_info))
             torrent_success = False
             if status_update_callback and not torrent_name_for_status:
                 status_update_callback(name, 'failed', 0, 0, 0)
             continue
         
-        if download_url:
-            fut = executor.submit(download_consumer, (name, local_path, download_url, size))
-            futures.append(fut)
+        fut = executor.submit(download_consumer, (name, local_path, download_url, size))
+        futures.append(fut)
+    
+    # --- Retry failed link generations ---
+    if failed_files:
+        print(f"\n  Retrying {len(failed_files)} failed link generation(s)...")
+        
+        for retry_attempt in range(1, _MAX_LINK_RETRIES + 1):
+            if not failed_files:
+                break
+                
+            still_failed = []
+            # Wait before retrying to avoid rate limiting
+            page.wait_for_timeout(3000)
+            
+            # Make sure page is in a good state before retrying
+            if not _recover_page_if_crashed():
+                print(f"    Page unrecoverable during retry. Skipping remaining files.")
+                break
+            
+            for orig_idx, file_info in failed_files:
+                name = file_info['name']
+                local_path = file_info['local_path']
+                selector = file_info['selector']
+                size = file_info['size']
+                
+                # Skip if already downloaded by another path
+                if os.path.exists(local_path):
+                    local_size = os.path.getsize(local_path)
+                    expected_bytes = parse_size_to_bytes(size)
+                    if expected_bytes and abs(local_size - expected_bytes) < 1024 * 1024:
+                        continue
+                
+                print(f"  [Retry {retry_attempt}/{_MAX_LINK_RETRIES}] Generating link for: {name} ({size})")
+                
+                download_url = _generate_download_link(name, size, selector)
+                
+                if download_url:
+                    fut = executor.submit(download_consumer, (name, local_path, download_url, size))
+                    futures.append(fut)
+                else:
+                    still_failed.append((orig_idx, file_info))
+            
+            failed_files = still_failed
+        
+        if failed_files:
+            print(f"    {len(failed_files)} file(s) failed after all retries: {', '.join(f[1]['name'] for f in failed_files)}")
             
     for fut in futures:
         try:
@@ -226,9 +464,19 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
         except Exception as e:
             print(f"    Download thread error: {e}")
             torrent_success = False
-            
+    
     executor.shutdown(wait=False)
+    
+    # Clean up route handlers
+    if _routes_installed:
+        try:
+            page.unroute("**/requestdl*")
+            page.unroute("**tb-cdn**")
+        except Exception:
+            pass
+    
     return torrent_success
+
 
 def get_torrent_files_structure(token, url, target_torrent_name, browser_type='chromium', headless=True):
     from playwright.sync_api import sync_playwright
@@ -282,6 +530,10 @@ def get_torrent_files_structure(token, url, target_torrent_name, browser_type='c
             if token:
                 page.wait_for_timeout(2000)
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+        # Validate if we are still stuck on the login page (token expired or invalid)
+        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+            raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
         
         try:
             page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
@@ -391,6 +643,10 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             if token:
                 page.wait_for_timeout(2000)
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+        # Validate if we are still stuck on the login page (token expired or invalid)
+        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+            raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
         
         # Wait for either the dashboard list or active files list to render
         print("Analyzing current page state...")
@@ -470,7 +726,9 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                         files_with_local_paths=files_with_local_paths,
                         max_parallel_files=max_parallel_files,
                         status_update_callback=status_update_callback,
-                        torrent_name_for_status=torrent['name']
+                        torrent_name_for_status=torrent['name'],
+                        url=url,
+                        token=token
                     )
                     
                     try:
@@ -547,7 +805,9 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             files_with_local_paths=files_with_local_paths,
             max_parallel_files=max_parallel_files,
             status_update_callback=status_update_callback,
-            torrent_name_for_status=None
+            torrent_name_for_status=None,
+            url=url,
+            token=token
         )
         try:
             if context:

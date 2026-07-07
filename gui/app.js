@@ -38,29 +38,17 @@ function showToast(type, title, message, durationMs = 8000) {
     }
 }
 
-function checkTokenExpiry(tokenStr) {
-    if (!tokenStr) return;
-    try {
-        const parsed = JSON.parse(tokenStr);
-        const expiresAt = parsed.expires_at;
-        if (expiresAt) {
-            const nowSec = Math.floor(Date.now() / 1000);
-            if (nowSec > expiresAt) {
-                if (!tokenExpiryWarningShown) {
-                    tokenExpiryWarningShown = true;
-                    const expiredAgo = nowSec - expiresAt;
-                    let agoText;
-                    if (expiredAgo < 3600) agoText = `${Math.floor(expiredAgo / 60)} minutes ago`;
-                    else agoText = `${Math.floor(expiredAgo / 3600)} hours ago`;
-                    
-                    showToast('warning', 'Session Token Expired',
-                        `Your Torbox session token expired ${agoText}. Please log in again at torbox.app and paste a fresh token.`, 0);
-                }
-            } else {
-                tokenExpiryWarningShown = false;
-            }
+function checkTokenExpiry(state) {
+    if (!state) return;
+    // If the backend has actively confirmed the token is expired/invalid (because redirect to login occurred), show a toast warning
+    if (state.status === 'error' && state.error_message && state.error_message.includes('expired or invalid')) {
+        if (!tokenExpiryWarningShown) {
+            tokenExpiryWarningShown = true;
+            showToast('warning', 'Session Token Expired / Invalid', state.error_message, 0);
         }
-    } catch (e) {}
+    } else if (state.status !== 'error') {
+        tokenExpiryWarningShown = false;
+    }
 }
 
 // Initialize the Dashboard
@@ -438,6 +426,7 @@ function toggleSelectAllFiles(checkbox) {
     allCheckboxes.forEach(cb => {
         cb.checked = checkbox.checked;
     });
+    updateSelectedCount();
 }
 
 function updateSelectAllState() {
@@ -453,6 +442,16 @@ function updateSelectAllState() {
         }
     }
     selectAllCheckbox.checked = allChecked;
+    updateSelectedCount();
+}
+
+function updateSelectedCount() {
+    const allFiles = document.querySelectorAll('#modal-files-tree .file-checkbox');
+    const checkedFiles = document.querySelectorAll('#modal-files-tree .file-checkbox:checked');
+    const countSpan = document.getElementById('modal-selected-count');
+    if (countSpan) {
+        countSpan.textContent = `(${checkedFiles.length} of ${allFiles.length} selected)`;
+    }
 }
 
 function startSelectedDownload() {
@@ -528,7 +527,7 @@ function fetchStatus() {
             }
             
             // Check if the token has expired
-            checkTokenExpiry(state.token);
+            checkTokenExpiry(state);
 
             const pathInput = document.getElementById('download-path-input');
             if (document.activeElement !== pathInput && state.dest_dir) {

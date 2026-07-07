@@ -25,3 +25,6 @@ downloads/
 *.njsproj
 *.sln
 *.swp
+
+# Debug HTML dumps (may contain personal content names)
+torbox_debug.html

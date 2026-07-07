@@ -231,6 +231,13 @@ def scan_torrents_background(token, browser_type, headless):
                 page.wait_for_timeout(2000)
                 page.goto("https://torbox.app/download", wait_until="domcontentloaded", timeout=60000)
                 
+            # Validate if we are still stuck on the login page (token expired or invalid)
+            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token is expired or invalid. Please paste a fresh token.")
+                app_state.set_status("error", "Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
+                browser.close()
+                return
+                
             try:
                 page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
             except Exception:
@@ -246,6 +253,12 @@ def scan_torrents_background(token, browser_type, headless):
             else:
                 app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Checked Torbox download queue: no active torrents found.")
                 
+            # Clear error status if scanner succeeded
+            with app_state.lock:
+                if app_state.status == "error":
+                    app_state.status = "idle"
+                    app_state.error_message = ""
+                    
             browser.close()
     except Exception as e:
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")

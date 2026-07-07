@@ -236,6 +236,7 @@ class TorboxDetector:
         if element.name != 'div':
             return False, None
 
+
         classes = element.get('class', [])
         class_str = ' '.join(classes).lower()
 

@@ -176,9 +176,9 @@ class TestDashboardExclusion(unittest.TestCase):
         <html>
         <body>
             <div class="torrent-container border rounded p-4">
-                <h3 class="font-bold text-white subfolder-title">Bob Hearts Abishola S01</h3>
+                <h3 class="font-bold text-white subfolder-title">Sample Show S01</h3>
                 <div class="flex items-center justify-between p-2 border-b">
-                    <span class="file-name">Bob.Hearts.Abishola.S01E01.mkv</span>
+                    <span class="file-name">Sample.Show.S01E01.mkv</span>
                     <span class="file-size">450MB</span>
                     <button title="Download" class="dl-btn">Download</button>
                 </div>
@@ -196,10 +196,10 @@ class TestDashboardExclusion(unittest.TestCase):
         
         files = detector.parse_structure()
         self.assertEqual(len(files), 2)
-        self.assertEqual(files[0]['name'], "Bob.Hearts.Abishola.S01E01.mkv")
-        self.assertEqual(files[0]['path'], ["Bob Hearts Abishola S01"])
+        self.assertEqual(files[0]['name'], "Sample.Show.S01E01.mkv")
+        self.assertEqual(files[0]['path'], ["Sample Show S01"])
         self.assertEqual(files[1]['name'], "read me.txt")
-        self.assertEqual(files[1]['path'], ["Bob Hearts Abishola S01"])
+        self.assertEqual(files[1]['path'], ["Sample Show S01"])
 
 class TestSelectiveDownloads(unittest.TestCase):
     def test_selected_files_path_filtering(self):

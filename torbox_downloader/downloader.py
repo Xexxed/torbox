@@ -133,6 +133,20 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
         
         if r.status_code in [200, 206]:
             total_size = int(r.headers.get('content-length', 0))
+            if expected_size_str and total_size > 0:
+                expected_bytes = parse_size_to_bytes(expected_size_str)
+                if expected_bytes:
+                    is_match = False
+                    if expected_bytes < 1024 * 1024:
+                        is_match = abs(total_size - expected_bytes) < 512 * 1024
+                    else:
+                        ratio = total_size / expected_bytes
+                        is_match = 0.7 <= ratio <= 1.3
+                    
+                    if not is_match:
+                        print(f"Error: Size mismatch for download. Expected {expected_size_str} ({expected_bytes} bytes), but server returned content-length of {total_size} bytes. Aborting download.")
+                        return False
+
             accept_ranges = 'bytes' in r.headers.get('Accept-Ranges', '').lower() or r.status_code == 206
             if not accept_ranges and total_size > 5 * 1024 * 1024:
                 accept_ranges = True
