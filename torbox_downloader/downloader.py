@@ -102,6 +102,20 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
                 print(f"Failed to download {os.path.basename(local_path)} after {retries} attempts.")
                 return False
 
+def is_file_size_matching(local_size, expected_size_str):
+    """
+    Checks if local_size is close enough to expected_size_str.
+    Allows 1MB difference for small files (<10MB), and 50%-200% tolerance for large files (>=10MB)
+    to handle rounded size strings or uploader database discrepancies in the UI.
+    """
+    expected_bytes = parse_size_to_bytes(expected_size_str)
+    if not expected_bytes:
+        return False
+    if expected_bytes < 10 * 1024 * 1024:
+        return abs(local_size - expected_bytes) < 1024 * 1024
+    ratio = local_size / expected_bytes
+    return 0.5 <= ratio <= 2.0
+
 def download_file(url, local_path, expected_size_str=None, headers=None, retries=5, backoff_factor=2, progress_callback=None):
     """
     Downloads a file using parallel segmented chunk downloads (similar to IDM)
@@ -109,9 +123,9 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     """
     if os.path.exists(local_path):
         local_size = os.path.getsize(local_path)
-        expected_bytes = parse_size_to_bytes(expected_size_str)
-        if expected_bytes and abs(local_size - expected_bytes) < 1024 * 1024:
+        if is_file_size_matching(local_size, expected_size_str):
             print(f"Skipping {os.path.basename(local_path)} (already downloaded)")
+            expected_bytes = parse_size_to_bytes(expected_size_str) or local_size
             if progress_callback:
                 progress_callback(os.path.basename(local_path), expected_bytes, expected_bytes, 0)
             return True
@@ -141,11 +155,10 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                         is_match = abs(total_size - expected_bytes) < 512 * 1024
                     else:
                         ratio = total_size / expected_bytes
-                        is_match = 0.7 <= ratio <= 1.3
+                        is_match = 0.5 <= ratio <= 2.0
                     
                     if not is_match:
-                        print(f"Error: Size mismatch for download. Expected {expected_size_str} ({expected_bytes} bytes), but server returned content-length of {total_size} bytes. Aborting download.")
-                        return False
+                        print(f"Warning: Size mismatch for download. Expected {expected_size_str} ({expected_bytes} bytes), but server returned content-length of {total_size} bytes. Proceeding anyway.")
 
             accept_ranges = 'bytes' in r.headers.get('Accept-Ranges', '').lower() or r.status_code == 206
             if not accept_ranges and total_size > 5 * 1024 * 1024:

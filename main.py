@@ -24,7 +24,7 @@ except ImportError:
 def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None):
     from threading import Lock
     from concurrent.futures import ThreadPoolExecutor
-    from torbox_downloader.downloader import parse_size_to_bytes
+    from torbox_downloader.downloader import parse_size_to_bytes, is_file_size_matching
     import re
     
     torrent_success = True
@@ -389,9 +389,9 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
         # Skip already downloaded files
         if os.path.exists(local_path):
             local_size = os.path.getsize(local_path)
-            expected_bytes = parse_size_to_bytes(size)
-            if expected_bytes and abs(local_size - expected_bytes) < 1024 * 1024:
+            if is_file_size_matching(local_size, size):
                 print(f"  [{f_idx + 1}/{len(files_with_local_paths)}] Skipping {name} (already downloaded).")
+                expected_bytes = parse_size_to_bytes(size) or local_size
                 with progress_lock:
                     downloaded_bytes[name] = expected_bytes
                 if status_update_callback and not torrent_name_for_status:
@@ -439,8 +439,7 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
                 # Skip if already downloaded by another path
                 if os.path.exists(local_path):
                     local_size = os.path.getsize(local_path)
-                    expected_bytes = parse_size_to_bytes(size)
-                    if expected_bytes and abs(local_size - expected_bytes) < 1024 * 1024:
+                    if is_file_size_matching(local_size, size):
                         continue
                 
                 print(f"  [Retry {retry_attempt}/{_MAX_LINK_RETRIES}] Generating link for: {name} ({size})")

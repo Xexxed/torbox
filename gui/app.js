@@ -1,6 +1,6 @@
 // Application State variables
 let currentTab = 'dashboard';
-let currentConsoleTab = 'currently';
+let currentConsoleTab = 'downloading';
 let isRunning = false;
 let pollingInterval = null;
 let lastLogCount = 0;
@@ -695,34 +695,24 @@ function renderLogs(logs, activeDownloads) {
     });
 
     // Populate Console views based on selected console tab
-    if (currentConsoleTab === 'currently') {
-        // Render active downloads progress bars
-        let currentlyHtml = '';
-        if (activeDownloads && Object.keys(activeDownloads).length > 0) {
-            Object.entries(activeDownloads).forEach(([filename, fileState]) => {
+    if (currentConsoleTab === 'downloading') {
+        let downloadingHtml = '';
+        const items = Object.entries(activeDownloads).filter(([_, state]) => state.status === 'downloading');
+        if (items.length > 0) {
+            items.forEach(([filename, fileState]) => {
                 const progress = fileState.progress || 0;
                 const speed = fileState.speed || '0 KB/s';
                 const downloadedStr = formatBytes(fileState.downloaded);
                 const totalStr = formatBytes(fileState.total);
                 
-                let barColor = 'var(--accent-emerald)';
-                let statusLabel = speed;
-                if (fileState.status === 'completed') {
-                    barColor = '#04BF8A';
-                    statusLabel = '<span style="color: #04BF8A; font-weight: bold;">Completed</span>';
-                } else if (fileState.status === 'failed') {
-                    barColor = '#ff5f56';
-                    statusLabel = '<span style="color: #ff5f56; font-weight: bold;">Failed</span>';
-                }
-                
-                currentlyHtml += `
+                downloadingHtml += `
                 <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
                     <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
                         <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${filename}">${filename}</span>
-                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);">${statusLabel}</span>
+                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);">${speed}</span>
                     </div>
                     <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
-                        <div class="progress-bar-fill" style="background: ${barColor}; width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
+                        <div class="progress-bar-fill" style="background: var(--accent-emerald); width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
                     </div>
                     <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono);">
                         <span>${progress}%</span>
@@ -731,9 +721,65 @@ function renderLogs(logs, activeDownloads) {
                 </div>`;
             });
         } else {
-            currentlyHtml = '<div class="console-line text-muted">No files are currently downloading. Select a torrent and click Start Download.</div>';
+            downloadingHtml = '<div class="console-line text-muted">No files are currently downloading. Select a torrent and click Start Download.</div>';
         }
-        consoleEl.innerHTML = currentlyHtml;
+        consoleEl.innerHTML = downloadingHtml;
+    } else if (currentConsoleTab === 'finished') {
+        let finishedHtml = '';
+        const items = Object.entries(activeDownloads).filter(([_, state]) => state.status === 'completed');
+        if (items.length > 0) {
+            items.forEach(([filename, fileState]) => {
+                const progress = fileState.progress || 0;
+                const downloadedStr = formatBytes(fileState.downloaded);
+                const totalStr = formatBytes(fileState.total);
+                
+                finishedHtml += `
+                <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
+                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${filename}">${filename}</span>
+                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);"><span style="color: #04BF8A; font-weight: bold;">Completed</span></span>
+                    </div>
+                    <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
+                        <div class="progress-bar-fill" style="background: #04BF8A; width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono);">
+                        <span>${progress}%</span>
+                        <span>${downloadedStr} / ${totalStr}</span>
+                    </div>
+                </div>`;
+            });
+        } else {
+            finishedHtml = '<div class="console-line text-muted">No finished downloads in this session.</div>';
+        }
+        consoleEl.innerHTML = finishedHtml;
+    } else if (currentConsoleTab === 'failed') {
+        let failedHtml = '';
+        const items = Object.entries(activeDownloads).filter(([_, state]) => state.status === 'failed');
+        if (items.length > 0) {
+            items.forEach(([filename, fileState]) => {
+                const progress = fileState.progress || 0;
+                const downloadedStr = formatBytes(fileState.downloaded);
+                const totalStr = formatBytes(fileState.total);
+                
+                failedHtml += `
+                <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
+                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${filename}">${filename}</span>
+                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);"><span style="color: #ff5f56; font-weight: bold;">Failed</span></span>
+                    </div>
+                    <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
+                        <div class="progress-bar-fill" style="background: #ff5f56; width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono);">
+                        <span>${progress}%</span>
+                        <span>${downloadedStr} / ${totalStr}</span>
+                    </div>
+                </div>`;
+            });
+        } else {
+            failedHtml = '<div class="console-line text-muted">No failed downloads in this session.</div>';
+        }
+        consoleEl.innerHTML = failedHtml;
     } else {
         consoleEl.innerHTML = systemHtml || '<div class="console-line text-muted">System idle. Handshake complete.</div>';
     }
@@ -745,8 +791,8 @@ function renderLogs(logs, activeDownloads) {
     });
     rawEl.innerHTML = rawHtml || '<div class="console-line text-muted">No raw logs collected yet.</div>';
 
-    // Auto-scroll to bottom of logs if system tab is open and logs have increased
-    if (currentConsoleTab === 'system' && logs.length > lastLogCount) {
+    // Auto-scroll to bottom of logs if logs tab is open and logs have increased
+    if (currentConsoleTab === 'logs' && logs.length > lastLogCount) {
         consoleEl.scrollTop = consoleEl.scrollHeight;
     }
     if (logs.length > lastLogCount) {
