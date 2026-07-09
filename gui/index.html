@@ -126,10 +126,16 @@
                                     </div>
                                     <div style="flex: 1;">
                                         <label for="delay-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Delay Between Files (s)</label>
-                                        <input type="number" id="delay-input" min="0" max="60" value="5" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;" />
-                                    </div>
+                                    <input type="number" id="delay-input" min="0" max="60" value="5" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;" />
                                 </div>
-                                <div class="path-stats">
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #e5e7eb; cursor: pointer;">
+                                    <input type="checkbox" id="parallel-connections-input" checked onchange="saveSettings()" />
+                                    <span>Use parallel connections (multi-part download, up to 4)</span>
+                                </label>
+                            </div>
+                            <div class="path-stats">
                                     <span class="stat-item"><span class="dot emerald"></span> Free Space: <strong id="free-space-val">Scanning...</strong></span>
                                     <span class="stat-item"><span class="dot blue"></span> Mount Point: Local PC</span>
                                 </div>

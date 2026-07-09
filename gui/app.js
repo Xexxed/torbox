@@ -117,12 +117,14 @@ function saveSettings() {
     const dest_dir = document.getElementById('download-path-input').value;
     const delay = parseInt(document.getElementById('delay-input').value) || 5;
     const max_parallel_files = parseInt(document.getElementById('parallel-downloads-input').value) || 1;
+    const parallel_connections = document.getElementById('parallel-connections-input').checked;
     
     const body = {
         token: token,
         dest_dir: dest_dir,
         delay: delay,
-        max_parallel_files: max_parallel_files
+        max_parallel_files: max_parallel_files,
+        parallel_connections: parallel_connections
     };
     
     fetch('/api/settings', {
@@ -542,6 +544,11 @@ function fetchStatus() {
             const delayInput = document.getElementById('delay-input');
             if (document.activeElement !== delayInput && state.delay !== undefined) {
                 delayInput.value = state.delay;
+            }
+
+            const parallelConnsInput = document.getElementById('parallel-connections-input');
+            if (parallelConnsInput && document.activeElement !== parallelConnsInput && state.parallel_connections !== undefined) {
+                parallelConnsInput.checked = state.parallel_connections;
             }
 
             // Extract and display user email from token if available

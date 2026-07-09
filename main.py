@@ -21,9 +21,10 @@ except ImportError:
     logger.error("Playwright is not installed. Please run: pip install playwright && playwright install")
     sys.exit(1)
 
-def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None):
-    from threading import Lock
+def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None, delay=0, parallel_connections=True, cancel_event=None):
+    from threading import Lock, Semaphore, Thread
     from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue, Empty
     from torbox_downloader.downloader import parse_size_to_bytes, is_file_size_matching
     import re
     
@@ -310,161 +311,234 @@ def download_files_pipeline(page, dest_dir, files_with_local_paths, max_parallel
                         status_update_callback(fname, 'downloading', dl, tot, sp)
         return cb
 
+    # --- Prefetch-buffer scheduling ---
+    max_workers = min(max_parallel_files, len(files_with_local_paths))
+    PREFETCH = 4
+
+    slot = Semaphore(max_workers)
+    link_backoff = [0.0]
+
+    def next_link(name, size, selector):
+        bo = link_backoff[0]
+        if bo > 0:
+            print(f"    Throttle backoff: waiting {bo:.1f}s before next link request...")
+            time.sleep(bo)
+        if delay and delay > 0:
+            time.sleep(delay)
+        url = _generate_download_link(name, size, selector)
+        if url:
+            link_backoff[0] = max(0.0, bo / 2.0)
+        else:
+            link_backoff[0] = min(bo * 2 + 5, 120)
+        return url
+
     def download_consumer(item):
         nonlocal torrent_success
-        name, local_path, d_url, size = item
-        
-        if status_update_callback:
-            try:
-                status_update_callback("", "check_abort", 0, 0, 0)
-            except Exception as e:
-                if "aborted" in str(e).lower():
-                    torrent_success = False
-                    return
-        
-        print(f"    Starting download: {name}...")
-        cb = make_file_progress_callback(name)
-        success = download_file(d_url, local_path, expected_size_str=size, progress_callback=cb)
-        
-        if success:
-            with progress_lock:
-                downloaded_bytes[name] = total_bytes_map[name]
-                speeds[name] = 0
-            if status_update_callback:
-                status_update_callback(name, 'completed_file', total_bytes_map[name], total_bytes_map[name], 0)
-                if not torrent_name_for_status:
-                    status_update_callback(name, 'completed', total_bytes_map[name], total_bytes_map[name], 0)
-        else:
-            torrent_success = False
-            if status_update_callback:
-                status_update_callback(name, 'failed_file', 0, 0, 0)
-                if not torrent_name_for_status:
-                    status_update_callback(name, 'failed', 0, 0, 0)
+        try:
+            name, local_path, d_url, size = item
 
-    # --- Main producer-consumer loop ---
-    max_workers = min(max_parallel_files, len(files_with_local_paths))
-    print(f"\nProcessing {len(files_with_local_paths)} files (Max {max_workers} parallel downloads)...")
-    
+            if status_update_callback:
+                try:
+                    status_update_callback("", "check_abort", 0, 0, 0)
+                except Exception as e:
+                    if "aborted" in str(e).lower():
+                        torrent_success = False
+                        return
+
+            if cancel_event and cancel_event.is_set():
+                torrent_success = False
+                return
+
+            print(f"    Starting download: {name}...")
+            cb = make_file_progress_callback(name)
+            success = download_file(d_url, local_path, expected_size_str=size, progress_callback=cb, parallel=parallel_connections, cancel_event=cancel_event)
+
+            if success:
+                with progress_lock:
+                    downloaded_bytes[name] = total_bytes_map[name]
+                    speeds[name] = 0
+                if status_update_callback:
+                    status_update_callback(name, 'completed_file', total_bytes_map[name], total_bytes_map[name], 0)
+                    if not torrent_name_for_status:
+                        status_update_callback(name, 'completed', total_bytes_map[name], total_bytes_map[name], 0)
+            else:
+                torrent_success = False
+                if status_update_callback:
+                    status_update_callback(name, 'failed_file', 0, 0, 0)
+                    if not torrent_name_for_status:
+                        status_update_callback(name, 'failed', 0, 0, 0)
+        finally:
+            slot.release()
+
+    total_files = len(files_with_local_paths)
+    failed_files = []  # Track files that failed link generation for retry
+    aborted = {'value': False}
+    token_expired = {'value': False}
+    submitted_count = [0]
+
+    print(f"\nProcessing {total_files} files (Max {max_workers} parallel downloads)...")
+
     executor = ThreadPoolExecutor(max_workers=max_workers)
     futures = []
-    failed_files = []  # Track files that failed link generation for retry
-    
-    for f_idx, file_info in enumerate(files_with_local_paths):
-        name = file_info['name']
-        local_path = file_info['local_path']
-        selector = file_info['selector']
-        size = file_info['size']
-        
-        # Check abort
-        if status_update_callback:
-            try:
-                status_update_callback("", "check_abort", 0, 0, 0)
-            except Exception as e:
-                if "aborted" in str(e).lower():
-                    print("Queue aborted by user request.")
-                    torrent_success = False
-                    break
-        
-        # Check page health / recover from crash
-        if not _recover_page_if_crashed():
-            print(f"  [{f_idx + 1}/{len(files_with_local_paths)}] Skipping {name} (page unrecoverable).")
-            torrent_success = False
-            if status_update_callback and not torrent_name_for_status:
-                status_update_callback(name, 'failed', 0, 0, 0)
-            continue
-        
-        # Check for token expiry
-        try:
-            current_page_url = page.url.lower()
-        except Exception:
-            current_page_url = ""
-        if "login" in current_page_url or page.locator("input[type='password']").count() > 0:
-            print("Session token has expired or is invalid. Aborting download pipeline.")
-            torrent_success = False
-            raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
-            
-        if status_update_callback and torrent_name_for_status:
-            status_update_callback(torrent_name_for_status, 'downloading', int((f_idx / len(files_with_local_paths)) * 100), 100, sum(speeds.values()))
-        
-        # Skip already downloaded files
-        if os.path.exists(local_path):
-            local_size = os.path.getsize(local_path)
-            if is_file_size_matching(local_size, size):
-                print(f"  [{f_idx + 1}/{len(files_with_local_paths)}] Skipping {name} (already downloaded).")
-                expected_bytes = parse_size_to_bytes(size) or local_size
-                with progress_lock:
-                    downloaded_bytes[name] = expected_bytes
-                if status_update_callback and not torrent_name_for_status:
-                    status_update_callback(name, 'completed', expected_bytes, expected_bytes, 0)
-                continue
-        
-        print(f"  [{f_idx + 1}/{len(files_with_local_paths)}] Generating link for: {name} ({size})")
-        
-        download_url = _generate_download_link(name, size, selector)
-        
-        if not download_url:
-            # Queue for retry instead of failing immediately
-            failed_files.append((f_idx, file_info))
-            torrent_success = False
-            if status_update_callback and not torrent_name_for_status:
-                status_update_callback(name, 'failed', 0, 0, 0)
-            continue
-        
-        fut = executor.submit(download_consumer, (name, local_path, download_url, size))
-        futures.append(fut)
-    
-    # --- Retry failed link generations ---
-    if failed_files:
-        print(f"\n  Retrying {len(failed_files)} failed link generation(s)...")
-        
-        for retry_attempt in range(1, _MAX_LINK_RETRIES + 1):
-            if not failed_files:
+    try:
+        # Loop through the files inline in the Playwright thread
+        for f_idx in range(total_files):
+            # Check cancel_event/abort flags before acquiring slot
+            if cancel_event and cancel_event.is_set():
+                aborted['value'] = True
+                torrent_success = False
                 break
                 
-            still_failed = []
-            # Wait before retrying to avoid rate limiting
-            page.wait_for_timeout(3000)
+            # Wait for a download slot to open up
+            slot.acquire()
             
-            # Make sure page is in a good state before retrying
+            # Double check cancel_event after slot is acquired
+            if cancel_event and cancel_event.is_set():
+                slot.release()
+                aborted['value'] = True
+                torrent_success = False
+                break
+                
+            name = files_with_local_paths[f_idx]['name']
+            local_path = files_with_local_paths[f_idx]['local_path']
+            selector = files_with_local_paths[f_idx]['selector']
+            size = files_with_local_paths[f_idx]['size']
+
+            # User abort check via status callback
+            if status_update_callback:
+                try:
+                    status_update_callback("", "check_abort", 0, 0, 0)
+                except Exception as e:
+                    if "aborted" in str(e).lower():
+                        print("Queue aborted by user request.")
+                        torrent_success = False
+                        aborted['value'] = True
+                        slot.release()
+                        break
+
+            # Page health / recover from crash
             if not _recover_page_if_crashed():
-                print(f"    Page unrecoverable during retry. Skipping remaining files.")
+                print(f"  [{f_idx + 1}/{total_files}] Skipping {name} (page unrecoverable).")
+                torrent_success = False
+                slot.release()
+                if status_update_callback and not torrent_name_for_status:
+                    status_update_callback(name, 'failed', 0, 0, 0)
+                continue
+
+            # Token expiry check
+            try:
+                current_page_url = page.url.lower()
+            except Exception:
+                current_page_url = ""
+            if "login" in current_page_url or page.locator("input[type='password']").count() > 0:
+                print("Session token has expired or is invalid. Aborting download pipeline.")
+                torrent_success = False
+                aborted['value'] = True
+                token_expired['value'] = True
+                slot.release()
                 break
-            
-            for orig_idx, file_info in failed_files:
-                name = file_info['name']
-                local_path = file_info['local_path']
-                selector = file_info['selector']
-                size = file_info['size']
-                
-                # Skip if already downloaded by another path
-                if os.path.exists(local_path):
-                    local_size = os.path.getsize(local_path)
-                    if is_file_size_matching(local_size, size):
+
+            # Skip already downloaded files
+            if os.path.exists(local_path):
+                local_size = os.path.getsize(local_path)
+                if is_file_size_matching(local_size, size):
+                    print(f"  [{f_idx + 1}/{total_files}] Skipping {name} (already downloaded).")
+                    expected_bytes = parse_size_to_bytes(size) or local_size
+                    with progress_lock:
+                        downloaded_bytes[name] = expected_bytes
+                    if status_update_callback and not torrent_name_for_status:
+                        status_update_callback(name, 'completed', expected_bytes, expected_bytes, 0)
+                    slot.release()
+                    continue
+
+            print(f"  [{f_idx + 1}/{total_files}] Generating link for: {name} ({size})")
+            try:
+                download_url = next_link(name, size, selector)
+            except Exception as e:
+                print(f"    Link generation error for {name}: {e}")
+                download_url = None
+
+            if not download_url:
+                failed_files.append((f_idx, files_with_local_paths[f_idx]))
+                torrent_success = False
+                slot.release()
+                if status_update_callback and not torrent_name_for_status:
+                    status_update_callback(name, 'failed', 0, 0, 0)
+                continue
+
+            # Submit the download consumer to ThreadPoolExecutor
+            fut = executor.submit(download_consumer, (name, local_path, download_url, size))
+            futures.append(fut)
+            submitted_count[0] += 1
+            if status_update_callback and torrent_name_for_status:
+                status_update_callback(torrent_name_for_status, 'downloading', int((submitted_count[0] / total_files) * 100), 100, sum(speeds.values()))
+
+        if token_expired['value']:
+            raise Exception("Your Torbox session token is expired or is invalid. Please log in again at torbox.app and paste a fresh token.")
+
+        # --- Retry failed link generations ---
+        if failed_files and not aborted['value'] and not (cancel_event and cancel_event.is_set()):
+            print(f"\n  Retrying {len(failed_files)} failed link generation(s)...")
+
+            for retry_attempt in range(1, _MAX_LINK_RETRIES + 1):
+                if not failed_files or (cancel_event and cancel_event.is_set()):
+                    break
+
+                still_failed = []
+                page.wait_for_timeout(3000)
+
+                if not _recover_page_if_crashed():
+                    print(f"    Page unrecoverable during retry. Skipping remaining files.")
+                    break
+
+                for orig_idx, file_info in failed_files:
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    name = file_info['name']
+                    local_path = file_info['local_path']
+                    selector = file_info['selector']
+                    size = file_info['size']
+
+                    if os.path.exists(local_path):
+                        local_size = os.path.getsize(local_path)
+                        if is_file_size_matching(local_size, size):
+                            continue
+
+                    slot.acquire()
+                    
+                    if cancel_event and cancel_event.is_set():
+                        slot.release()
+                        break
+                        
+                    try:
+                        download_url = next_link(name, size, selector)
+                    except Exception as e:
+                        print(f"    Link generation error for {name}: {e}")
+                        slot.release()
+                        still_failed.append((orig_idx, file_info))
                         continue
-                
-                print(f"  [Retry {retry_attempt}/{_MAX_LINK_RETRIES}] Generating link for: {name} ({size})")
-                
-                download_url = _generate_download_link(name, size, selector)
-                
-                if download_url:
-                    fut = executor.submit(download_consumer, (name, local_path, download_url, size))
-                    futures.append(fut)
-                else:
-                    still_failed.append((orig_idx, file_info))
-            
-            failed_files = still_failed
-        
-        if failed_files:
-            print(f"    {len(failed_files)} file(s) failed after all retries: {', '.join(f[1]['name'] for f in failed_files)}")
-            
-    for fut in futures:
-        try:
-            fut.result()
-        except Exception as e:
-            print(f"    Download thread error: {e}")
-            torrent_success = False
-    
-    executor.shutdown(wait=False)
+
+                    if download_url:
+                        fut = executor.submit(download_consumer, (name, local_path, download_url, size))
+                        futures.append(fut)
+                    else:
+                        slot.release()
+                        still_failed.append((orig_idx, file_info))
+
+                failed_files = still_failed
+
+            if failed_files and not (cancel_event and cancel_event.is_set()):
+                print(f"    {len(failed_files)} file(s) failed after all retries: {', '.join(f[1]['name'] for f in failed_files)}")
+
+        # Wait for all submitted downloads to complete
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"    Download thread error: {e}")
+                torrent_success = False
+    finally:
+        executor.shutdown(wait=True)
     
     # Clean up route handlers
     if _routes_installed:
@@ -490,82 +564,94 @@ def get_torrent_files_structure(token, url, target_torrent_name, browser_type='c
         engine = getattr(p, browser_type)
         launch_args = browser_args if browser_type == 'chromium' else []
         
+        browser = None
+        context = None
         try:
-            browser = engine.launch(headless=headless, args=launch_args)
-        except Exception:
-            browser = engine.launch(headless=headless)
-            
-        context = browser.new_context(
-            viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        
-        page = context.new_page()
-        
-        def route_blocker(route):
-            req_url = route.request.url.lower()
-            if "torbox.app" in req_url:
-                route.continue_()
-                return
-            if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
-                route.abort()
-            else:
-                route.continue_()
-        page.route("**/*", route_blocker)
-        
-        if token:
             try:
-                page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
-                page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
-                page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
-            except Exception as e:
-                print(f"Failed to inject session token during fetch: {e}")
+                browser = engine.launch(headless=headless, args=launch_args)
+            except Exception:
+                browser = engine.launch(headless=headless)
                 
-        print(f"Fetch structure - Navigating to: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        
-        # Handle auth handshake redirect
-        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+            context = browser.new_context(
+                viewport={'width': 1280, 'height': 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            
+            page = context.new_page()
+            
+            def route_blocker(route):
+                req_url = route.request.url.lower()
+                if "torbox.app" in req_url:
+                    route.continue_()
+                    return
+                if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
+                    route.abort()
+                else:
+                    route.continue_()
+            page.route("**/*", route_blocker)
+            
             if token:
-                page.wait_for_timeout(2000)
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                
-        # Validate if we are still stuck on the login page (token expired or invalid)
-        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-            raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
-        
-        try:
-            page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
-        except Exception:
-            pass
+                try:
+                    page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
+                    page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
+                    page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
+                except Exception as e:
+                    print(f"Failed to inject session token during fetch: {e}")
+                    
+            print(f"Fetch structure - Navigating to: {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-        html_content = page.content()
-        detector = TorboxDetector(html_content)
-        
-        # Locate the card download button directly via the target torrent name
-        title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=target_torrent_name).last
-        card = title_el
-        for _ in range(10):
-            card = card.locator("..")
-            if card.locator("button[title='Download files']").count() > 0:
-                break
-        btn_to_click = card.locator("button[title='Download files']").first
-        
-        if btn_to_click.count() > 0:
-            btn_to_click.evaluate("el => el.click()")
+            # Handle auth handshake redirect
+            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                if token:
+                    page.wait_for_timeout(2000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    
+            # Validate if we are still stuck on the login page (token expired or invalid)
+            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
+            
             try:
-                page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
+                page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
             except Exception:
                 pass
                 
-        html_content = page.content()
-        detector.set_html(html_content)
-        files = detector.parse_structure()
-        
-        browser.close()
-        return files
+            html_content = page.content()
+            detector = TorboxDetector(html_content)
+            
+            # Locate the card download button directly via the target torrent name
+            title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=target_torrent_name).last
+            card = title_el
+            for _ in range(10):
+                card = card.locator("..")
+                if card.locator("button[title='Download files']").count() > 0:
+                    break
+            btn_to_click = card.locator("button[title='Download files']").first
+            
+            if btn_to_click.count() > 0:
+                btn_to_click.evaluate("el => el.click()")
+                try:
+                    page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
+                except Exception:
+                    pass
+                    
+            html_content = page.content()
+            detector.set_html(html_content)
+            files = detector.parse_structure()
+            return files
+        finally:
+            if context:
+                try:
+                    context.close()
+                except:
+                    pass
+            if browser:
+                try:
+                    browser.close()
+                except:
+                    pass
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None):
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None):
     """
     Runs the full automation workflow:
     1. Launches Playwright browser context.
@@ -584,240 +670,238 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
         browser = None
         context = None
         
-        print(f"Launching clean {browser_type} context...")
-        engine = getattr(p, browser_type)
-        
-        # Select launch arguments based on browser type
-        launch_args = browser_args if browser_type == 'chromium' else []
-        
         try:
-            browser = engine.launch(headless=headless, args=launch_args)
-            print(f"Successfully launched {browser_type}.")
-        except Exception as e:
-            logger.warning(f"Could not launch browser: {e}. Falling back to default launch.")
-            browser = engine.launch(headless=headless)
-        
-        context = browser.new_context(
-            viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            permissions=['clipboard-read', 'clipboard-write']
-        )
-        
-        page = context.new_page()
-        
-        def route_blocker(route):
-            req_url = route.request.url.lower()
-            if "torbox.app" in req_url:
-                route.continue_()
-                return
-            if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
-                route.abort()
-            else:
-                route.continue_()
-        page.route("**/*", route_blocker)
-        
-        if token:
-            print(f"Injecting session token into localStorage for Torbox...")
+            print(f"Launching clean {browser_type} context...")
+            engine = getattr(p, browser_type)
+            
+            # Select launch arguments based on browser type
+            launch_args = browser_args if browser_type == 'chromium' else []
+            
             try:
-                page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
-                
-                page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
-                page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
-                print("Session token successfully injected.")
-                
-                val = page.evaluate("localStorage.getItem('sb-db-auth-token')")
-                if val:
-                    print(f"Verified: token is in localStorage (length: {len(val)} characters).")
-                else:
-                    print("Warning: verification failed, localStorage is empty!")
-                    
+                browser = engine.launch(headless=headless, args=launch_args)
+                print(f"Successfully launched {browser_type}.")
             except Exception as e:
-                print(f"Failed to inject session token: {e}")
-                
-        print(f"Navigating to: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        
-        # Handle auth handshake redirect
-        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-            if token:
-                page.wait_for_timeout(2000)
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                
-        # Validate if we are still stuck on the login page (token expired or invalid)
-        if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-            raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
-        
-        # Wait for either the dashboard list or active files list to render
-        print("Analyzing current page state...")
-        try:
-            page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
-        except Exception:
-            pass
-        
-        # Get active page HTML
-        html_content = page.content()
-        
-        # Parse layout using TorboxDetector
-        detector = TorboxDetector(html_content)
-        files = detector.parse_structure()
-        
-        # If no files are detected, we check if we are on the dashboard with torrent cards
-        if not files:
-            torrents = detector.parse_torrents()
-            if torrents:
-                if target_torrent_name:
-                    # Filter to target torrent only
-                    filtered = [t for t in torrents if target_torrent_name.lower() in t['name'].lower()]
-                    if filtered:
-                        torrents = filtered
-                    else:
-                        print(f"Target torrent not found: {target_torrent_name}")
-                        torrents = []
-                
-                print(f"Detected {len(torrents)} torrent folders to expand and download.")
-                if file_scraped_callback:
-                    file_scraped_callback(torrents)
-                    
-                for idx, torrent in enumerate(torrents):
-                    # Check for abort flag in callbacks
-                    if status_update_callback:
-                        status_update_callback(torrent['name'], 'downloading', 0, 100, 0)
-                        
-                    print(f"\n[{idx + 1}/{len(torrents)}] Expanding torrent: {torrent['name']}")
-                    btn_to_click = None
-                    try:
-                        title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent['name']).last
-                        card = title_el
-                        for _ in range(10):
-                            card = card.locator("..")
-                            if card.locator("button[title='Download files']").count() > 0:
-                                break
-                        btn_to_click = card.locator("button[title='Download files']").first
-                        if btn_to_click.count() > 0:
-                            btn_to_click.evaluate("el => el.click()")
-                            try:
-                                page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
-                            except Exception as wait_err:
-                                print(f"Timeout waiting for torrent details page: {wait_err}")
-                        else:
-                            print(f"Could not locate download button for torrent: {torrent['name']}")
-                    except Exception as exp_err:
-                        print(f"Could not click expand button: {exp_err}")
-                        
-                    card_html = page.content()
-                    detector.set_html(card_html)
-                    files = detector.parse_structure()
-                    
-                    if selected_files is not None:
-                        files = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files]
-                        
-                    if not files:
-                        print(f"No matching files selected inside torrent: {torrent['name']}")
-                        if status_update_callback:
-                            status_update_callback(torrent['name'], 'failed', 0, 100, 0)
-                        continue
-                    print(f"Scraped {len(files)} matching/selected files inside {torrent['name']}.")
-                    files_with_local_paths = create_folder_structure(dest_dir, files)
-                    
-                    torrent_success = download_files_pipeline(
-                        page=page,
-                        dest_dir=dest_dir,
-                        files_with_local_paths=files_with_local_paths,
-                        max_parallel_files=max_parallel_files,
-                        status_update_callback=status_update_callback,
-                        torrent_name_for_status=torrent['name'],
-                        url=url,
-                        token=token
-                    )
-                    
-                    try:
-                        # Navigate back to dashboard to reset the SPA view for next torrents
-                        page.goto(url, wait_until="load", timeout=30000)
-                        page.wait_for_timeout(2000)
-                    except:
-                        pass
-                        
-                    if status_update_callback:
-                        if torrent_success:
-                            status_update_callback(torrent['name'], 'completed', 100, 100, 0)
-                        else:
-                            status_update_callback(torrent['name'], 'failed', 0, 100, 0)
-                            
-                print(f"\nAll torrent folder queues completed.")
-                try:
-                    if context:
-                        context.close()
-                except Exception:
-                    pass
-                try:
-                    if browser and browser.is_connected():
-                        browser.close()
-                except Exception:
-                    pass
-                return
-
-            else:
-                if headless:
-                    print("\n[!] No files or torrent cards detected in headless mode.")
-                    browser.close()
+                logger.warning(f"Could not launch browser: {e}. Falling back to default launch.")
+                browser = engine.launch(headless=headless)
+            
+            context = browser.new_context(
+                viewport={'width': 1280, 'height': 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                permissions=['clipboard-read', 'clipboard-write']
+            )
+            
+            page = context.new_page()
+            
+            def route_blocker(route):
+                req_url = route.request.url.lower()
+                if "torbox.app" in req_url:
+                    route.continue_()
                     return
+                if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
+                    route.abort()
                 else:
-                    print("\n[*] Headed browser active.")
-                    print("[*] Please navigate/log in and click on the torrent you want to download in the browser window.")
-                    print("[*] Once the files list is visible on the page, press ENTER here to start parsing & downloading...")
-                    input()
+                    route.continue_()
+            page.route("**/*", route_blocker)
+            
+            if token:
+                print(f"Injecting session token into localStorage for Torbox...")
+                try:
+                    page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
                     
-                    html_content = page.content()
-                    detector.set_html(html_content)
-                    files = detector.parse_structure()
+                    page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
+                    page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
+                    print("Session token successfully injected.")
+                    
+                    val = page.evaluate("localStorage.getItem('sb-db-auth-token')")
+                    if val:
+                        print(f"Verified: token is in localStorage (length: {len(val)} characters).")
+                    else:
+                        print("Warning: verification failed, localStorage is empty!")
+                        
+                except Exception as e:
+                    print(f"Failed to inject session token: {e}")
+                    
+            print(f"Navigating to: {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            
+            # Handle auth handshake redirect
+            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                if token:
+                    page.wait_for_timeout(2000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    
+            # Validate if we are still stuck on the login page (token expired or invalid)
+            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                raise Exception("Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
+            
+            # Wait for either the dashboard list or active files list to render
+            print("Analyzing current page state...")
+            try:
+                page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
+            except Exception:
+                pass
+            
+            # Get active page HTML
+            html_content = page.content()
+            
+            # Parse layout using TorboxDetector
+            detector = TorboxDetector(html_content)
+            files = detector.parse_structure()
+            
+            # If no files are detected, we check if we are on the dashboard with torrent cards
+            if not files:
+                torrents = detector.parse_torrents()
+                if torrents:
+                    if target_torrent_name:
+                        # Filter to target torrent only
+                        filtered = [t for t in torrents if target_torrent_name.lower() in t['name'].lower()]
+                        if filtered:
+                            torrents = filtered
+                        else:
+                            print(f"Target torrent not found: {target_torrent_name}")
+                            torrents = []
+                    
+                    print(f"Detected {len(torrents)} torrent folders to expand and download.")
+                    if file_scraped_callback:
+                        file_scraped_callback(torrents)
+                        
+                    for idx, torrent in enumerate(torrents):
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        # Check for abort flag in callbacks
+                        if status_update_callback:
+                            status_update_callback(torrent['name'], 'downloading', 0, 100, 0)
+                            
+                        print(f"\n[{idx + 1}/{len(torrents)}] Expanding torrent: {torrent['name']}")
+                        btn_to_click = None
+                        try:
+                            title_el = page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent['name']).last
+                            card = title_el
+                            for _ in range(10):
+                                card = card.locator("..")
+                                if card.locator("button[title='Download files']").count() > 0:
+                                    break
+                            btn_to_click = card.locator("button[title='Download files']").first
+                            if btn_to_click.count() > 0:
+                                btn_to_click.evaluate("el => el.click()")
+                                try:
+                                    page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
+                                except Exception as wait_err:
+                                    print(f"Timeout waiting for torrent details page: {wait_err}")
+                            else:
+                                print(f"Could not locate download button for torrent: {torrent['name']}")
+                        except Exception as exp_err:
+                            print(f"Could not click expand button: {exp_err}")
+                            
+                        card_html = page.content()
+                        detector.set_html(card_html)
+                        files = detector.parse_structure()
+                        
+                        if selected_files is not None:
+                            files = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files]
+                            
+                        if not files:
+                            print(f"No matching files selected inside torrent: {torrent['name']}")
+                            if status_update_callback:
+                                status_update_callback(torrent['name'], 'failed', 0, 100, 0)
+                            continue
+                        print(f"Scraped {len(files)} matching/selected files inside {torrent['name']}.")
+                        files_with_local_paths = create_folder_structure(dest_dir, files)
+                        
+                        torrent_success = download_files_pipeline(
+                            page=page,
+                            dest_dir=dest_dir,
+                            files_with_local_paths=files_with_local_paths,
+                            max_parallel_files=max_parallel_files,
+                            status_update_callback=status_update_callback,
+                            torrent_name_for_status=torrent['name'],
+                            url=url,
+                            token=token,
+                            delay=delay,
+                            parallel_connections=parallel_connections,
+                            cancel_event=cancel_event
+                        )
+                        
+                        try:
+                            # Navigate back to dashboard to reset the SPA view for next torrents
+                            page.goto(url, wait_until="load", timeout=30000)
+                            page.wait_for_timeout(2000)
+                        except:
+                            pass
+                            
+                        if status_update_callback:
+                            if torrent_success:
+                                status_update_callback(torrent['name'], 'completed', 100, 100, 0)
+                            else:
+                                status_update_callback(torrent['name'], 'failed', 0, 100, 0)
+                                
+                    print(f"\nAll torrent folder queues completed.")
+                    return
+    
+                else:
+                    if headless:
+                        print("\n[!] No files or torrent cards detected in headless mode.")
+                        return
+                    else:
+                        print("\n[*] Headed browser active.")
+                        print("[*] Please navigate/log in and click on the torrent you want to download in the browser window.")
+                        print("[*] Once the files list is visible on the page, press ENTER here to start parsing & downloading...")
+                        input()
+                        
+                        html_content = page.content()
+                        detector.set_html(html_content)
+                        files = detector.parse_structure()
+                    
+            if selected_files is not None and files:
+                files = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files]
                 
-        if selected_files is not None and files:
-            files = [f for f in files if "/".join(f.get('path', []) + [f['name']]) in selected_files]
+            if not files:
+                print("[!] Could not detect any matching/selected files on the page.")
+                print("Please make sure you are on the Torbox torrent download detail page (files list visible) and have valid file selections.")
+                debug_file = "torbox_debug.html"
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                print(f"Saved page HTML to {debug_file} for debugging.")
+                return
+                
+            print(f"Detected {len(files)} matching/selected files and folder structures:")
+            for idx, f in enumerate(files):
+                path_str = " / ".join(f['path'])
+                print(f"  [{idx + 1}] {path_str} / {f['name']} ({f['size']})")
+                
+            # Recreate folders locally
+            print("\nRecreating local folder architecture...")
+            files_with_local_paths = create_folder_structure(dest_dir, files)
             
-        if not files:
-            print("[!] Could not detect any matching/selected files on the page.")
-            print("Please make sure you are on the Torbox torrent download detail page (files list visible) and have valid file selections.")
-            debug_file = "torbox_debug.html"
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(html_content)
-            print(f"Saved page HTML to {debug_file} for debugging.")
-            browser.close()
-            return
+            if file_scraped_callback:
+                file_scraped_callback(files_with_local_paths)
             
-        print(f"Detected {len(files)} matching/selected files and folder structures:")
-        for idx, f in enumerate(files):
-            path_str = " / ".join(f['path'])
-            print(f"  [{idx + 1}] {path_str} / {f['name']} ({f['size']})")
-            
-        # Recreate folders locally
-        print("\nRecreating local folder architecture...")
-        files_with_local_paths = create_folder_structure(dest_dir, files)
-        
-        if file_scraped_callback:
-            file_scraped_callback(files_with_local_paths)
-        
-        # Start parallel downloading
-        print("\nStarting parallel download queue...")
-        torrent_success = download_files_pipeline(
-            page=page,
-            dest_dir=dest_dir,
-            files_with_local_paths=files_with_local_paths,
-            max_parallel_files=max_parallel_files,
-            status_update_callback=status_update_callback,
-            torrent_name_for_status=None,
-            url=url,
-            token=token
-        )
-        try:
+            # Start parallel downloading
+            print("\nStarting parallel download queue...")
+            torrent_success = download_files_pipeline(
+                page=page,
+                dest_dir=dest_dir,
+                files_with_local_paths=files_with_local_paths,
+                max_parallel_files=max_parallel_files,
+                status_update_callback=status_update_callback,
+                torrent_name_for_status=None,
+                url=url,
+                token=token,
+                delay=delay,
+                parallel_connections=parallel_connections,
+                cancel_event=cancel_event
+            )
+        finally:
             if context:
-                context.close()
-        except Exception:
-            pass
-        try:
-            if browser and browser.is_connected():
-                browser.close()
-        except Exception:
-            pass
+                try:
+                    context.close()
+                except:
+                    pass
+            if browser:
+                try:
+                    browser.close()
+                except:
+                    pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Torbox Folder-Structure Downloader GUI")

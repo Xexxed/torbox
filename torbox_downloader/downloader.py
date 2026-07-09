@@ -33,7 +33,7 @@ def parse_size_to_bytes(size_str):
     
     return int(value * units[unit])
 
-def _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback):
+def _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event=None):
     # Ensure parent directory exists
     parent_dir = os.path.dirname(part_path)
     if parent_dir:
@@ -42,6 +42,9 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
     session = requests.Session()
     attempt = 0
     while attempt < retries:
+        if cancel_event and cancel_event.is_set():
+            logger.info("Download cancelled before single-threaded download start.")
+            return False
         try:
             resume_header = {}
             existing_bytes = 0
@@ -55,7 +58,10 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
             
             if response.status_code not in [200, 206]:
                 if response.status_code == 416 and existing_bytes > 0:
-                    os.remove(part_path)
+                    try:
+                        os.remove(part_path)
+                    except:
+                        pass
                     existing_bytes = 0
                     response = session.get(url, headers=headers, stream=True, timeout=30)
                 else:
@@ -70,34 +76,53 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
             if len(desc) > 30:
                 desc = desc[:27] + "..."
                 
+            last_update_time = 0.0
+            update_interval = 0.25 # update GUI at most every 250ms
+            
             with open(part_path, mode) as f:
                 with tqdm(total=stream_total, initial=existing_bytes, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
                     downloaded = existing_bytes
                     start_time = time.time()
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    for chunk in response.iter_content(chunk_size=512 * 1024): # 512KB chunks
+                        if cancel_event and cancel_event.is_set():
+                            raise IOError("Aborted by user")
                         if chunk:
                             f.write(chunk)
                             chunk_len = len(chunk)
                             pbar.update(chunk_len)
                             downloaded += chunk_len
                             if progress_callback:
-                                elapsed = time.time() - start_time
-                                speed = (downloaded - existing_bytes) / elapsed if elapsed > 0 else 0
-                                progress_callback(os.path.basename(local_path), downloaded, stream_total, speed)
-                                
+                                now = time.time()
+                                if now - last_update_time >= update_interval or downloaded >= stream_total:
+                                    last_update_time = now
+                                    elapsed = now - start_time
+                                    speed = (downloaded - existing_bytes) / elapsed if elapsed > 0 else 0
+                                    progress_callback(os.path.basename(local_path), downloaded, stream_total, speed)
+                                    
             if os.path.exists(local_path):
-                os.remove(local_path)
+                try:
+                    os.remove(local_path)
+                except:
+                    pass
             os.rename(part_path, local_path)
             print(f"Successfully downloaded: {os.path.basename(local_path)}")
             return True
             
         except (requests.RequestException, IOError) as e:
+            if (cancel_event and cancel_event.is_set()) or "aborted" in str(e).lower():
+                print(f"Download of {os.path.basename(local_path)} aborted.")
+                return False
             attempt += 1
             wait_time = backoff_factor ** attempt
             print(f"Error downloading {os.path.basename(local_path)}: {e}")
             if attempt < retries:
                 print(f"Retrying in {wait_time}s (Attempt {attempt + 1}/{retries})...")
-                time.sleep(wait_time)
+                slept = 0.0
+                while slept < wait_time:
+                    if cancel_event and cancel_event.is_set():
+                        return False
+                    time.sleep(0.2)
+                    slept += 0.2
             else:
                 print(f"Failed to download {os.path.basename(local_path)} after {retries} attempts.")
                 return False
@@ -116,7 +141,7 @@ def is_file_size_matching(local_size, expected_size_str):
     ratio = local_size / expected_bytes
     return 0.5 <= ratio <= 2.0
 
-def download_file(url, local_path, expected_size_str=None, headers=None, retries=5, backoff_factor=2, progress_callback=None):
+def download_file(url, local_path, expected_size_str=None, headers=None, retries=5, backoff_factor=2, progress_callback=None, parallel=True, num_threads=4, cancel_event=None):
     """
     Downloads a file using parallel segmented chunk downloads (similar to IDM)
     if the server supports it, otherwise falls back to single-threaded chunked downloads.
@@ -161,16 +186,16 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                         print(f"Warning: Size mismatch for download. Expected {expected_size_str} ({expected_bytes} bytes), but server returned content-length of {total_size} bytes. Proceeding anyway.")
 
             accept_ranges = 'bytes' in r.headers.get('Accept-Ranges', '').lower() or r.status_code == 206
-            if not accept_ranges and total_size > 5 * 1024 * 1024:
+            if not accept_ranges and total_size > 1024 * 1024 * 1024:
                 accept_ranges = True
     except Exception as e:
         logger.error(f"Error fetching headers: {e}")
 
-    if total_size < 5 * 1024 * 1024 or not accept_ranges or total_size == 0:
-        return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback)
+    if total_size < 1024 * 1024 * 1024 or not accept_ranges or total_size == 0 or not parallel:
+        return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event)
 
-    # Replicate IDM multi-connection speed boost (8 threads)
-    num_threads = 8
+    # Replicate IDM multi-connection speed boost (max 4 threads to reduce 429 rate limits)
+    num_threads = max(1, min(int(num_threads), 4))
     segment_size = total_size // num_threads
     ranges = []
     for i in range(num_threads):
@@ -182,15 +207,46 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
 
-    try:
-        with open(part_path, 'wb') as f:
-            f.truncate(total_size)
-    except IOError as e:
-        logger.error(f"Failed to pre-allocate file, falling back to single-thread: {e}")
-        return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback)
+    # Check for existing segment files
+    existing_segments = []
+    if parent_dir:
+        try:
+            existing_segments = [f for f in os.listdir(parent_dir) if f.startswith(os.path.basename(part_path) + ".")]
+        except Exception:
+            pass
+            
+    existing_indices = []
+    for f_name in existing_segments:
+        try:
+            idx = int(f_name.split('.')[-1])
+            existing_indices.append(idx)
+        except ValueError:
+            pass
+            
+    # If the number of segment files doesn't match num_threads, or they are not sequential from 0 to num_threads-1,
+    # clean them up and start fresh.
+    should_clean = False
+    if existing_indices:
+        if len(existing_indices) != num_threads or set(existing_indices) != set(range(num_threads)):
+            should_clean = True
+            
+    if should_clean:
+        print("Number of connections changed or segment files mismatch. Cleaning up old segments...")
+        for idx in existing_indices:
+            try:
+                os.remove(f"{part_path}.{idx}")
+            except:
+                pass
 
+    # Calculate initially downloaded bytes from existing segment files
+    initial_downloaded_bytes = 0
+    for idx in range(num_threads):
+        seg_path = f"{part_path}.{idx}"
+        if os.path.exists(seg_path):
+            initial_downloaded_bytes += os.path.getsize(seg_path)
+            
     downloaded_lock = threading.Lock()
-    downloaded_bytes = 0
+    downloaded_bytes = initial_downloaded_bytes
     start_time = time.time()
     errors = []
 
@@ -200,66 +256,150 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
 
     print(f"Connecting to download {os.path.basename(local_path)} using {num_threads} connections...")
 
+    last_update_time = [0.0]
+    update_interval = 0.25 # update GUI at most every 250ms
+
     def download_segment(segment_idx, start, end):
         nonlocal downloaded_bytes
-        seg_headers = {**headers, 'Range': f'bytes={start}-{end}'}
+        seg_path = f"{part_path}.{segment_idx}"
         
         seg_attempt = 0
         while seg_attempt < retries:
+            if cancel_event and cancel_event.is_set():
+                return False
             try:
+                existing_bytes = 0
+                if os.path.exists(seg_path):
+                    existing_bytes = os.path.getsize(seg_path)
+                
+                # Check if we already finished this segment
+                seg_total_size = end - start + 1
+                if existing_bytes >= seg_total_size:
+                    return True
+                
+                # Request only remaining bytes for this segment
+                curr_start = start + existing_bytes
+                seg_headers = {**headers, 'Range': f'bytes={curr_start}-{end}'}
+                
                 resp = requests.get(url, headers=seg_headers, stream=True, timeout=30)
                 if resp.status_code not in [200, 206]:
-                    resp.raise_for_status()
-
-                with open(part_path, 'r+b') as f:
-                    f.seek(start)
+                    if resp.status_code == 416 and existing_bytes > 0:
+                        try:
+                            os.remove(seg_path)
+                        except:
+                            pass
+                        existing_bytes = 0
+                        seg_headers = {**headers, 'Range': f'bytes={start}-{end}'}
+                        resp = requests.get(url, headers=seg_headers, stream=True, timeout=30)
+                        if resp.status_code not in [200, 206]:
+                            resp.raise_for_status()
+                    else:
+                        resp.raise_for_status()
+                
+                mode = 'ab' if (resp.status_code == 206 and existing_bytes > 0) else 'wb'
+                
+                with open(seg_path, mode) as f:
                     for chunk in resp.iter_content(chunk_size=512 * 1024): # 512KB chunks
+                        if cancel_event and cancel_event.is_set():
+                            raise IOError("Aborted by user")
                         if chunk:
                             f.write(chunk)
                             chunk_len = len(chunk)
-                            
                             with downloaded_lock:
                                 downloaded_bytes += chunk_len
                                 if progress_callback:
-                                    elapsed = time.time() - start_time
-                                    speed = downloaded_bytes / elapsed if elapsed > 0 else 0
-                                    progress_callback(os.path.basename(local_path), downloaded_bytes, total_size, speed)
-                return True
+                                    now = time.time()
+                                    if now - last_update_time[0] >= update_interval or downloaded_bytes >= total_size:
+                                        last_update_time[0] = now
+                                        elapsed = now - start_time
+                                        speed = downloaded_bytes / elapsed if elapsed > 0 else 0
+                                        progress_callback(os.path.basename(local_path), downloaded_bytes, total_size, speed)
+                
+                # Verify segment size
+                if os.path.exists(seg_path) and os.path.getsize(seg_path) >= seg_total_size:
+                    return True
+                else:
+                    raise IOError("Segment download incomplete")
             except Exception as e:
-                if "aborted" in str(e).lower() or "aborted" in str(getattr(e, '__context__', '')).lower():
+                if cancel_event and cancel_event.is_set() or "aborted" in str(e).lower() or "aborted" in str(getattr(e, '__context__', '')).lower():
                     errors.append(f"Aborted: {e}")
                     raise
                 seg_attempt += 1
                 if seg_attempt >= retries:
                     errors.append(f"Segment {segment_idx} failed: {e}")
                     return False
-                time.sleep(backoff_factor ** seg_attempt)
+                slept = 0.0
+                wait_time = backoff_factor ** seg_attempt
+                while slept < wait_time:
+                    if cancel_event and cancel_event.is_set():
+                        return False
+                    time.sleep(0.2)
+                    slept += 0.2
         return False
 
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = [executor.submit(download_segment, idx, r[0], r[1]) for idx, r in enumerate(ranges)]
         
-        with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
-            last_val = 0
+        with tqdm(total=total_size, initial=initial_downloaded_bytes, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
+            last_val = initial_downloaded_bytes
             while True:
                 with downloaded_lock:
                     curr = downloaded_bytes
                 pbar.update(curr - last_val)
                 last_val = curr
-                if curr >= total_size or len(errors) > 0:
+                if curr >= total_size or len(errors) > 0 or (cancel_event and cancel_event.is_set()):
                     break
                 time.sleep(0.2)
             
-            if len(errors) == 0:
+            if len(errors) == 0 and not (cancel_event and cancel_event.is_set()):
                 pbar.update(total_size - last_val)
 
+    if (cancel_event and cancel_event.is_set()) or any("Aborted" in err for err in errors):
+        print(f"Segmented download aborted: {os.path.basename(local_path)}")
+        return False
+
     if errors:
-        print(f"Segmented download failed: {errors[0]}")
+        print(f"Segmented download failed: {errors[0]}. Falling back to single-threaded resume...")
+        try:
+            return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event)
+        except Exception as e:
+            logger.error(f"Single-threaded fallback failed for {os.path.basename(local_path)}: {e}")
+            return False
+
+    # Merge segments sequentially to avoid disk thrashing and files lock contention
+    print(f"Merging segments for {os.path.basename(local_path)}...")
+    try:
+        seg0_path = f"{part_path}.0"
         if os.path.exists(part_path):
             try:
                 os.remove(part_path)
             except:
                 pass
+        
+        if os.path.exists(seg0_path):
+            os.rename(seg0_path, part_path)
+        else:
+            raise IOError("Segment 0 file missing, cannot merge")
+
+        with open(part_path, 'ab') as dest_f:
+            for idx in range(1, num_threads):
+                seg_path = f"{part_path}.{idx}"
+                with open(seg_path, 'rb') as src_f:
+                    while True:
+                        if cancel_event and cancel_event.is_set():
+                            raise IOError("Aborted during merge")
+                        chunk = src_f.read(8 * 1024 * 1024) # 8MB buffer
+                        if not chunk:
+                            break
+                        dest_f.write(chunk)
+                try:
+                    os.remove(seg_path)
+                except Exception as e:
+                    logger.warning(f"Could not remove temporary segment file {seg_path}: {e}")
+    except Exception as merge_err:
+        logger.error(f"Error merging segments for {os.path.basename(local_path)}: {merge_err}")
+        if cancel_event and cancel_event.is_set():
+            return False
         return False
 
     if os.path.exists(local_path):
@@ -267,6 +407,11 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
             os.remove(local_path)
         except:
             pass
-    os.rename(part_path, local_path)
+    try:
+        os.rename(part_path, local_path)
+    except Exception as e:
+        logger.error(f"Failed to rename merged part file to local path: {e}")
+        return False
+        
     print(f"Successfully downloaded: {os.path.basename(local_path)}")
     return True

@@ -18,12 +18,14 @@ class AppState:
         self.browser_type = "chromium"
         self.headless = True
         self.max_parallel_files = 1
+        self.parallel_connections = True
         
         self.status = "idle"  # idle, scanning, downloading, finished, error
         self.error_message = ""
         self.queue = []       # list of file dicts: {name, path, size, status, progress, speed}
         self.logs = []        # list of console log lines
         self.abort_flag = False
+        self.cancel_event = threading.Event()
         self.active_downloads = {}  # dict: {filename: {downloaded, total, speed, status, progress}}
         
         # Load default token if present
@@ -51,6 +53,8 @@ class AppState:
                         self.delay = data["delay"]
                     if "max_parallel_files" in data:
                         self.max_parallel_files = int(data["max_parallel_files"])
+                    if "parallel_connections" in data:
+                        self.parallel_connections = bool(data["parallel_connections"])
             except Exception:
                 pass
 
@@ -60,7 +64,8 @@ class AppState:
                 json.dump({
                     "dest_dir": self.dest_dir,
                     "delay": self.delay,
-                    "max_parallel_files": self.max_parallel_files
+                    "max_parallel_files": self.max_parallel_files,
+                    "parallel_connections": self.parallel_connections
                 }, f)
         except Exception:
             pass
@@ -142,31 +147,54 @@ class AppState:
 
     def get_serializable_state(self):
         with self.lock:
-            # Re-read free space dynamically
-            free_space_str = "Unknown"
-            try:
-                os.makedirs(self.dest_dir, exist_ok=True)
-                total, used, free = shutil.disk_usage(self.dest_dir)
-                free_gb = free / (1024**3)
-                if free_gb > 1024:
-                    free_space_str = f"{free_gb / 1024:.1f} TB"
-                else:
-                    free_space_str = f"{free_gb:.1f} GB"
-            except Exception:
-                pass
+            token = self.token
+            dest_dir = self.dest_dir
+            delay = self.delay
+            status = self.status
+            error_message = self.error_message
+            queue = list(self.queue)
+            logs = list(self.logs)
+            active_downloads = dict(self.active_downloads)
+            max_parallel_files = self.max_parallel_files
+            parallel_connections = self.parallel_connections
 
-            return {
-                "token": self.token,
-                "dest_dir": self.dest_dir,
-                "delay": self.delay,
-                "status": self.status,
-                "error_message": self.error_message,
-                "queue": list(self.queue),
-                "logs": list(self.logs),
-                "active_downloads": dict(self.active_downloads),
-                "free_space": free_space_str,
-                "max_parallel_files": self.max_parallel_files
-            }
+        # Compute free space OUTSIDE the lock so a slow/blocking filesystem
+        # call (e.g. on an unready/removable/local path) can't freeze the
+        # whole status endpoint and leave the UI stuck on "Scanning...".
+        # Also avoid os.makedirs here so we don't create/scan the directory
+        # on every 800ms poll.
+        free_space_str = "Unknown"
+        try:
+            probe = dest_dir
+            while probe and not os.path.exists(probe):
+                parent = os.path.dirname(probe)
+                if parent == probe:
+                    break
+                probe = parent
+            if not probe or not os.path.exists(probe):
+                probe = os.path.expanduser("~")
+            total, used, free = shutil.disk_usage(probe)
+            free_gb = free / (1024 ** 3)
+            if free_gb > 1024:
+                free_space_str = f"{free_gb / 1024:.1f} TB"
+            else:
+                free_space_str = f"{free_gb:.1f} GB"
+        except Exception:
+            pass
+
+        return {
+            "token": token,
+            "dest_dir": dest_dir,
+            "delay": delay,
+            "status": status,
+            "error_message": error_message,
+            "queue": queue,
+            "logs": logs,
+            "active_downloads": active_downloads,
+            "free_space": free_space_str,
+            "max_parallel_files": max_parallel_files,
+            "parallel_connections": parallel_connections
+        }
 
 app_state = AppState()
 
@@ -202,68 +230,79 @@ def scan_torrents_background(token, browser_type, headless):
     from playwright.sync_api import sync_playwright
     from torbox_downloader.detector import TorboxDetector
     
+    browser = None
+    context = None
     try:
         with sync_playwright() as p:
-            browser = getattr(p, browser_type).launch(headless=True)
-            context = browser.new_context(viewport={'width': 1280, 'height': 800})
-            page = context.new_page()
-            
-            def route_blocker(route):
-                req_url = route.request.url.lower()
-                if "torbox.app" in req_url:
-                    route.continue_()
-                    return
-                if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
-                    route.abort()
-                else:
-                    route.continue_()
-            page.route("**/*", route_blocker)
-            
-            # Inject token fast via commit wait
-            page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
-            page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
-            page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
-            
-            page.goto("https://torbox.app/download", wait_until="domcontentloaded", timeout=60000)
-            
-            # Handle auth handshake redirect
-            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-                page.wait_for_timeout(2000)
+            try:
+                browser = getattr(p, browser_type).launch(headless=True)
+                context = browser.new_context(viewport={'width': 1280, 'height': 800})
+                page = context.new_page()
+                
+                def route_blocker(route):
+                    req_url = route.request.url.lower()
+                    if "torbox.app" in req_url:
+                        route.continue_()
+                        return
+                    if any(kw in req_url for kw in ['intercom', 'jam.dev', 'featurebase', 'sentry', 'hotjar', 'analytics', 'doubleclick', 'google-analytics']):
+                        route.abort()
+                    else:
+                        route.continue_()
+                page.route("**/*", route_blocker)
+                
+                # Inject token fast via commit wait
+                page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
+                page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(token)})")
+                page.evaluate(f"localStorage.setItem('torbox_session_token', {json.dumps(token)})")
+                
                 page.goto("https://torbox.app/download", wait_until="domcontentloaded", timeout=60000)
                 
-            # Validate if we are still stuck on the login page (token expired or invalid)
-            if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-                app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token is expired or invalid. Please paste a fresh token.")
-                app_state.set_status("error", "Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
-                browser.close()
-                return
-                
-            try:
-                page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
-            except Exception:
-                pass
-            
-            html = page.content()
-            detector = TorboxDetector(html)
-            torrents = detector.parse_torrents()
-            
-            if torrents:
-                app_state.update_queue(torrents)
-                app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Successfully scraped {len(torrents)} active torrents from Torbox.")
-            else:
-                app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Checked Torbox download queue: no active torrents found.")
-                
-            # Clear error status if scanner succeeded
-            with app_state.lock:
-                if app_state.status == "error":
-                    app_state.status = "idle"
-                    app_state.error_message = ""
+                # Handle auth handshake redirect
+                if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                    page.wait_for_timeout(2000)
+                    page.goto("https://torbox.app/download", wait_until="domcontentloaded", timeout=60000)
                     
-            browser.close()
+                # Validate if we are still stuck on the login page (token expired or invalid)
+                if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
+                    app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token is expired or invalid. Please paste a fresh token.")
+                    app_state.set_status("error", "Your Torbox session token is expired or invalid. Please log in again at torbox.app and paste a fresh token.")
+                    return
+                    
+                try:
+                    page.wait_for_selector("button[title='Download files'], button[title*='Download'], button[aria-label*='Download'], a[download]", timeout=15000)
+                except Exception:
+                    pass
+                
+                html = page.content()
+                detector = TorboxDetector(html)
+                torrents = detector.parse_torrents()
+                
+                if torrents:
+                    app_state.update_queue(torrents)
+                    app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Successfully scraped {len(torrents)} active torrents from Torbox.")
+                else:
+                    app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Checked Torbox download queue: no active torrents found.")
+                    
+                # Clear error status if scanner succeeded
+                with app_state.lock:
+                    if app_state.status == "error":
+                        app_state.status = "idle"
+                        app_state.error_message = ""
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except:
+                        pass
+                if browser:
+                    try:
+                        browser.close()
+                    except:
+                        pass
     except Exception as e:
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")
 
-def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None):
+def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True):
     app_state.set_status("scanning")
     app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Initializing Torbox Engine...")
     
@@ -302,7 +341,9 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             status_update_callback=status_update_cb,
             target_torrent_name=target_torrent_name,
             max_parallel_files=max_parallel_files,
-            selected_files=selected_files
+            selected_files=selected_files,
+            parallel_connections=parallel_connections,
+            cancel_event=app_state.cancel_event
         )
         app_state.set_status("finished")
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")
@@ -382,6 +423,8 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     app_state.delay = int(params["delay"])
                 if "max_parallel_files" in params:
                     app_state.max_parallel_files = int(params["max_parallel_files"])
+                if "parallel_connections" in params:
+                    app_state.parallel_connections = bool(params["parallel_connections"])
                 app_state.save_settings()
             
             if token_updated:
@@ -447,6 +490,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 return
 
             app_state.abort_flag = False
+            app_state.cancel_event.clear()
             app_state.error_message = ""
             url = params.get("url", "https://torbox.app/download")
             torrent_name = params.get("torrent_name", None)
@@ -463,7 +507,8 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     app_state.token,
                     torrent_name,
                     app_state.max_parallel_files,
-                    selected_files
+                    selected_files,
+                    app_state.parallel_connections
                 ),
                 daemon=True
             )
@@ -477,6 +522,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/stop":
             app_state.abort_flag = True
+            app_state.cancel_event.set()
             app_state.set_status("idle")
             app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Stop signal received. Aborting queue...")
             
@@ -488,6 +534,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/logout":
             app_state.abort_flag = True
+            app_state.cancel_event.set()
             with app_state.lock:
                 app_state.token = ""
                 app_state.queue = []
