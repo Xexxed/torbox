@@ -194,8 +194,8 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     if total_size < 1024 * 1024 * 1024 or not accept_ranges or total_size == 0 or not parallel:
         return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event)
 
-    # Replicate IDM multi-connection speed boost (max 4 threads to reduce 429 rate limits)
-    num_threads = max(1, min(int(num_threads), 4))
+    # Replicate IDM multi-connection speed boost (max 5 threads to reduce 429 rate limits)
+    num_threads = max(1, min(int(num_threads), 5))
     segment_size = total_size // num_threads
     ranges = []
     for i in range(num_threads):
@@ -324,12 +324,31 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                 if cancel_event and cancel_event.is_set() or "aborted" in str(e).lower() or "aborted" in str(getattr(e, '__context__', '')).lower():
                     errors.append(f"Aborted: {e}")
                     raise
+                
+                is_429 = False
+                if isinstance(e, requests.exceptions.HTTPError) and e.response is not None and e.response.status_code == 429:
+                    is_429 = True
+                
                 seg_attempt += 1
                 if seg_attempt >= retries:
                     errors.append(f"Segment {segment_idx} failed: {e}")
                     return False
+
+                if is_429:
+                    retry_after_val = e.response.headers.get('Retry-After')
+                    wait_time = 5
+                    if retry_after_val:
+                        try:
+                            wait_time = int(retry_after_val)
+                        except ValueError:
+                            pass
+                    else:
+                        wait_time = 5 * (2 ** seg_attempt)
+                    print(f"Warning: Rate limited (429) on segment {segment_idx} for {os.path.basename(local_path)}. Retrying in {wait_time}s...")
+                else:
+                    wait_time = backoff_factor ** seg_attempt
+
                 slept = 0.0
-                wait_time = backoff_factor ** seg_attempt
                 while slept < wait_time:
                     if cancel_event and cancel_event.is_set():
                         return False

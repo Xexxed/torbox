@@ -771,8 +771,11 @@ function renderLogs(logs, activeDownloads) {
                 failedHtml += `
                 <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
                     <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
-                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${filename}">${filename}</span>
-                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);"><span style="color: #ff5f56; font-weight: bold;">Failed</span></span>
+                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;" title="${filename}">${filename}</span>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <button onclick="retryFailedFile('${filename.replace(/'/g, "\\'")}')" style="background: var(--accent-emerald); color: #000000; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; border: none; cursor: pointer;">Retry</button>
+                            <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);"><span style="color: #ff5f56; font-weight: bold;">Failed</span></span>
+                        </div>
                     </div>
                     <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
                         <div class="progress-bar-fill" style="background: #ff5f56; width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
@@ -844,4 +847,43 @@ function renderCompleted(queue) {
         `;
     });
     tbody.innerHTML = html;
+}
+
+// Retry a single failed download file
+function retryFailedFile(filename) {
+    const startBtn = document.getElementById('start-btn');
+    const startText = document.getElementById('start-btn-text');
+    
+    // Set running UI state immediately
+    if (startBtn) {
+        startBtn.classList.remove('btn-primary');
+        startBtn.classList.add('btn-secondary');
+    }
+    if (startText) {
+        startText.textContent = 'Stop Download';
+    }
+    isRunning = true;
+    
+    fetch('/api/retry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: filename })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data && data.success) {
+            showToast("success", "Retrying Download", `Retrying: ${filename}`);
+            // Auto switch to Downloading tab
+            switchConsoleTab('downloading');
+        } else {
+            alert(data ? data.error : "Failed to retry file download.");
+            isRunning = false;
+            fetchStatus();
+        }
+    })
+    .catch(err => {
+        console.error("Error retrying file:", err);
+        isRunning = false;
+        fetchStatus();
+    });
 }
