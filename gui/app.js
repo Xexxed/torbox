@@ -1,3 +1,27 @@
+// Extract api_key from URL query parameters and store it
+const urlParams = new URLSearchParams(window.location.search);
+const apiKey = urlParams.get('api_key') || localStorage.getItem('torbox_api_key') || '';
+if (urlParams.get('api_key')) {
+    localStorage.setItem('torbox_api_key', urlParams.get('api_key'));
+}
+
+// Redefine window.fetch to automatically inject X-API-Key header
+const originalFetch = window.fetch;
+window.fetch = function (resource, options) {
+    if (apiKey) {
+        options = options || {};
+        options.headers = options.headers || {};
+        if (options.headers instanceof Headers) {
+            options.headers.set('X-API-Key', apiKey);
+        } else if (Array.isArray(options.headers)) {
+            options.headers.push(['X-API-Key', apiKey]);
+        } else {
+            options.headers['X-API-Key'] = apiKey;
+        }
+    }
+    return originalFetch(resource, options);
+};
+
 // Application State variables
 let currentTab = 'dashboard';
 let currentConsoleTab = 'downloading';
@@ -118,13 +142,17 @@ function saveSettings() {
     const delay = parseInt(document.getElementById('delay-input').value) || 5;
     const max_parallel_files = parseInt(document.getElementById('parallel-downloads-input').value) || 1;
     const parallel_connections = document.getElementById('parallel-connections-input').checked;
+    const watch_mode = document.getElementById('watch-mode-input').checked;
+    const watch_interval = parseInt(document.getElementById('watch-interval-input').value) || 60;
     
     const body = {
         token: token,
         dest_dir: dest_dir,
         delay: delay,
         max_parallel_files: max_parallel_files,
-        parallel_connections: parallel_connections
+        parallel_connections: parallel_connections,
+        watch_mode: watch_mode,
+        watch_interval: watch_interval
     };
     
     fetch('/api/settings', {
@@ -524,8 +552,15 @@ function fetchStatus() {
         .then(state => {
             // 1. Sync settings fields if not focused
             const tokenInput = document.getElementById('session-token-input');
-            if (document.activeElement !== tokenInput && state.token) {
-                tokenInput.value = state.token;
+            if (document.activeElement !== tokenInput) {
+                if (state.token_set) {
+                    // Only overwrite if it doesn't already show a masked value or actual value
+                    if (!tokenInput.value) {
+                        tokenInput.value = '••••••••••••••••••••';
+                    }
+                } else {
+                    tokenInput.value = '';
+                }
             }
             
             // Check if the token has expired
@@ -551,34 +586,24 @@ function fetchStatus() {
                 parallelConnsInput.checked = state.parallel_connections;
             }
 
-            // Extract and display user email from token if available
-            let displayEmail = "Account";
-            if (state.token) {
-                try {
-                    const parsed = JSON.parse(state.token);
-                    if (parsed.user && parsed.user.email) {
-                        displayEmail = parsed.user.email;
-                    } else if (parsed.email) {
-                        displayEmail = parsed.email;
-                    }
-                } catch (e) {
-                    try {
-                        const parts = state.token.split('.');
-                        if (parts.length === 3) {
-                            const payload = JSON.parse(atob(parts[1]));
-                            if (payload.email) {
-                                displayEmail = payload.email;
-                            }
-                        }
-                    } catch (jwtErr) {}
-                }
+            const watchModeInput = document.getElementById('watch-mode-input');
+            if (watchModeInput && document.activeElement !== watchModeInput && state.watch_mode !== undefined) {
+                watchModeInput.checked = state.watch_mode;
             }
+
+            const watchIntervalInput = document.getElementById('watch-interval-input');
+            if (watchIntervalInput && document.activeElement !== watchIntervalInput && state.watch_interval !== undefined) {
+                watchIntervalInput.value = state.watch_interval;
+            }
+
+            // Extract and display user email from backend state
+            let displayEmail = state.email || "Account";
             const accountEl = document.getElementById('account-status');
             if (accountEl) {
                 const span = accountEl.querySelector('span');
                 if (span) {
                     span.textContent = displayEmail;
-                    span.style.color = state.token ? '#04BF8A' : '';
+                    span.style.color = state.token_set ? '#04BF8A' : '';
                 }
             }
 

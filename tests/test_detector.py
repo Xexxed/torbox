@@ -192,7 +192,6 @@ class TestDashboardExclusion(unittest.TestCase):
         </html>
         """
         detector = TorboxDetector(mock_html_no_subdirs)
-        detector.excluded_nodes = set()
         
         files = detector.parse_structure()
         self.assertEqual(len(files), 2)

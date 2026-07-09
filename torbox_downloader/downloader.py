@@ -99,6 +99,10 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
                                     speed = (downloaded - existing_bytes) / elapsed if elapsed > 0 else 0
                                     progress_callback(os.path.basename(local_path), downloaded, stream_total, speed)
                                     
+            downloaded_size = os.path.getsize(part_path)
+            if stream_total > 0 and downloaded_size != stream_total:
+                raise IOError(f"Integrity check failed: downloaded {downloaded_size} bytes, expected {stream_total} bytes")
+
             if os.path.exists(local_path):
                 try:
                     os.remove(local_path)
@@ -420,6 +424,16 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
         if cancel_event and cancel_event.is_set():
             return False
         return False
+
+    if total_size > 0:
+        downloaded_size = os.path.getsize(part_path)
+        if downloaded_size != total_size:
+            logger.error(f"Integrity check failed for merged segmented download of {os.path.basename(local_path)}: downloaded {downloaded_size} bytes, expected {total_size} bytes")
+            try:
+                os.remove(part_path)
+            except:
+                pass
+            return False
 
     if os.path.exists(local_path):
         try:
