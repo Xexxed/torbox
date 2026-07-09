@@ -169,8 +169,8 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     if total_size < 5 * 1024 * 1024 or not accept_ranges or total_size == 0:
         return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback)
 
-    # Replicate IDM multi-connection speed boost (8 threads)
-    num_threads = 8
+    # Replicate IDM multi-connection speed boost (5 threads to reduce 429 rate limits)
+    num_threads = 5
     segment_size = total_size // num_threads
     ranges = []
     for i in range(num_threads):
@@ -229,11 +229,30 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                 if "aborted" in str(e).lower() or "aborted" in str(getattr(e, '__context__', '')).lower():
                     errors.append(f"Aborted: {e}")
                     raise
+                
+                is_429 = False
+                if isinstance(e, requests.exceptions.HTTPError) and e.response is not None and e.response.status_code == 429:
+                    is_429 = True
+                
                 seg_attempt += 1
                 if seg_attempt >= retries:
                     errors.append(f"Segment {segment_idx} failed: {e}")
                     return False
-                time.sleep(backoff_factor ** seg_attempt)
+                
+                if is_429:
+                    retry_after_val = e.response.headers.get('Retry-After')
+                    retry_after = 5
+                    if retry_after_val:
+                        try:
+                            retry_after = int(retry_after_val)
+                        except ValueError:
+                            pass
+                    else:
+                        retry_after = 5 * (2 ** seg_attempt)
+                    print(f"Warning: Rate limited (429) on segment {segment_idx} for {os.path.basename(local_path)}. Retrying in {retry_after}s...")
+                    time.sleep(retry_after)
+                else:
+                    time.sleep(backoff_factor ** seg_attempt)
         return False
 
     with ThreadPoolExecutor(max_workers=num_threads) as executor:

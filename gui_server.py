@@ -25,6 +25,7 @@ class AppState:
         self.logs = []        # list of console log lines
         self.abort_flag = False
         self.active_downloads = {}  # dict: {filename: {downloaded, total, speed, status, progress}}
+        self.file_to_torrent_map = {}  # dict: {filename: {torrent_name, relative_path}}
         
         # Load default token if present
         if os.path.exists("token.txt"):
@@ -89,6 +90,12 @@ class AppState:
                     "progress": f.get("progress", 0),
                     "speed": f.get("speed", "0 KB/s")
                 })
+                path_segments = f.get("path", [])
+                if path_segments:
+                    self.file_to_torrent_map[f["name"]] = {
+                        "torrent_name": path_segments[0],
+                        "relative_path": "/".join(path_segments + [f["name"]])
+                    }
 
     def update_file_progress(self, filename, status, downloaded, total, speed_bytes):
         with self.lock:
@@ -277,6 +284,15 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
     def file_scraped_cb(files):
         if not target_torrent_name:
             app_state.update_queue(files)
+        else:
+            with app_state.lock:
+                for f in files:
+                    path_segments = f.get("path", [])
+                    if path_segments:
+                        app_state.file_to_torrent_map[f["name"]] = {
+                            "torrent_name": path_segments[0],
+                            "relative_path": "/".join(path_segments + [f["name"]])
+                        }
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Found and matched torrent target.")
  
     def status_update_cb(filename, status, downloaded, total, speed):
@@ -469,6 +485,61 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             )
             t.start()
             
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path == "/api/retry":
+            if app_state.status in ["scanning", "downloading"]:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Downloader is already running."}).encode("utf-8"))
+                return
+
+            filename = params.get("filename")
+            if not filename or filename not in app_state.file_to_torrent_map:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Failed to find download information for the requested file."}).encode("utf-8"))
+                return
+
+            mapping = app_state.file_to_torrent_map[filename]
+            torrent_name = mapping["torrent_name"]
+            selected_files = [mapping["relative_path"]]
+
+            app_state.abort_flag = False
+            app_state.error_message = ""
+            url = "https://torbox.app/download"
+
+            with app_state.lock:
+                for item in app_state.queue:
+                    if item["name"] == filename:
+                        item["status"] = "queued"
+                        item["progress"] = 0
+                        item["speed"] = "0 KB/s"
+                        break
+
+            t = threading.Thread(
+                target=downloader_worker,
+                args=(
+                    url,
+                    app_state.dest_dir,
+                    app_state.delay,
+                    app_state.headless,
+                    app_state.browser_type,
+                    app_state.token,
+                    torrent_name,
+                    app_state.max_parallel_files,
+                    selected_files
+                ),
+                daemon=True
+            )
+            t.start()
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
