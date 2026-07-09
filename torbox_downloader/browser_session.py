@@ -333,8 +333,9 @@ class TorboxBrowserSession:
         self._recover_page_if_crashed()
         
         # Early Token Expiration Check
-        if "login" in self.page.url.lower() or self.page.locator("input[type='password']").count() > 0:
-            raise Exception("Your Torbox session token has expired or is invalid.")
+        if action != "update_token":
+            if "login" in self.page.url.lower() or self.page.locator("input[type='password']").count() > 0:
+                raise Exception("Your Torbox session token has expired or is invalid.")
             
         if action == "scan_torrents":
             html_content = self.page.content()

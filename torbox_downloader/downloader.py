@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+global_merge_lock = threading.Lock()
+
 def parse_size_to_bytes(size_str):
     """
     Helper to convert sizes like "2GB", "304KB", "45B" to bytes.
@@ -390,61 +392,62 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
             return False
 
     # Merge segments sequentially to avoid disk thrashing and files lock contention
-    print(f"Merging segments for {os.path.basename(local_path)}...")
-    try:
-        seg0_path = f"{part_path}.0"
-        if os.path.exists(part_path):
-            try:
-                os.remove(part_path)
-            except:
-                pass
-        
-        if os.path.exists(seg0_path):
-            os.rename(seg0_path, part_path)
-        else:
-            raise IOError("Segment 0 file missing, cannot merge")
-
-        with open(part_path, 'ab') as dest_f:
-            for idx in range(1, num_threads):
-                seg_path = f"{part_path}.{idx}"
-                with open(seg_path, 'rb') as src_f:
-                    while True:
-                        if cancel_event and cancel_event.is_set():
-                            raise IOError("Aborted during merge")
-                        chunk = src_f.read(8 * 1024 * 1024) # 8MB buffer
-                        if not chunk:
-                            break
-                        dest_f.write(chunk)
-                try:
-                    os.remove(seg_path)
-                except Exception as e:
-                    logger.warning(f"Could not remove temporary segment file {seg_path}: {e}")
-    except Exception as merge_err:
-        logger.error(f"Error merging segments for {os.path.basename(local_path)}: {merge_err}")
-        if cancel_event and cancel_event.is_set():
-            return False
-        return False
-
-    if total_size > 0:
-        downloaded_size = os.path.getsize(part_path)
-        if downloaded_size != total_size:
-            logger.error(f"Integrity check failed for merged segmented download of {os.path.basename(local_path)}: downloaded {downloaded_size} bytes, expected {total_size} bytes")
-            try:
-                os.remove(part_path)
-            except:
-                pass
-            return False
-
-    if os.path.exists(local_path):
+    with global_merge_lock:
+        print(f"Merging segments for {os.path.basename(local_path)}...")
         try:
-            os.remove(local_path)
-        except:
-            pass
-    try:
-        os.rename(part_path, local_path)
-    except Exception as e:
-        logger.error(f"Failed to rename merged part file to local path: {e}")
-        return False
-        
-    print(f"Successfully downloaded: {os.path.basename(local_path)}")
-    return True
+            seg0_path = f"{part_path}.0"
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except:
+                    pass
+            
+            if os.path.exists(seg0_path):
+                os.rename(seg0_path, part_path)
+            else:
+                raise IOError("Segment 0 file missing, cannot merge")
+
+            with open(part_path, 'ab') as dest_f:
+                for idx in range(1, num_threads):
+                    seg_path = f"{part_path}.{idx}"
+                    with open(seg_path, 'rb') as src_f:
+                        while True:
+                            if cancel_event and cancel_event.is_set():
+                                raise IOError("Aborted during merge")
+                            chunk = src_f.read(8 * 1024 * 1024) # 8MB buffer
+                            if not chunk:
+                                break
+                            dest_f.write(chunk)
+                    try:
+                        os.remove(seg_path)
+                    except Exception as e:
+                        logger.warning(f"Could not remove temporary segment file {seg_path}: {e}")
+        except Exception as merge_err:
+            logger.error(f"Error merging segments for {os.path.basename(local_path)}: {merge_err}")
+            if cancel_event and cancel_event.is_set():
+                return False
+            return False
+
+        if total_size > 0:
+            downloaded_size = os.path.getsize(part_path)
+            if downloaded_size != total_size:
+                logger.error(f"Integrity check failed for merged segmented download of {os.path.basename(local_path)}: downloaded {downloaded_size} bytes, expected {total_size} bytes")
+                try:
+                    os.remove(part_path)
+                except:
+                    pass
+                return False
+
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except:
+                pass
+        try:
+            os.rename(part_path, local_path)
+        except Exception as e:
+            logger.error(f"Failed to rename merged part file to local path: {e}")
+            return False
+            
+        print(f"Successfully downloaded: {os.path.basename(local_path)}")
+        return True

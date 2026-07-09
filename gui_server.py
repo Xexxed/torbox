@@ -137,6 +137,30 @@ class AppState:
         except Exception:
             pass
 
+    def handle_token_expired(self):
+        self.abort_flag = True
+        self.cancel_event.set()
+        with self.lock:
+            self.token = ""
+            self.email = ""
+            self.queue = []
+            self.status = "error"
+            self.error_message = "Your Torbox session token has expired or is invalid."
+        
+        if self.session:
+            try:
+                self.session.stop()
+            except Exception:
+                pass
+            self.session = None
+
+        if os.path.exists("token.txt"):
+            try:
+                os.remove("token.txt")
+            except Exception:
+                pass
+        self.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token has expired. Gracefully logged out.")
+
     def add_log(self, message):
         with self.lock:
             self.logs.append(message)
@@ -318,7 +342,10 @@ def scan_torrents_background():
                 app_state.status = "idle"
                 app_state.error_message = ""
     except Exception as e:
-        app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")
+        if "session token has expired or is invalid" in str(e):
+            app_state.handle_token_expired()
+        else:
+            app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")
 
 def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True):
     app_state.set_status("scanning")
@@ -379,7 +406,9 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")
         send_os_notification("Torbox Downloader", "All downloads finished successfully!")
     except Exception as e:
-        if app_state.abort_flag:
+        if "session token has expired or is invalid" in str(e):
+            app_state.handle_token_expired()
+        elif app_state.abort_flag:
             app_state.set_status("idle")
             app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Download task successfully aborted.")
         else:
@@ -537,13 +566,24 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 app_state.save_settings()
             
             if token_updated:
-                if app_state.session:
-                    app_state.session.update_token(app_state.token)
-                t = threading.Thread(
-                    target=scan_torrents_background,
-                    daemon=True
-                )
-                t.start()
+                try:
+                    if app_state.session:
+                        app_state.session.update_token(app_state.token)
+                    t = threading.Thread(
+                        target=scan_torrents_background,
+                        daemon=True
+                    )
+                    t.start()
+                except Exception as e:
+                    if "session token has expired or is invalid" in str(e):
+                        app_state.handle_token_expired()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                        return
+                    else:
+                        raise e
             
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -581,7 +621,9 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True, "files": files}).encode("utf-8"))
             except Exception as e:
-                self.send_response(500)
+                if "session token has expired or is invalid" in str(e):
+                    app_state.handle_token_expired()
+                self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
@@ -770,7 +812,12 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping GUI Server...")
-        server.server_close()
+        try:
+            server.server_close()
+        except:
+            pass
+        import os
+        os._exit(0)
     finally:
         if app_state.session:
             try:
