@@ -328,6 +328,27 @@ class TorboxBrowserSession:
             logger.error(f"Failed to recover browser session: {e}")
             return False
 
+    def _reset_to_dashboard(self):
+        try:
+            logger.info("Resetting SPA view by navigating to home page first...")
+            # Go to home page (forces SPA router out of the download dashboard route)
+            self.page.goto("https://torbox.app/", wait_until="domcontentloaded", timeout=15000)
+            self.page.wait_for_timeout(500)
+            # Navigate back to download dashboard (forces a clean re-mount of download dashboard)
+            self.page.goto(self.download_url, wait_until="domcontentloaded", timeout=30000)
+            self.page.wait_for_selector("button[title='Download files']", timeout=15000)
+            self.page.wait_for_timeout(1000)
+            return True
+        except Exception as e:
+            logger.warning(f"Error resetting to dashboard: {e}")
+            try:
+                # Fallback: force browser reload
+                self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                self.page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            return False
+
     def _execute_action(self, action, *args, **kwargs):
         # Always run recovery check before executing command
         self._recover_page_if_crashed()
@@ -338,6 +359,15 @@ class TorboxBrowserSession:
                 raise Exception("Your Torbox session token has expired or is invalid.")
             
         if action == "scan_torrents":
+            # If we're not on the main dashboard url, or if there are no 'Download files' buttons,
+            # we force a reset to clear the SPA state back to the active torrents dashboard list.
+            try:
+                if "download" not in self.page.url or self.page.locator("button[title='Download files']").count() == 0:
+                    logger.info("scan_torrents: Not on dashboard or no cards found. Resetting dashboard view...")
+                    self._reset_to_dashboard()
+            except Exception as e:
+                logger.warning(f"Error checking/navigating to dashboard in scan_torrents: {e}")
+                
             html_content = self.page.content()
             from torbox_downloader.detector import TorboxDetector
             detector = TorboxDetector(html_content)
@@ -348,16 +378,37 @@ class TorboxBrowserSession:
             self.current_torrent_name = torrent_name
             from torbox_downloader.detector import TorboxDetector
             
-            # Find download button for target torrent
-            title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
-            card = title_el
-            for _ in range(10):
-                card = card.locator("..")
-                if card.locator("button[title='Download files']").count() > 0:
-                    break
-            btn_to_click = card.locator("button[title='Download files']").first
-            
-            if btn_to_click.count() > 0:
+            # Locate download button for target torrent.
+            # If not found or if the torrent card isn't visible, navigate to dashboard first.
+            btn_to_click = None
+            try:
+                title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
+                if title_el.count() > 0:
+                    card = title_el
+                    for _ in range(10):
+                        card = card.locator("..")
+                        if card.locator("button[title='Download files']").count() > 0:
+                            btn_to_click = card.locator("button[title='Download files']").first
+                            break
+            except Exception:
+                pass
+
+            if btn_to_click is None or btn_to_click.count() == 0:
+                logger.info(f"Torrent '{torrent_name}' download button not found or not visible. Resetting dashboard view...")
+                self._reset_to_dashboard()
+                try:
+                    # Re-locate the button
+                    title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
+                    card = title_el
+                    for _ in range(10):
+                        card = card.locator("..")
+                        if card.locator("button[title='Download files']").count() > 0:
+                            break
+                    btn_to_click = card.locator("button[title='Download files']").first
+                except Exception as e:
+                    logger.warning(f"Error re-locating torrent card: {e}")
+
+            if btn_to_click and btn_to_click.count() > 0:
                 btn_to_click.evaluate("el => el.click()")
                 try:
                     self.page.locator("button[title*='Options'], button[title*='options'], button[aria-label*='Options'], button[aria-label*='options']").first.wait_for(state="visible", timeout=10000)
@@ -447,6 +498,10 @@ class TorboxBrowserSession:
                 if torrent_name:
                     logger.warning(f"File row '{name}' not found. Attempting to re-expand torrent card '{torrent_name}'...")
                     try:
+                        # Force reload to reset the SPA view to the dashboard and locate the card correctly
+                        if "download" not in self.page.url or self.page.locator("button[title='Download files']").count() == 0:
+                            self._reset_to_dashboard()
+
                         title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
                         card = title_el
                         for _ in range(10):
