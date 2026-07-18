@@ -30,6 +30,7 @@ let pollingInterval = null;
 let lastLogCount = 0;
 let selectedTorrentName = null;
 let tokenExpiryWarningShown = false;
+let currentTorrentFiles = [];
 
 // SVG icon paths for toast types
 const TOAST_ICONS = {
@@ -252,6 +253,8 @@ function fetchTorrentStructure(name) {
     document.getElementById('modal-error-state').style.display = 'none';
     document.getElementById('modal-tree-content').style.display = 'none';
     document.getElementById('modal-download-btn').style.display = 'none';
+    const genBtn = document.getElementById('modal-generate-links-btn');
+    if (genBtn) genBtn.style.display = 'none';
     
     document.getElementById('modal-torrent-name').textContent = name;
     
@@ -274,9 +277,12 @@ function fetchTorrentStructure(name) {
     })
     .then(data => {
         if (data && data.success && data.files) {
+            currentTorrentFiles = data.files;
             document.getElementById('modal-loading-state').style.display = 'none';
             document.getElementById('modal-tree-content').style.display = 'block';
             document.getElementById('modal-download-btn').style.display = 'inline-flex';
+            const genBtn = document.getElementById('modal-generate-links-btn');
+            if (genBtn) genBtn.style.display = 'inline-flex';
             
             renderFilesTree(data.files);
         } else {
@@ -532,6 +538,155 @@ function startSelectedDownload() {
         }
     })
     .catch(err => console.error("Error starting selected downloads:", err));
+}
+
+// Generate Links Modal Handling functions
+let isGeneratingLinks = false;
+let generateLinksAbortController = null;
+
+function openGenerateLinksModal() {
+    const checkedFileCheckboxes = document.querySelectorAll('#modal-files-tree .file-checkbox:checked');
+    if (checkedFileCheckboxes.length === 0) {
+        alert("Please select at least one file to generate links for.");
+        return;
+    }
+    
+    // Show setup UI and hide progress / results
+    document.getElementById('gen-links-setup').style.display = 'block';
+    document.getElementById('gen-links-progress-container').style.display = 'none';
+    document.getElementById('gen-links-result-container').style.display = 'none';
+    
+    document.getElementById('gen-links-selected-count').textContent = checkedFileCheckboxes.length;
+    
+    // Reset progress bar
+    document.getElementById('gen-links-progress-bar').style.width = '0%';
+    document.getElementById('gen-links-progress-status').textContent = `Generating: 0 / ${checkedFileCheckboxes.length} completed...`;
+    
+    const modal = document.getElementById('generate-links-modal');
+    if (modal) {
+        modal.style.display = 'flex';
+        setTimeout(() => {
+            modal.classList.add('active');
+        }, 10);
+    }
+}
+
+function closeGenerateLinksModal() {
+    if (isGeneratingLinks) {
+        if (!confirm("Are you sure you want to stop generating links?")) {
+            return;
+        }
+        if (generateLinksAbortController) {
+            generateLinksAbortController.abort();
+        }
+        isGeneratingLinks = false;
+    }
+    
+    const modal = document.getElementById('generate-links-modal');
+    if (modal) {
+        modal.classList.remove('active');
+        setTimeout(() => {
+            modal.style.display = 'none';
+        }, 300);
+    }
+}
+
+async function startGeneratingLinks() {
+    const checkedCheckboxes = document.querySelectorAll('#modal-files-tree .file-checkbox:checked');
+    const totalFiles = checkedCheckboxes.length;
+    if (totalFiles === 0) return;
+    
+    isGeneratingLinks = true;
+    generateLinksAbortController = new AbortController();
+    
+    // Hide setup, show progress
+    document.getElementById('gen-links-setup').style.display = 'none';
+    document.getElementById('gen-links-progress-container').style.display = 'flex';
+    document.getElementById('gen-links-result-container').style.display = 'none';
+    
+    const formatOption = document.querySelector('input[name="link-format"]:checked').value;
+    const generatedItems = [];
+    
+    let completed = 0;
+    
+    for (let i = 0; i < totalFiles; i++) {
+        if (!isGeneratingLinks) break;
+        
+        const cb = checkedCheckboxes[i];
+        const fileId = cb.getAttribute('data-id');
+        
+        const fileObj = currentTorrentFiles.find(f => {
+            const relPath = (f.path || []).concat([f.name]).join('/');
+            return relPath === fileId;
+        });
+        
+        if (!fileObj) {
+            console.error("Could not find file object for ID:", fileId);
+            continue;
+        }
+        
+        document.getElementById('gen-links-progress-status').textContent = `Generating link [${i+1}/${totalFiles}]: ${fileObj.name}...`;
+        
+        try {
+            const response = await fetch('/api/generate_link', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    torrent_name: selectedTorrentName,
+                    name: fileObj.name,
+                    size: fileObj.size,
+                    selector: fileObj.selector
+                }),
+                signal: generateLinksAbortController.signal
+            });
+            
+            const data = await response.json();
+            if (data && data.success && data.download_url) {
+                if (formatOption === 'link-title') {
+                    generatedItems.push(`${data.download_url}:${fileObj.name}`);
+                } else {
+                    generatedItems.push(data.download_url);
+                }
+            } else {
+                console.error("Failed to generate link for file", fileObj.name, data ? data.error : "Unknown error");
+                generatedItems.push(`FAILED_TO_GENERATE_LINK:${fileObj.name}`);
+            }
+        } catch (err) {
+            if (err.name === 'AbortError') {
+                console.log('Link generation aborted by user.');
+                break;
+            }
+            console.error("Error calling /api/generate_link for file", fileObj.name, err);
+            generatedItems.push(`ERROR_TO_GENERATE_LINK:${fileObj.name}`);
+        }
+        
+        completed++;
+        const percent = Math.round((completed / totalFiles) * 100);
+        document.getElementById('gen-links-progress-bar').style.width = `${percent}%`;
+        document.getElementById('gen-links-progress-status').textContent = `Generating: ${completed} / ${totalFiles} completed...`;
+    }
+    
+    isGeneratingLinks = false;
+    
+    // Show textarea and results
+    document.getElementById('gen-links-progress-container').style.display = 'none';
+    document.getElementById('gen-links-result-container').style.display = 'flex';
+    
+    const textarea = document.getElementById('gen-links-textarea');
+    textarea.value = generatedItems.join('\n');
+}
+
+function copyGeneratedLinks() {
+    const textarea = document.getElementById('gen-links-textarea');
+    if (!textarea || !textarea.value) return;
+    
+    textarea.select();
+    try {
+        navigator.clipboard.writeText(textarea.value);
+        showToast('success', 'Copied to Clipboard', 'All generated download links successfully copied.');
+    } catch (err) {
+        showToast('error', 'Copy Failed', 'Please manually select and copy the text.');
+    }
 }
 
 // Clear session storage and log out

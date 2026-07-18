@@ -631,6 +631,59 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 app_state.fetch_lock.release()
             return
 
+        elif self.path.startswith("/api/generate_link"):
+            torrent_name = params.get("torrent_name")
+            name = params.get("name")
+            size = params.get("size")
+            selector = params.get("selector")
+            
+            if not app_state.token or not torrent_name or not name:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Missing token, torrent_name or file details"}).encode("utf-8"))
+                return
+                
+            if not app_state.fetch_lock.acquire(blocking=True, timeout=30):
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Another browser operation is in progress. Please wait."}).encode("utf-8"))
+                return
+                
+            try:
+                if not app_state.session:
+                    from torbox_downloader.browser_session import TorboxBrowserSession
+                    app_state.session = TorboxBrowserSession(app_state.token, app_state.browser_type, app_state.headless)
+                    app_state.session.start()
+                
+                # Expand torrent if not current
+                if app_state.session.current_torrent_name != torrent_name or "download" not in app_state.session.page.url:
+                    app_state.session.fetch_structure(torrent_name)
+                    
+                download_url = app_state.session.generate_download_link(name, size, selector)
+                
+                if download_url:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "download_url": download_url}).encode("utf-8"))
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Failed to generate link (Direct Download button not found/captured)"}).encode("utf-8"))
+            except Exception as e:
+                if "session token has expired or is invalid" in str(e):
+                    app_state.handle_token_expired()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+            finally:
+                app_state.fetch_lock.release()
+            return
+
         elif self.path.startswith("/api/start"):
             if app_state.status in ["scanning", "downloading"]:
                 self.send_response(400)
