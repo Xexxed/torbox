@@ -21,16 +21,31 @@ except ImportError:
     logger.error("Playwright is not installed. Please run: pip install playwright && playwright install")
     sys.exit(1)
 
-def download_files_pipeline(session, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None, delay=0, parallel_connections=True, cancel_event=None):
+def download_files_pipeline(session, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None, delay=0, parallel_connections=True, cancel_event=None, disk_profile="auto", buffer_mb=None):
     from threading import Lock, Semaphore, Thread
     from concurrent.futures import ThreadPoolExecutor
     import queue
     import shutil
     from torbox_downloader.downloader import parse_size_to_bytes, is_file_size_matching, download_file
+    from torbox_downloader.diskio import configure_write_throttle, resolve_disk_profile
 
     torrent_success = True
     progress_lock = Lock()
-    
+
+    # --- Storage profile ---
+    # Detect once per batch (detection can shell out to PowerShell on Windows)
+    # and cap how many write streams may hit the drive at the same time.
+    effective_profile = resolve_disk_profile(dest_dir, disk_profile)
+    if effective_profile == "hdd" and max_parallel_files > 1:
+        logger.info(
+            "Rotational disk detected at %s - limiting parallel files from %d to 1 "
+            "to keep writes sequential.", dest_dir, max_parallel_files
+        )
+        max_parallel_files = 1
+    stream_limit = configure_write_throttle(effective_profile, max_parallel_files)
+    logger.info("Storage profile: %s (max %d concurrent write streams)",
+                effective_profile, stream_limit)
+
     # --- Disk-space precheck ---
     total_expected_bytes = 0
     for f_info in files_with_local_paths:
@@ -166,7 +181,7 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
 
             print(f"    Starting download: {name}...")
             cb = make_file_progress_callback(name)
-            success = download_file(d_url, local_path, expected_size_str=size, progress_callback=cb, parallel=parallel_connections, cancel_event=cancel_event)
+            success = download_file(d_url, local_path, expected_size_str=size, progress_callback=cb, parallel=parallel_connections, cancel_event=cancel_event, disk_profile=effective_profile, buffer_mb=buffer_mb)
 
             if success:
                 with progress_lock:
@@ -271,7 +286,7 @@ def get_torrent_files_structure(token, url, target_torrent_name, browser_type='c
         session.stop()
 
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None):
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None):
     """
     Runs the full automation workflow:
     1. Launches/uses TorboxBrowserSession.
@@ -346,7 +361,9 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                         token=token,
                         delay=delay,
                         parallel_connections=parallel_connections,
-                        cancel_event=cancel_event
+                        cancel_event=cancel_event,
+                        disk_profile=disk_profile,
+                        buffer_mb=buffer_mb
                     )
 
                     try:
@@ -415,7 +432,9 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             token=token,
             delay=delay,
             parallel_connections=parallel_connections,
-            cancel_event=cancel_event
+            cancel_event=cancel_event,
+            disk_profile=disk_profile,
+            buffer_mb=buffer_mb
         )
     finally:
         if local_session:
@@ -434,6 +453,8 @@ if __name__ == '__main__':
     parser.add_argument('--delay', type=int, default=5, help="Delay in seconds between downloads")
     parser.add_argument('--no-gui', action='store_false', dest='gui', help="Disable launching the Web GUI dashboard and run CLI directly")
     parser.add_argument('--parallel-files', type=int, default=1, help="Max number of parallel file downloads")
+    parser.add_argument('--disk-profile', type=str, default='auto', choices=['auto', 'hdd', 'ssd'], help="Disk I/O strategy. 'hdd' forces one sequential write stream with large buffers (lowest disk utilisation); 'auto' detects the drive type (default: auto)")
+    parser.add_argument('--write-buffer-mb', type=float, default=None, help="Size of the in-memory write buffer per download stream, in MB (default: 8 on SSD, 32 on HDD)")
     
     args = parser.parse_args()
     
@@ -464,5 +485,7 @@ if __name__ == '__main__':
             browser_type=args.browser,
             token=token_val,
             delay=args.delay,
-            max_parallel_files=args.parallel_files
+            max_parallel_files=args.parallel_files,
+            disk_profile=args.disk_profile,
+            buffer_mb=args.write_buffer_mb
         )

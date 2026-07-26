@@ -143,6 +143,8 @@ function saveSettings() {
     const delay = parseInt(document.getElementById('delay-input').value) || 5;
     const max_parallel_files = parseInt(document.getElementById('parallel-downloads-input').value) || 1;
     const parallel_connections = document.getElementById('parallel-connections-input').checked;
+    const disk_profile = (document.getElementById('disk-profile-input') || {}).value || 'auto';
+    const write_buffer_mb = parseFloat((document.getElementById('write-buffer-input') || {}).value) || 0;
     const watch_mode = document.getElementById('watch-mode-input').checked;
     const watch_interval = parseInt(document.getElementById('watch-interval-input').value) || 60;
     
@@ -152,6 +154,8 @@ function saveSettings() {
         delay: delay,
         max_parallel_files: max_parallel_files,
         parallel_connections: parallel_connections,
+        disk_profile: disk_profile,
+        write_buffer_mb: write_buffer_mb,
         watch_mode: watch_mode,
         watch_interval: watch_interval
     };
@@ -736,6 +740,16 @@ function fetchStatus() {
             const delayInput = document.getElementById('delay-input');
             if (document.activeElement !== delayInput && state.delay !== undefined) {
                 delayInput.value = state.delay;
+            }
+
+            const diskProfileInput = document.getElementById('disk-profile-input');
+            if (diskProfileInput && document.activeElement !== diskProfileInput && state.disk_profile !== undefined) {
+                diskProfileInput.value = state.disk_profile;
+            }
+
+            const writeBufferInput = document.getElementById('write-buffer-input');
+            if (writeBufferInput && document.activeElement !== writeBufferInput && state.write_buffer_mb !== undefined) {
+                writeBufferInput.value = state.write_buffer_mb;
             }
 
             const parallelConnsInput = document.getElementById('parallel-connections-input');

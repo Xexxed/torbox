@@ -7,6 +7,17 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+from .diskio import (
+    DEFAULT_CHUNK_BYTES,
+    SegmentWriter,
+    allocate_file,
+    configure_write_throttle,
+    recommended_buffer_bytes,
+    recommended_connections,
+    resolve_disk_profile,
+    write_throttle,
+)
+
 logger = logging.getLogger(__name__)
 
 # Compiled once at import time — parse_size_to_bytes() is called frequently.
@@ -37,11 +48,14 @@ def parse_size_to_bytes(size_str):
     
     return int(value * units[unit])
 
-def _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event=None):
+def _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event=None, buffer_bytes=None, chunk_bytes=DEFAULT_CHUNK_BYTES, drop_cache=False):
     # Ensure parent directory exists
     parent_dir = os.path.dirname(part_path)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
+
+    if buffer_bytes is None:
+        buffer_bytes = recommended_buffer_bytes("ssd")
         
     session = requests.Session()
     attempt = 0
@@ -83,26 +97,39 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
             last_update_time = 0.0
             update_interval = 0.25 # update GUI at most every 250ms
             
-            with open(part_path, mode) as f:
-                with tqdm(total=stream_total, initial=existing_bytes, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
-                    downloaded = existing_bytes
-                    start_time = time.time()
-                    for chunk in response.iter_content(chunk_size=2 * 1024 * 1024):  # 2 MB chunks
-                        if cancel_event and cancel_event.is_set():
-                            raise IOError("Aborted by user")
-                        if chunk:
-                            f.write(chunk)
-                            chunk_len = len(chunk)
-                            pbar.update(chunk_len)
-                            downloaded += chunk_len
-                            if progress_callback:
-                                now = time.time()
-                                if now - last_update_time >= update_interval or downloaded >= stream_total:
-                                    last_update_time = now
-                                    elapsed = now - start_time
-                                    speed = (downloaded - existing_bytes) / elapsed if elapsed > 0 else 0
-                                    progress_callback(os.path.basename(local_path), downloaded, stream_total, speed)
-                                    
+            # Write through a large coalescing buffer instead of pushing every
+            # 512 KB straight at the filesystem. Only one sequential stream is
+            # open here, so the throttle is just protecting the drive from
+            # other files being downloaded in parallel.
+            if mode == 'wb':
+                # Truncate/create, then reopen r+b so SegmentWriter can pwrite.
+                open(part_path, 'wb').close()
+                write_offset = 0
+            else:
+                write_offset = existing_bytes
+
+            with write_throttle:
+                with SegmentWriter(part_path, write_offset,
+                                   buffer_bytes=buffer_bytes,
+                                   drop_cache=drop_cache) as writer:
+                    with tqdm(total=stream_total, initial=existing_bytes, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
+                        downloaded = existing_bytes
+                        start_time = time.time()
+                        for chunk in response.iter_content(chunk_size=chunk_bytes):
+                            if cancel_event and cancel_event.is_set():
+                                raise IOError("Aborted by user")
+                            if chunk:
+                                writer.append(chunk)
+                                chunk_len = len(chunk)
+                                pbar.update(chunk_len)
+                                downloaded += chunk_len
+                                if progress_callback:
+                                    now = time.time()
+                                    if now - last_update_time >= update_interval or downloaded >= stream_total:
+                                        last_update_time = now
+                                        elapsed = now - start_time
+                                        speed = (downloaded - existing_bytes) / elapsed if elapsed > 0 else 0
+                                        progress_callback(os.path.basename(local_path), downloaded, stream_total, speed)
             downloaded_size = os.path.getsize(part_path)
             if stream_total > 0 and downloaded_size != stream_total:
                 raise IOError(f"Integrity check failed: downloaded {downloaded_size} bytes, expected {stream_total} bytes")
@@ -149,11 +176,23 @@ def is_file_size_matching(local_size, expected_size_str):
     ratio = local_size / expected_bytes
     return 0.5 <= ratio <= 2.0
 
-def download_file(url, local_path, expected_size_str=None, headers=None, retries=5, backoff_factor=2, progress_callback=None, parallel=True, num_threads=4, cancel_event=None):
+def download_file(url, local_path, expected_size_str=None, headers=None, retries=5, backoff_factor=2, progress_callback=None, parallel=True, num_threads=4, cancel_event=None, disk_profile="auto", buffer_mb=None, drop_cache=None):
     """
     Downloads a file using parallel segmented chunk downloads (similar to IDM)
     if the server supports it, otherwise falls back to single-threaded chunked downloads.
+
+    ``disk_profile`` selects the I/O strategy: ``"auto"`` detects whether the
+    destination is a rotational disk, ``"hdd"`` forces the low-seek strategy
+    (single connection, large write buffers), and ``"ssd"`` allows the full
+    parallel segmented path.
     """
+    # Decide the I/O strategy once, before any bytes move.
+    profile = resolve_disk_profile(os.path.dirname(local_path) or ".", disk_profile)
+    buffer_bytes = recommended_buffer_bytes(profile, buffer_mb)
+    if drop_cache is None:
+        # Streaming a multi-GB file through the page cache evicts everything
+        # else and causes bursty writeback; only worth it for big transfers.
+        drop_cache = (profile == "hdd")
     if os.path.exists(local_path):
         local_size = os.path.getsize(local_path)
         if is_file_size_matching(local_size, expected_size_str):
@@ -199,12 +238,28 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     except Exception as e:
         logger.error(f"Error fetching headers: {e}")
 
-    if total_size < 1024 * 1024 * 1024 or not accept_ranges or total_size == 0 or not parallel:
-        return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event)
+    # On a rotational disk, splitting one file across N connections means N
+    # write cursors thousands of MB apart; the head spends most of its time
+    # seeking rather than writing. Collapse to a single sequential stream.
+    effective_threads = recommended_connections(profile, num_threads)
+    if profile == "hdd" and parallel and num_threads > 1:
+        logger.info(
+            "Rotational disk detected for %s - using 1 sequential connection "
+            "with a %d MB write buffer to avoid seek thrashing.",
+            os.path.basename(local_path), buffer_bytes // (1024 * 1024),
+        )
+
+    if (total_size < 1024 * 1024 * 1024 or not accept_ranges or total_size == 0
+            or not parallel or effective_threads <= 1):
+        return _download_single_threaded(
+            url, part_path, local_path, total_size, headers, retries,
+            backoff_factor, progress_callback, cancel_event,
+            buffer_bytes=buffer_bytes, drop_cache=drop_cache,
+        )
 
     # Multi-connection parallel download using write-at-offset (no merge step needed).
     # Each thread writes directly to its own byte-range offset in the pre-allocated output file.
-    num_threads = max(1, min(int(num_threads), 5))
+    num_threads = max(1, min(int(effective_threads), 5))
     segment_size = total_size // num_threads
     ranges = []
     for i in range(num_threads):
@@ -270,13 +325,17 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     if needs_prealloc:
         print(f"Pre-allocating {os.path.basename(local_path)} ({total_size:,} bytes)...")
         try:
-            with open(part_path, 'wb') as f:
-                if total_size > 0:
-                    f.seek(total_size - 1)
-                    f.write(b'\x00')
+            # Reserve real extents rather than creating a sparse file. Filling a
+            # sparse file from several offsets at once makes the allocator
+            # interleave each writer's extents, fragmenting the finished file.
+            allocate_file(part_path, total_size)
         except Exception as e:
             logger.error(f"Pre-allocation failed for {os.path.basename(local_path)}: {e}. Falling back to single-threaded.")
-            return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event)
+            return _download_single_threaded(
+                url, part_path, local_path, total_size, headers, retries,
+                backoff_factor, progress_callback, cancel_event,
+                buffer_bytes=buffer_bytes, drop_cache=drop_cache,
+            )
 
     downloaded_lock = threading.Lock()
     downloaded_bytes = initial_downloaded_bytes
@@ -317,18 +376,28 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                     else:
                         resp.raise_for_status()
 
-                # Write directly into the pre-allocated file at this segment's offset.
-                # Each thread operates on a non-overlapping region so no file-level
-                # locking is required for writes.
+                # Write into the pre-allocated file at this segment's offset via a
+                # large coalescing buffer. Each thread owns a non-overlapping
+                # region, so no locking is needed for the writes themselves -
+                # but buffering is what keeps the drive from seeing interleaved
+                # 512 KB writes from every segment at once.
                 bytes_written = 0
                 local_pending = 0  # bytes accumulated since last lock acquisition
-                with open(part_path, 'r+b') as f:
-                    f.seek(seg_start)
-                    for chunk in resp.iter_content(chunk_size=2 * 1024 * 1024):  # 2 MB chunks
+                with SegmentWriter(part_path, seg_start,
+                                   buffer_bytes=buffer_bytes,
+                                   drop_cache=drop_cache) as writer:
+                    for chunk in resp.iter_content(chunk_size=DEFAULT_CHUNK_BYTES):
                         if cancel_event and cancel_event.is_set():
                             raise IOError("Aborted by user")
                         if chunk:
-                            f.write(chunk)
+                            # Never spill past this segment into the next one's
+                            # region (some servers ignore the Range header).
+                            remaining = seg_total_size - bytes_written
+                            if remaining <= 0:
+                                break
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
+                            writer.append(chunk)
                             chunk_len = len(chunk)
                             bytes_written += chunk_len
                             local_pending += chunk_len
@@ -426,7 +495,11 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
         except Exception:
             pass
         try:
-            return _download_single_threaded(url, part_path, local_path, total_size, headers, retries, backoff_factor, progress_callback, cancel_event)
+            return _download_single_threaded(
+                url, part_path, local_path, total_size, headers, retries,
+                backoff_factor, progress_callback, cancel_event,
+                buffer_bytes=buffer_bytes, drop_cache=drop_cache,
+            )
         except Exception as e:
             logger.error(f"Single-threaded fallback failed for {os.path.basename(local_path)}: {e}")
             return False
