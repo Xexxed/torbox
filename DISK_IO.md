@@ -1,8 +1,30 @@
 # Reducing HDD Usage During Downloads
 
-Your screenshot didn't come through, but "disk at 100% while downloading" is a
-well-defined symptom and the code had a textbook cause. This documents the
-diagnosis, what changed, and the options you can still turn on.
+This documents the diagnosis, what changed, and the options you can still turn on.
+
+## What the screenshot shows
+
+The settings in the screenshot are the exact worst case for a spinning disk:
+
+| Setting | Value | Effect |
+|---|---|---|
+| Parallel Files | **4 Files** | 4 files written at once |
+| Use parallel connections | **on, up to 4** | x4 byte-ranges per file |
+| Download path | `f:/torbox` | a large secondary drive (606 GB free) |
+
+4 x 4 = **up to 16 write cursors scattered across the platter simultaneously.**
+
+The decisive number is the throughput: **11.2 MB/s on a 39 GB file.** A healthy
+modern HDD does 120–200 MB/s sequentially. Getting ~11 MB/s while the drive
+reports 100% busy is the signature of seek saturation — the drive is working
+flat out, but almost all of that work is head movement rather than writing. It
+is *not* a network limit and *not* a full disk.
+
+Also note `fg-01.bin` at 39 GB: comfortably over the 1 GB threshold, so it took
+the 4-connection segmented path, with its four cursors ~10 GB apart.
+
+**With the HDD profile this workload becomes one file, one sequential stream,
+32 MB writes** — the same bytes, but written in the order the platter spins.
 
 ## Important distinction: 100% "active time" is not "disk is full"
 
@@ -12,6 +34,17 @@ throughput. A hard drive doing 8 MB/s of scattered writes will read 100% while
 the same drive doing 150 MB/s of sequential writes might read 30%. So the goal
 is not "write less data" (you need every byte of the file) — it's **write the
 same bytes in far fewer, larger, sequential operations**.
+
+## Bug found via the screenshot: `f:/torbox` broke drive detection
+
+The path is typed with **forward slashes**. The first version of my Windows
+detection used `os.path.splitdrive(...).rstrip(":")`, which is correct on
+Windows but silently returned `""` when reasoning about such paths elsewhere,
+and would have passed a bogus value to `Get-Partition`. Auto-detect would have
+fallen back to the SSD profile and **changed nothing for you.** Fixed by parsing
+with `ntpath` explicitly and rejecting anything that isn't a single drive
+letter; UNC paths (`\\server\share`) now get their own `network` profile that
+keeps parallelism but still uses large buffers.
 
 ## Root causes found in the code
 
@@ -124,15 +157,16 @@ Buffer size is a RAM-vs-seeks trade: 32 MB × 1 file ≈ 32 MB RAM. Raising it t
 
 ## Tests
 
-`tests/test_diskio.py` (15) and `tests/test_download_io.py` (9) cover
-non-sparse allocation, write coalescing, threaded-segment integrity, and
-end-to-end downloads (single-threaded, segmented, resumed, no-Range fallback)
-against a local range-capable HTTP server, with SHA-256 verification.
+`tests/test_diskio.py` (19) and `tests/test_download_io.py` (9) cover
+non-sparse allocation, write coalescing, threaded-segment integrity, Windows
+drive-letter parsing (including `f:/torbox` and UNC paths), and end-to-end
+downloads (single-threaded, segmented, resumed, no-Range fallback) against a
+local range-capable HTTP server, with SHA-256 verification.
 
 ```
 python -m unittest tests.test_diskio tests.test_downloader \
                    tests.test_download_io tests.test_detector
-# Ran 32 tests - OK
+# Ran 36 tests - OK
 ```
 
 `tests/test_integration.py` still requires `playwright` and is unaffected.

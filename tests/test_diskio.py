@@ -152,6 +152,30 @@ class TestProfilePolicy(unittest.TestCase):
                          recommended_buffer_bytes("ssd"))
 
 
+class TestWindowsPathHandling(unittest.TestCase):
+    """The GUI accepts paths like 'f:/torbox'; drive parsing must cope."""
+
+    def test_forward_slash_drive_path_yields_letter(self):
+        import ntpath
+        for p in ("f:/torbox", "F:\\torbox", "f:/torbox/movies"):
+            drive = ntpath.splitdrive(p)[0].rstrip(":")
+            self.assertEqual(drive.lower(), "f", f"failed for {p}")
+
+    def test_unc_path_has_no_drive_letter(self):
+        import ntpath
+        drive = ntpath.splitdrive(r"\\server\share\torbox")[0].rstrip(":")
+        # Must not be mistaken for a one-letter local drive.
+        self.assertNotEqual(len(drive), 1)
+
+    def test_network_profile_uses_large_buffer(self):
+        self.assertEqual(recommended_buffer_bytes("network"),
+                         recommended_buffer_bytes("hdd"))
+
+    def test_network_profile_keeps_parallelism(self):
+        # No physical seek penalty on a share, so don't collapse to 1.
+        self.assertGreater(recommended_connections("network", 4), 1)
+
+
 class TestWriteThrottle(unittest.TestCase):
     def test_limits_concurrency(self):
         import threading

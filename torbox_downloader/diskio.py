@@ -67,10 +67,16 @@ def _detect_disk_type_windows(path):
     """Ask Windows (MSFT_PhysicalDisk) whether the volume is on an HDD."""
     try:
         import subprocess
+        import ntpath
 
-        drive = os.path.splitdrive(os.path.abspath(path))[0].rstrip(":")
-        if not drive:
-            return "unknown"
+        # Use ntpath explicitly: a path like "f:/torbox" (forward slashes, as
+        # typed in the GUI) must still yield the "f" drive letter.
+        drive = ntpath.splitdrive(ntpath.abspath(path))[0].rstrip(":")
+
+        # UNC paths ("\\\\server\\share") have no drive letter and are not a
+        # local physical disk - never hand them to Get-Partition.
+        if len(drive) != 1 or not drive.isalpha():
+            return "network" if drive else "unknown"
 
         # MediaType: 3 = HDD, 4 = SSD. Partition -> Disk -> PhysicalDisk.
         ps = (
@@ -111,7 +117,11 @@ def detect_disk_type(path):
     if not probe or not os.path.exists(probe):
         probe = os.path.expanduser("~")
 
-    key = os.path.splitdrive(probe)[0] or probe
+    if sys.platform.startswith("win"):
+        import ntpath
+        key = ntpath.splitdrive(probe)[0].lower() or probe
+    else:
+        key = probe
     with _disk_type_lock:
         if key in _disk_type_cache:
             return _disk_type_cache[key]
@@ -136,8 +146,12 @@ def resolve_disk_profile(dest_dir, configured="auto"):
     if configured in ("hdd", "ssd"):
         return configured
     detected = detect_disk_type(dest_dir)
-    # Treat "unknown" conservatively as HDD-ish is too slow for SSD users, so
-    # fall back to the balanced SSD profile but with coalesced writes on.
+    if detected == "network":
+        # A network share has no seek penalty locally, but many small writes
+        # cost a round trip each - keep parallelism, keep big buffers.
+        return "network"
+    # Treat "unknown" conservatively: forcing HDD would be too slow for SSD
+    # users, so use the balanced SSD profile (coalesced writes still apply).
     return detected if detected in ("hdd", "ssd") else "ssd"
 
 
@@ -154,6 +168,10 @@ def recommended_connections(profile, requested):
     return min(requested, 4)
 
 
+def _is_buffered_profile(profile):
+    return profile in ("hdd", "network")
+
+
 def recommended_buffer_bytes(profile, override_mb=None):
     if override_mb:
         try:
@@ -162,7 +180,7 @@ def recommended_buffer_bytes(profile, override_mb=None):
                 return int(mb * 1024 * 1024)
         except (TypeError, ValueError):
             pass
-    return HDD_BUFFER_BYTES if profile == "hdd" else DEFAULT_BUFFER_BYTES
+    return HDD_BUFFER_BYTES if _is_buffered_profile(profile) else DEFAULT_BUFFER_BYTES
 
 
 # ---------------------------------------------------------------------------
