@@ -73,6 +73,8 @@ class AppState:
         self.headless = True
         self.max_parallel_files = 1
         self.parallel_connections = True
+        self.disk_profile = "auto"   # auto | hdd | ssd
+        self.write_buffer_mb = 0     # 0 = pick from disk profile
         self.watch_mode = False
         self.watch_interval = 60
         
@@ -116,6 +118,10 @@ class AppState:
                         self.max_parallel_files = int(data["max_parallel_files"])
                     if "parallel_connections" in data:
                         self.parallel_connections = bool(data["parallel_connections"])
+                    if "disk_profile" in data and data["disk_profile"] in ("auto", "hdd", "ssd"):
+                        self.disk_profile = data["disk_profile"]
+                    if "write_buffer_mb" in data:
+                        self.write_buffer_mb = float(data["write_buffer_mb"])
                     if "watch_mode" in data:
                         self.watch_mode = bool(data["watch_mode"])
                     if "watch_interval" in data:
@@ -131,6 +137,8 @@ class AppState:
                     "delay": self.delay,
                     "max_parallel_files": self.max_parallel_files,
                     "parallel_connections": self.parallel_connections,
+                    "disk_profile": self.disk_profile,
+                    "write_buffer_mb": self.write_buffer_mb,
                     "watch_mode": self.watch_mode,
                     "watch_interval": self.watch_interval
                 }, f)
@@ -248,6 +256,8 @@ class AppState:
             active_downloads = dict(self.active_downloads)
             max_parallel_files = self.max_parallel_files
             parallel_connections = self.parallel_connections
+            disk_profile = self.disk_profile
+            write_buffer_mb = self.write_buffer_mb
             watch_mode = self.watch_mode
             watch_interval = self.watch_interval
 
@@ -283,6 +293,8 @@ class AppState:
             "free_space": free_space_str,
             "max_parallel_files": max_parallel_files,
             "parallel_connections": parallel_connections,
+            "disk_profile": disk_profile,
+            "write_buffer_mb": write_buffer_mb,
             "watch_mode": watch_mode,
             "watch_interval": watch_interval
         }
@@ -347,7 +359,7 @@ def scan_torrents_background():
         else:
             app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")
 
-def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True):
+def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, disk_profile="auto", write_buffer_mb=0):
     app_state.set_status("scanning")
     app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Initializing Torbox Engine...")
     
@@ -400,7 +412,9 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             selected_files=selected_files,
             parallel_connections=parallel_connections,
             cancel_event=app_state.cancel_event,
-            session=app_state.session
+            session=app_state.session,
+            disk_profile=disk_profile,
+            buffer_mb=(write_buffer_mb or None)
         )
         app_state.set_status("finished")
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")
@@ -454,7 +468,9 @@ def watch_mode_loop():
                                 None,
                                 app_state.max_parallel_files,
                                 None,
-                                app_state.parallel_connections
+                                app_state.parallel_connections,
+                                app_state.disk_profile,
+                                app_state.write_buffer_mb
                             ),
                             daemon=True
                         )
@@ -559,6 +575,13 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     app_state.max_parallel_files = int(params["max_parallel_files"])
                 if "parallel_connections" in params:
                     app_state.parallel_connections = bool(params["parallel_connections"])
+                if "disk_profile" in params and params["disk_profile"] in ("auto", "hdd", "ssd"):
+                    app_state.disk_profile = params["disk_profile"]
+                if "write_buffer_mb" in params:
+                    try:
+                        app_state.write_buffer_mb = max(0.0, float(params["write_buffer_mb"]))
+                    except (TypeError, ValueError):
+                        pass
                 if "watch_mode" in params:
                     app_state.watch_mode = bool(params["watch_mode"])
                 if "watch_interval" in params:
@@ -710,7 +733,9 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     torrent_name,
                     app_state.max_parallel_files,
                     selected_files,
-                    app_state.parallel_connections
+                    app_state.parallel_connections,
+                    app_state.disk_profile,
+                    app_state.write_buffer_mb
                 ),
                 daemon=True
             )
@@ -765,7 +790,10 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     app_state.token,
                     torrent_name,
                     app_state.max_parallel_files,
-                    selected_files
+                    selected_files,
+                    app_state.parallel_connections,
+                    app_state.disk_profile,
+                    app_state.write_buffer_mb
                 ),
                 daemon=True
             )

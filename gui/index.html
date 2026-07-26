@@ -135,6 +135,23 @@
                                     <span>Use parallel connections (multi-part download, up to 4)</span>
                                 </label>
                             </div>
+                            <div style="display: flex; gap: 16px; margin-top: 14px;">
+                                <div style="flex: 1;">
+                                    <label for="disk-profile-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Storage Type</label>
+                                    <select id="disk-profile-input" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;">
+                                        <option value="auto">Auto-detect</option>
+                                        <option value="hdd">HDD (low disk usage)</option>
+                                        <option value="ssd">SSD / NVMe (max speed)</option>
+                                    </select>
+                                </div>
+                                <div style="flex: 1;">
+                                    <label for="write-buffer-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Write Buffer (MB, 0 = auto)</label>
+                                    <input type="number" id="write-buffer-input" min="0" max="256" step="4" value="0" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;" />
+                                </div>
+                            </div>
+                            <div style="margin-top: 8px; font-size: 11px; color: var(--text-muted); line-height: 1.5;">
+                                On a hard drive, several download streams writing at once force the head to seek constantly, pinning disk usage at 100% while throughput stays low. The HDD profile writes one file at a time through a large buffer.
+                            </div>
                             <div style="margin-top: 12px; display: flex; align-items: center; gap: 16px;">
                                 <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #e5e7eb; cursor: pointer;">
                                     <input type="checkbox" id="watch-mode-input" onchange="saveSettings()" />
