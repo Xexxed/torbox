@@ -163,18 +163,29 @@ class TestNoRangeSupport(BaseServerTest):
 class TestWritePattern(BaseServerTest):
     def test_write_sizes_are_large(self):
         """Regression guard: the old code wrote 512 KB at a time."""
-        real_pwrite = os.pwrite
+        real_pwrite = getattr(os, "pwrite", None)
         sizes = []
 
-        def counting(fd, data, off):
-            sizes.append(len(data))
-            return real_pwrite(fd, data, off)
+        if real_pwrite is not None:
+            def counting(fd, data, off):
+                sizes.append(len(data))
+                return real_pwrite(fd, data, off)
+            os.pwrite = counting
+        else:
+            def counting(fd, data, off):
+                sizes.append(len(data))
+                os.lseek(fd, off, os.SEEK_SET)
+                return os.write(fd, data)
+            os.pwrite = counting
 
-        os.pwrite = counting
         try:
             ok = dl.download_file(self.url, self.out, disk_profile="hdd")
         finally:
-            os.pwrite = real_pwrite
+            if real_pwrite is not None:
+                os.pwrite = real_pwrite
+            else:
+                if hasattr(os, "pwrite"):
+                    delattr(os, "pwrite")
 
         self.assertTrue(ok)
         self.assertPayload(self.out)

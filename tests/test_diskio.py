@@ -112,20 +112,31 @@ class TestSegmentWriter(unittest.TestCase):
         """The whole point: many small appends must become few large writes."""
         size = 4 * 1024 * 1024
         allocate_file(self.path, size)
-        real_pwrite = os.pwrite
+        real_pwrite = getattr(os, "pwrite", None)
         calls = []
 
-        def counting_pwrite(fd, data, off):
-            calls.append(len(data))
-            return real_pwrite(fd, data, off)
+        if real_pwrite is not None:
+            def counting_pwrite(fd, data, off):
+                calls.append(len(data))
+                return real_pwrite(fd, data, off)
+            os.pwrite = counting_pwrite
+        else:
+            def counting_pwrite(fd, data, off):
+                calls.append(len(data))
+                os.lseek(fd, off, os.SEEK_SET)
+                return os.write(fd, data)
+            os.pwrite = counting_pwrite
 
-        os.pwrite = counting_pwrite
         try:
             with SegmentWriter(self.path, 0, buffer_bytes=1024 * 1024) as w:
                 for _ in range(size // (64 * 1024)):  # 64 appends of 64 KB
                     w.append(b"a" * (64 * 1024))
         finally:
-            os.pwrite = real_pwrite
+            if real_pwrite is not None:
+                os.pwrite = real_pwrite
+            else:
+                if hasattr(os, "pwrite"):
+                    delattr(os, "pwrite")
 
         # 64 appends coalesced into ~4 writes of 1 MB.
         self.assertLessEqual(len(calls), 6)
