@@ -11,6 +11,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logger = logging.getLogger(__name__)
 
+
+def _fmt_speed(bps: float) -> str:
+    """Format bytes-per-second as a human-readable string. Centralised here to
+    avoid copy-pasting the same if/elif chain in multiple AppState methods."""
+    if bps > 1_048_576:
+        return f"{bps / 1_048_576:.1f} MB/s"
+    if bps > 1024:
+        return f"{bps / 1024:.1f} KB/s"
+    if bps > 0:
+        return f"{int(bps)} B/s"
+    return "0 KB/s"
+
+
+# In-memory cache for static GUI files. Files never change at runtime so we
+# read each one once and serve from RAM on every subsequent request.
+_static_cache: dict = {}
+
+
 def extract_email_from_token(token):
     """
     Decodes the user's email from the JWT payload in localStorage token
@@ -86,8 +104,14 @@ class AppState:
         self.file_to_torrent_map = {}  # dict: {filename: {torrent_name, relative_path}}
         
         self.session = None
+        self.session_lock = threading.Lock()
         self.api_key = str(uuid.uuid4())
-        
+        # O(1) name → queue-index mapping; rebuilt whenever update_queue() runs.
+        self._queue_index: dict = {}
+        # TTL cache for shutil.disk_usage() to avoid a filesystem syscall on
+        # every /api/status poll (which fires every ~500 ms from the frontend).
+        self._disk_cache: dict = {"free_space": "Unknown", "expires": 0.0}
+
         # Load default token if present
         if os.path.exists("token.txt"):
             try:
@@ -147,12 +171,7 @@ class AppState:
             self.status = "error"
             self.error_message = "Your Torbox session token has expired or is invalid."
         
-        if self.session:
-            try:
-                self.session.stop()
-            except Exception:
-                pass
-            self.session = None
+        self.stop_session()
 
         if os.path.exists("token.txt"):
             try:
@@ -160,6 +179,31 @@ class AppState:
             except Exception:
                 pass
         self.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token has expired. Gracefully logged out.")
+
+    def get_or_create_session(self, token=None, browser_type=None, headless=None):
+        with self.session_lock:
+            if not self.session:
+                tok = token or self.token
+                if tok:
+                    from torbox_downloader.browser_session import TorboxBrowserSession
+                    b_type = browser_type or self.browser_type
+                    h_less = headless if headless is not None else self.headless
+                    self.session = TorboxBrowserSession(tok, b_type, h_less)
+                    self.session.start()
+            return self.session
+
+    def stop_session(self):
+        with self.session_lock:
+            if self.session:
+                try:
+                    self.session.stop()
+                except Exception:
+                    pass
+                self.session = None
+
+    def clear_logs(self):
+        with self.lock:
+            self.logs = []
 
     def add_log(self, message):
         with self.lock:
@@ -176,35 +220,27 @@ class AppState:
     def update_queue(self, torrents):
         with self.lock:
             self.queue = []
+            self._queue_index = {}
             for t in torrents:
-                self.queue.append({
+                entry = {
                     "name": t["name"],
                     "path": "",
                     "size": t["size"],
                     "status": "queued",
                     "progress": 0,
                     "speed": "0 KB/s"
-                })
+                }
+                self._queue_index[t["name"]] = len(self.queue)
+                self.queue.append(entry)
 
     def update_file_progress(self, filename, status, downloaded, total, speed_bytes):
         with self.lock:
-            for item in self.queue:
-                if item["name"] == filename:
-                    item["status"] = status
-                    if total > 0:
-                        item["progress"] = int((downloaded / total) * 100)
-                    else:
-                        item["progress"] = 0
-                    
-                    if speed_bytes > 1024 * 1024:
-                        item["speed"] = f"{speed_bytes / (1024*1024):.1f} MB/s"
-                    elif speed_bytes > 1024:
-                        item["speed"] = f"{speed_bytes / 1024:.1f} KB/s"
-                    elif speed_bytes > 0:
-                        item["speed"] = f"{int(speed_bytes)} B/s"
-                    else:
-                        item["speed"] = "0 KB/s"
-                    break
+            idx = self._queue_index.get(filename)
+            if idx is not None:
+                item = self.queue[idx]
+                item["status"] = status
+                item["progress"] = int((downloaded / total) * 100) if total > 0 else 0
+                item["speed"] = _fmt_speed(speed_bytes)
 
     def update_active_download(self, filename, status, downloaded, total, speed_bytes):
         with self.lock:
@@ -217,22 +253,12 @@ class AppState:
                     "progress": 100 if status == 'completed_file' else 0
                 }
             else:
-                progress = int((downloaded / total) * 100) if total > 0 else 0
-                if speed_bytes > 1024 * 1024:
-                    speed_str = f"{speed_bytes / (1024*1024):.1f} MB/s"
-                elif speed_bytes > 1024:
-                    speed_str = f"{speed_bytes / 1024:.1f} KB/s"
-                elif speed_bytes > 0:
-                    speed_str = f"{int(speed_bytes)} B/s"
-                else:
-                    speed_str = "0 KB/s"
-                    
                 self.active_downloads[filename] = {
                     "downloaded": downloaded,
                     "total": total,
-                    "speed": speed_str,
+                    "speed": _fmt_speed(speed_bytes),
                     "status": "downloading",
-                    "progress": progress
+                    "progress": int((downloaded / total) * 100) if total > 0 else 0
                 }
 
     def get_serializable_state(self):
@@ -251,24 +277,31 @@ class AppState:
             watch_mode = self.watch_mode
             watch_interval = self.watch_interval
 
-        free_space_str = "Unknown"
-        try:
-            probe = dest_dir
-            while probe and not os.path.exists(probe):
-                parent = os.path.dirname(probe)
-                if parent == probe:
-                    break
-                probe = parent
-            if not probe or not os.path.exists(probe):
-                probe = os.path.expanduser("~")
-            total, used, free = shutil.disk_usage(probe)
-            free_gb = free / (1024 ** 3)
-            if free_gb > 1024:
-                free_space_str = f"{free_gb / 1024:.1f} TB"
-            else:
-                free_space_str = f"{free_gb:.1f} GB"
-        except Exception:
-            pass
+        # Serve free-space at most once every 5 s to avoid a filesystem syscall
+        # on every /api/status poll (frontend polls every ~500 ms).
+        now_ts = time.time()
+        if now_ts >= self._disk_cache["expires"]:
+            free_space_str = "Unknown"
+            try:
+                probe = dest_dir
+                while probe and not os.path.exists(probe):
+                    parent = os.path.dirname(probe)
+                    if parent == probe:
+                        break
+                    probe = parent
+                if not probe or not os.path.exists(probe):
+                    probe = os.path.expanduser("~")
+                _total, _used, free = shutil.disk_usage(probe)
+                free_gb = free / (1024 ** 3)
+                if free_gb > 1024:
+                    free_space_str = f"{free_gb / 1024:.1f} TB"
+                else:
+                    free_space_str = f"{free_gb:.1f} GB"
+            except Exception:
+                pass
+            self._disk_cache["free_space"] = free_space_str
+            self._disk_cache["expires"] = now_ts + 5.0
+        free_space_str = self._disk_cache["free_space"]
 
         return {
             "token_set": token_set,
@@ -318,10 +351,9 @@ def scan_torrents_background():
     app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Scanning Torbox torrents list in background...")
     
     try:
-        if not app_state.session:
-            from torbox_downloader.browser_session import TorboxBrowserSession
-            app_state.session = TorboxBrowserSession(app_state.token, app_state.browser_type, app_state.headless)
-            app_state.session.start()
+        session = app_state.get_or_create_session()
+        if not session:
+            return
             
         from torbox_downloader.browser_session import is_token_expired
         if is_token_expired(app_state.token):
@@ -330,7 +362,7 @@ def scan_torrents_background():
             send_os_notification("Torbox Session Warning", "Your Torbox session token has expired.")
             return
             
-        torrents = app_state.session.scan_torrents()
+        torrents = session.scan_torrents()
         if torrents:
             app_state.update_queue(torrents)
             app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Successfully scraped {len(torrents)} active torrents from Torbox.")
@@ -381,10 +413,7 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             app_state.set_status("downloading")
    
     try:
-        if not app_state.session:
-            from torbox_downloader.browser_session import TorboxBrowserSession
-            app_state.session = TorboxBrowserSession(token, browser_type, headless)
-            app_state.session.start()
+        session = app_state.get_or_create_session(token, browser_type, headless)
             
         run_downloader(
             url=url,
@@ -400,7 +429,7 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             selected_files=selected_files,
             parallel_connections=parallel_connections,
             cancel_event=app_state.cancel_event,
-            session=app_state.session
+            session=session
         )
         app_state.set_status("finished")
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")
@@ -506,6 +535,10 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         file_path = os.path.join(os.path.dirname(__file__), "gui", sanitized_path)
 
         if os.path.exists(file_path) and os.path.isfile(file_path):
+            if file_path not in _static_cache:
+                with open(file_path, "rb") as f:
+                    _static_cache[file_path] = f.read()
+            content = _static_cache[file_path]
             self.send_response(200)
             if file_path.endswith(".html"):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -515,10 +548,9 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/javascript; charset=utf-8")
             else:
                 self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(content)))
             self.end_headers()
-            
-            with open(file_path, "rb") as f:
-                self.wfile.write(f.read())
+            self.wfile.write(content)
         else:
             self.send_response(404)
             self.end_headers()
@@ -542,6 +574,27 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/api/settings"):
             token_updated = False
+            dest_err = None
+
+            if "dest_dir" in params:
+                new_dest = params["dest_dir"].strip()
+                if new_dest:
+                    try:
+                        os.makedirs(new_dest, exist_ok=True)
+                        test_file = os.path.join(new_dest, f".write_test_{uuid.uuid4().hex}")
+                        with open(test_file, "w") as f:
+                            f.write("test")
+                        os.remove(test_file)
+                    except Exception as e:
+                        dest_err = f"Invalid or non-writable download directory '{new_dest}': {e}"
+
+            if dest_err:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": dest_err}).encode("utf-8"))
+                return
+
             with app_state.lock:
                 if "token" in params:
                     new_token = params["token"].strip()
@@ -551,7 +604,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                         token_updated = True
                         with open("token.txt", "w", encoding="utf-8") as f:
                             f.write(app_state.token)
-                if "dest_dir" in params:
+                if "dest_dir" in params and not dest_err:
                     app_state.dest_dir = params["dest_dir"].strip()
                 if "delay" in params:
                     app_state.delay = int(params["delay"])
@@ -567,8 +620,9 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             
             if token_updated:
                 try:
-                    if app_state.session:
-                        app_state.session.update_token(app_state.token)
+                    session = app_state.get_or_create_session()
+                    if session:
+                        session.update_token(app_state.token)
                     t = threading.Thread(
                         target=scan_torrents_background,
                         daemon=True
@@ -585,6 +639,14 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     else:
                         raise e
             
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path.startswith("/api/clear_logs"):
+            app_state.clear_logs()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -610,12 +672,10 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": "Another fetch is in progress. Please wait."}).encode("utf-8"))
                 return
             try:
-                if not app_state.session:
-                    from torbox_downloader.browser_session import TorboxBrowserSession
-                    app_state.session = TorboxBrowserSession(app_state.token, app_state.browser_type, app_state.headless)
-                    app_state.session.start()
-                    
-                files = app_state.session.fetch_structure(torrent_name)
+                session = app_state.get_or_create_session()
+                if not session:
+                    raise RuntimeError("No valid session token provided.")
+                files = session.fetch_structure(torrent_name)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -652,16 +712,15 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 return
                 
             try:
-                if not app_state.session:
-                    from torbox_downloader.browser_session import TorboxBrowserSession
-                    app_state.session = TorboxBrowserSession(app_state.token, app_state.browser_type, app_state.headless)
-                    app_state.session.start()
+                session = app_state.get_or_create_session()
+                if not session:
+                    raise RuntimeError("No valid session token provided.")
                 
                 # Expand torrent if not current
-                if app_state.session.current_torrent_name != torrent_name or "download" not in app_state.session.page.url:
-                    app_state.session.fetch_structure(torrent_name)
+                if session.current_torrent_name != torrent_name or "download" not in session.page.url:
+                    session.fetch_structure(torrent_name)
                     
-                download_url = app_state.session.generate_download_link(name, size, selector)
+                download_url = session.generate_download_link(name, size, selector)
                 
                 if download_url:
                     self.send_response(200)
@@ -747,12 +806,12 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             url = "https://torbox.app/download"
 
             with app_state.lock:
-                for item in app_state.queue:
-                    if item["name"] == filename:
-                        item["status"] = "queued"
-                        item["progress"] = 0
-                        item["speed"] = "0 KB/s"
-                        break
+                idx = app_state._queue_index.get(filename)
+                if idx is not None:
+                    item = app_state.queue[idx]
+                    item["status"] = "queued"
+                    item["progress"] = 0
+                    item["speed"] = "0 KB/s"
 
             t = threading.Thread(
                 target=downloader_worker,
@@ -798,12 +857,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 app_state.queue = []
                 app_state.status = "idle"
             
-            if app_state.session:
-                try:
-                    app_state.session.stop()
-                except:
-                    pass
-                app_state.session = None
+            app_state.stop_session()
 
             if os.path.exists("token.txt"):
                 try:
@@ -840,9 +894,7 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
 
     # Initialize shared browser session
     if app_state.token:
-        from torbox_downloader.browser_session import TorboxBrowserSession
-        app_state.session = TorboxBrowserSession(app_state.token, app_state.browser_type, app_state.headless)
-        app_state.session.start()
+        app_state.get_or_create_session()
         
         # Pre-populate list on startup
         t = threading.Thread(
@@ -865,6 +917,7 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping GUI Server...")
+        app_state.stop_session()
         try:
             server.server_close()
         except:
@@ -872,8 +925,4 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
         import os
         os._exit(0)
     finally:
-        if app_state.session:
-            try:
-                app_state.session.stop()
-            except:
-                pass
+        app_state.stop_session()

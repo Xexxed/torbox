@@ -9,6 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# Compiled once at import time — parse_size_to_bytes() is called frequently.
+_SIZE_PATTERN = re.compile(r'^([\d.]+)\s*(GB|MB|KB|B)$', re.I)
+
 
 def parse_size_to_bytes(size_str):
     """
@@ -17,7 +20,7 @@ def parse_size_to_bytes(size_str):
     if not size_str:
         return None
     
-    match = re.match(r'^([\d.]+)\s*(GB|MB|KB|B)$', size_str.strip(), re.I)
+    match = _SIZE_PATTERN.match(size_str.strip())
     if not match:
         return None
         
@@ -84,7 +87,7 @@ def _download_single_threaded(url, part_path, local_path, total_size, headers, r
                 with tqdm(total=stream_total, initial=existing_bytes, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
                     downloaded = existing_bytes
                     start_time = time.time()
-                    for chunk in response.iter_content(chunk_size=512 * 1024): # 512KB chunks
+                    for chunk in response.iter_content(chunk_size=2 * 1024 * 1024):  # 2 MB chunks
                         if cancel_event and cancel_event.is_set():
                             raise IOError("Aborted by user")
                         if chunk:
@@ -280,11 +283,9 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
     start_time = time.time()
     errors = []
 
-    desc = os.path.basename(local_path)
-    if len(desc) > 30:
-        desc = desc[:27] + "..."
-
-    print(f"Connecting to download {os.path.basename(local_path)} using {num_threads} connections...")
+    # Pre-computed once; used by progress callback and log messages below.
+    fname = os.path.basename(local_path)
+    print(f"Connecting to download {fname} using {num_threads} connections...")
 
     last_update_time = [0.0]
     update_interval = 0.25  # update GUI at most every 250 ms
@@ -320,24 +321,40 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                 # Each thread operates on a non-overlapping region so no file-level
                 # locking is required for writes.
                 bytes_written = 0
+                local_pending = 0  # bytes accumulated since last lock acquisition
                 with open(part_path, 'r+b') as f:
                     f.seek(seg_start)
-                    for chunk in resp.iter_content(chunk_size=512 * 1024):  # 512 KB
+                    for chunk in resp.iter_content(chunk_size=2 * 1024 * 1024):  # 2 MB chunks
                         if cancel_event and cancel_event.is_set():
                             raise IOError("Aborted by user")
                         if chunk:
                             f.write(chunk)
                             chunk_len = len(chunk)
                             bytes_written += chunk_len
-                            with downloaded_lock:
-                                downloaded_bytes += chunk_len
-                                if progress_callback:
-                                    now = time.time()
-                                    if now - last_update_time[0] >= update_interval or downloaded_bytes >= total_size:
+                            local_pending += chunk_len
+                            now = time.time()
+                            if now - last_update_time[0] >= update_interval:
+                                # Only take the lock when the GUI refresh interval
+                                # fires — not on every chunk. Avoids thousands of
+                                # kernel-level mutex operations per second.
+                                with downloaded_lock:
+                                    downloaded_bytes += local_pending
+                                    local_pending = 0
+                                    if progress_callback:
                                         last_update_time[0] = now
                                         elapsed = now - start_time
                                         speed = downloaded_bytes / elapsed if elapsed > 0 else 0
-                                        progress_callback(os.path.basename(local_path), downloaded_bytes, total_size, speed)
+                                        progress_callback(fname, downloaded_bytes, total_size, speed)
+
+                # Flush bytes accumulated since the last lock acquisition.
+                if local_pending > 0:
+                    with downloaded_lock:
+                        downloaded_bytes += local_pending
+                        if progress_callback and downloaded_bytes >= total_size:
+                            now = time.time()
+                            elapsed = now - start_time
+                            speed = downloaded_bytes / elapsed if elapsed > 0 else 0
+                            progress_callback(fname, downloaded_bytes, total_size, speed)
 
                 if bytes_written >= seg_total_size:
                     # Mark this segment complete so it can be skipped on resume.
@@ -375,7 +392,7 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
                             pass
                     else:
                         wait_time = 5 * (2 ** seg_attempt)
-                    print(f"Warning: Rate limited (429) on segment {segment_idx} for {os.path.basename(local_path)}. Retrying in {wait_time}s...")
+                    print(f"Warning: Rate limited (429) on segment {segment_idx} for {fname}. Retrying in {wait_time}s...")
                 else:
                     wait_time = backoff_factor ** seg_attempt
 
@@ -389,20 +406,13 @@ def download_file(url, local_path, expected_size_str=None, headers=None, retries
 
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = [executor.submit(download_segment, idx, r[0], r[1]) for idx, r in enumerate(ranges)]
-
-        with tqdm(total=total_size, initial=initial_downloaded_bytes, unit='B', unit_scale=True, desc=desc, leave=True) as pbar:
-            last_val = initial_downloaded_bytes
-            while True:
-                with downloaded_lock:
-                    curr = downloaded_bytes
-                pbar.update(curr - last_val)
-                last_val = curr
-                if curr >= total_size or errors or (cancel_event and cancel_event.is_set()):
-                    break
-                time.sleep(0.2)
-
-            if not errors and not (cancel_event and cancel_event.is_set()):
-                pbar.update(total_size - last_val)
+        # executor.__exit__ calls shutdown(wait=True), so all segments complete
+        # before we reach the integrity check below. No tqdm polling loop needed.
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception:
+                pass  # Errors collected in the shared errors list; abort via cancel_event
 
     if (cancel_event and cancel_event.is_set()) or any("Aborted" in err for err in errors):
         print(f"Segmented download aborted: {os.path.basename(local_path)}")

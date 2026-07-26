@@ -68,10 +68,18 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
         total_bytes_map[fname] = fsize
         downloaded_bytes[fname] = 0
         speeds[fname] = 0
-        
+
+    # Pre-compute the total once — total_bytes_map doesn't change after setup.
+    _overall_tot = sum(total_bytes_map.values())
+    # Running counter updated by delta so we never call sum(downloaded_bytes.values())
+    # inside the hot progress callback path.
+    _cumul_dl = [0]
+
     def make_file_progress_callback(fname):
         def cb(filename, dl, tot, sp):
             with progress_lock:
+                prev = downloaded_bytes[fname]
+                _cumul_dl[0] += dl - prev        # O(1) delta update
                 downloaded_bytes[fname] = dl
                 total_bytes_map[fname] = tot
                 speeds[fname] = sp
@@ -84,10 +92,8 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
                             raise
                             
                     if torrent_name_for_status:
-                        overall_dl = sum(downloaded_bytes.values())
-                        overall_tot = sum(total_bytes_map.values())
                         overall_speed = sum(speeds.values())
-                        percent = int((overall_dl / overall_tot * 100)) if overall_tot > 0 else 0
+                        percent = int(_cumul_dl[0] / _overall_tot * 100) if _overall_tot > 0 else 0
                         status_update_callback(torrent_name_for_status, 'downloading', percent, 100, overall_speed)
                     else:
                         status_update_callback(fname, 'downloading', dl, tot, sp)
@@ -217,6 +223,7 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
                 expected_bytes = parse_size_to_bytes(size) or os.path.getsize(local_path)
                 with progress_lock:
                     downloaded_bytes[name] = expected_bytes
+                    _cumul_dl[0] += expected_bytes  # keep overall % accurate for skipped files
                 if status_update_callback and not torrent_name_for_status:
                     status_update_callback(name, 'completed', expected_bytes, expected_bytes, 0)
                 continue

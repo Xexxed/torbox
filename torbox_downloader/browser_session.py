@@ -75,6 +75,7 @@ class TorboxBrowserSession:
         self.page = None
         
         self._intercepted_download_url = None
+        self._recovery_count = 0
 
     def start(self):
         """Spawns the background worker thread."""
@@ -299,9 +300,15 @@ class TorboxBrowserSession:
         )
         
         if not is_crashed:
+            self._recovery_count = 0
             return True
-            
-        logger.info(f"Browser page crashed (URL: {current_url}). Initiating automatic recovery...")
+
+        self._recovery_count = getattr(self, "_recovery_count", 0) + 1
+        if self._recovery_count > 3:
+            logger.error("Browser session crashed repeatedly (3+ recovery attempts failed). Aborting recovery.")
+            raise RuntimeError("Browser session crashed and could not be recovered after 3 attempts.")
+
+        logger.info(f"Browser page crashed (URL: {current_url}). Initiating automatic recovery (Attempt {self._recovery_count}/3)...")
         try:
             self._close_browser()
             self._init_browser()

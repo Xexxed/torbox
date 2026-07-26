@@ -126,7 +126,7 @@ function switchConsoleTab(tabName) {
 
 // Clear UI Console log rows
 function clearConsoleLogs() {
-    fetch('/api/stop', { method: 'POST' }) // Stops and resets state log array
+    fetch('/api/clear_logs', { method: 'POST' }) // Resets state log array without stopping downloads
         .then(() => {
             const consoleEl = document.getElementById('console-logs');
             if (consoleEl) consoleEl.innerHTML = '';
@@ -184,6 +184,8 @@ function saveSettings() {
             }
             
             fetchStatus();
+        } else if (data.error) {
+            alert("Error saving settings: " + data.error);
         }
     })
     .catch(err => console.error("Error saving settings:", err));
