@@ -10,6 +10,14 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+# The Torbox dashboard lazy-loads its torrent list (infinite scroll): right
+# after page load only the few cards near the viewport exist in the DOM, so a
+# single HTML snapshot yields only ~5 torrents. These tunables control how we
+# scroll the list until every card has been fetched and rendered.
+SCAN_MAX_ROUNDS = 60        # hard cap on scroll rounds (safety net)
+SCAN_STALE_ROUNDS = 3       # stop after this many consecutive rounds with no new cards
+SCAN_SCROLL_WAIT_MS = 400   # wait between scroll rounds so the SPA can render
+
 def is_token_expired(token):
     """
     Checks offline if a token is expired. Supports raw JWT strings
@@ -317,14 +325,11 @@ class TorboxBrowserSession:
             torrent_name = getattr(self, "current_torrent_name", None)
             if torrent_name:
                 logger.info(f"Re-expanding torrent card during recovery: {torrent_name}")
-                title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
-                card = title_el
-                for _ in range(10):
-                    card = card.locator("..")
-                    if card.locator("button[title='Download files']").count() > 0:
-                        break
-                btn_to_click = card.locator("button[title='Download files']").first
-                if btn_to_click.count() > 0:
+                btn_to_click = self._locate_torrent_download_button(torrent_name)
+                if btn_to_click is None or btn_to_click.count() == 0:
+                    # Card may be lazy-loaded below the fold after the reload.
+                    btn_to_click = self._locate_torrent_download_button_scrolling(torrent_name)
+                if btn_to_click is not None and btn_to_click.count() > 0:
                     btn_to_click.evaluate("el => el.click()")
                     try:
                         self.page.locator("button[title*='Options'], button[title*='options']").first.wait_for(state="visible", timeout=10000)
@@ -356,6 +361,112 @@ class TorboxBrowserSession:
                 pass
             return False
 
+    def _locate_torrent_download_button(self, torrent_name):
+        """Find the 'Download files' button of the torrent card whose title
+        matches torrent_name. Returns a Playwright locator or None."""
+        try:
+            title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
+            if title_el.count() > 0:
+                card = title_el
+                for _ in range(10):
+                    card = card.locator("..")
+                    if card.locator("button[title='Download files']").count() > 0:
+                        return card.locator("button[title='Download files']").first
+        except Exception:
+            pass
+        return None
+
+    def _scroll_page_down(self):
+        """Scroll the dashboard list down by one viewport to trigger the next
+        lazy-loaded batch. Prefers wheel events (bubbling to whichever element
+        is scrollable under the cursor) with a window.scrollBy fallback."""
+        try:
+            self.page.mouse.wheel(0, 800)
+        except Exception:
+            self.page.evaluate("window.scrollBy(0, window.innerHeight)")
+
+    def _collect_dashboard_torrents(self):
+        """
+        Scroll the dashboard list and repeatedly parse the DOM, accumulating
+        unique torrent cards.
+
+        The Torbox dashboard lazy-loads its list (infinite scroll): right after
+        page load only the few cards near the viewport exist in the DOM, so a
+        single HTML snapshot used to yield only ~5 torrents. Scrolling forces
+        the SPA to fetch and render the rest; merging snapshots by name also
+        copes with virtualised lists that remove off-screen cards.
+        """
+        from torbox_downloader.detector import TorboxDetector
+
+        collected = {}
+        stale_rounds = 0
+
+        # Wheel events must land on the scrollable area; park the cursor mid-page.
+        try:
+            self.page.mouse.move(640, 400)
+        except Exception:
+            pass
+
+        for round_idx in range(SCAN_MAX_ROUNDS):
+            try:
+                html_content = self.page.content()
+                found = TorboxDetector(html_content).parse_torrents()
+            except Exception as e:
+                logger.warning(f"scan_torrents: parse failed on scroll round {round_idx}: {e}")
+                found = []
+
+            new_count = 0
+            for t in found:
+                if t["name"] not in collected:
+                    collected[t["name"]] = t
+                    new_count += 1
+
+            if new_count:
+                stale_rounds = 0
+            else:
+                stale_rounds += 1
+                if stale_rounds >= SCAN_STALE_ROUNDS:
+                    break
+
+            try:
+                self._scroll_page_down()
+            except Exception as e:
+                logger.warning(f"scan_torrents: scroll failed on round {round_idx}: {e}")
+            self.page.wait_for_timeout(SCAN_SCROLL_WAIT_MS)
+
+        # Return to the top so subsequent card lookups start from a sane state.
+        try:
+            self.page.evaluate("window.scrollTo(0, 0)")
+            self.page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+        return list(collected.values())
+
+    def _locate_torrent_download_button_scrolling(self, torrent_name, max_rounds=SCAN_MAX_ROUNDS, wait_ms=SCAN_SCROLL_WAIT_MS):
+        """
+        Scroll the lazy-loaded dashboard list until the torrent card's download
+        button appears. Needed when the requested torrent sits below the fold
+        (only ~5 cards are rendered near the initial viewport).
+        """
+        try:
+            self.page.mouse.move(640, 400)
+        except Exception:
+            pass
+
+        for _ in range(max_rounds):
+            btn = self._locate_torrent_download_button(torrent_name)
+            if btn is not None and btn.count() > 0:
+                return btn
+
+            try:
+                self._scroll_page_down()
+            except Exception as e:
+                logger.warning(f"Card search scroll failed for '{torrent_name}': {e}")
+            self.page.wait_for_timeout(wait_ms)
+
+        return None
+
     def _execute_action(self, action, *args, **kwargs):
         # Always run recovery check before executing command
         self._recover_page_if_crashed()
@@ -375,10 +486,7 @@ class TorboxBrowserSession:
             except Exception as e:
                 logger.warning(f"Error checking/navigating to dashboard in scan_torrents: {e}")
                 
-            html_content = self.page.content()
-            from torbox_downloader.detector import TorboxDetector
-            detector = TorboxDetector(html_content)
-            return detector.parse_torrents()
+            return self._collect_dashboard_torrents()
             
         elif action == "fetch_structure":
             torrent_name = args[0]
@@ -387,33 +495,18 @@ class TorboxBrowserSession:
             
             # Locate download button for target torrent.
             # If not found or if the torrent card isn't visible, navigate to dashboard first.
-            btn_to_click = None
-            try:
-                title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
-                if title_el.count() > 0:
-                    card = title_el
-                    for _ in range(10):
-                        card = card.locator("..")
-                        if card.locator("button[title='Download files']").count() > 0:
-                            btn_to_click = card.locator("button[title='Download files']").first
-                            break
-            except Exception:
-                pass
+            btn_to_click = self._locate_torrent_download_button(torrent_name)
 
             if btn_to_click is None or btn_to_click.count() == 0:
                 logger.info(f"Torrent '{torrent_name}' download button not found or not visible. Resetting dashboard view...")
                 self._reset_to_dashboard()
-                try:
-                    # Re-locate the button
-                    title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
-                    card = title_el
-                    for _ in range(10):
-                        card = card.locator("..")
-                        if card.locator("button[title='Download files']").count() > 0:
-                            break
-                    btn_to_click = card.locator("button[title='Download files']").first
-                except Exception as e:
-                    logger.warning(f"Error re-locating torrent card: {e}")
+                btn_to_click = self._locate_torrent_download_button(torrent_name)
+
+            if btn_to_click is None or btn_to_click.count() == 0:
+                # The card may sit below the fold: the dashboard lazy-loads its
+                # list, so only the first few cards exist in the DOM until we scroll.
+                logger.info(f"Torrent '{torrent_name}' still not found. Scrolling dashboard to locate card...")
+                btn_to_click = self._locate_torrent_download_button_scrolling(torrent_name)
 
             if btn_to_click and btn_to_click.count() > 0:
                 btn_to_click.evaluate("el => el.click()")
@@ -509,14 +602,11 @@ class TorboxBrowserSession:
                         if "download" not in self.page.url or self.page.locator("button[title='Download files']").count() == 0:
                             self._reset_to_dashboard()
 
-                        title_el = self.page.locator("p, span, div, h1, h2, h3, h4").filter(has_text=torrent_name).last
-                        card = title_el
-                        for _ in range(10):
-                            card = card.locator("..")
-                            if card.locator("button[title='Download files']").count() > 0:
-                                break
-                        btn_to_click = card.locator("button[title='Download files']").first
-                        if btn_to_click.count() > 0:
+                        btn_to_click = self._locate_torrent_download_button(torrent_name)
+                        if btn_to_click is None or btn_to_click.count() == 0:
+                            # Card may be lazy-loaded below the fold.
+                            btn_to_click = self._locate_torrent_download_button_scrolling(torrent_name)
+                        if btn_to_click is not None and btn_to_click.count() > 0:
                             btn_to_click.evaluate("el => el.click()")
                             try:
                                 self.page.locator("button[title*='Options'], button[title*='options']").first.wait_for(state="visible", timeout=6000)
