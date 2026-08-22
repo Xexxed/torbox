@@ -1,4 +1,8 @@
-requests>=2.34.2
-beautifulsoup4>=4.15.0
-tqdm>=4.68.2
-playwright>=1.49.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+tqdm>=4.66.0
+playwright>=1.40.0
+winfspy>=0.8.4; sys_platform == "win32"
+wsgidav>=4.3.0
+cheroot>=8.3.0
+

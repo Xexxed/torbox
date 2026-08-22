@@ -3,6 +3,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Build & packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
 
 # Virtual environments
 .venv/
@@ -13,18 +22,35 @@ ENV/
 # Local sensitive configuration and credentials
 token.txt
 settings.json
+*.token
 
 # Local downloads target directory (Default)
 downloads/
 
-# IDE configurations
+# IDE & Editor configurations
 .idea/
 .vscode/
+.kilo/
+.agents/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.swp
+*.swo
+
+# OS artifacts
+Thumbs.db
+[Dd]esktop.ini
+ehthumbs.db
+.DS_Store
+
+# Logs & temp files
+*.log
+*.tmp
+*.bak
 
 # Debug HTML dumps (may contain personal content names)
-torbox_debug.html
+torbox_debug*.html
+debug_*.html
+*.html.dump

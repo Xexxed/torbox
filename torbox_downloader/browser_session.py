@@ -655,11 +655,20 @@ class TorboxBrowserSession:
                 logger.error(f"Could not locate download options button for: {name}")
                 return None
                 
+            try:
+                dl_btn.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
             dl_btn.evaluate("el => el.click()")
-            self.page.wait_for_timeout(1000)
-            
-            # 4. Find Direct Download
-            direct_dl_btn = row_locator.locator("button:visible, a:visible", has_text="Direct Download").first
+            self.page.wait_for_timeout(500)
+
+            # 4. Find Direct Download (in row or in global portal/menu)
+            direct_dl_btn = row_locator.locator("button:visible, a:visible, div[role='menuitem']:visible", has_text=re.compile(r"Direct\s*Download", re.I)).first
+            if direct_dl_btn.count() == 0:
+                direct_dl_btn = self.page.locator("button:visible, a:visible, div[role='menuitem']:visible, [role='menu'] *", has_text=re.compile(r"Direct\s*Download", re.I)).first
+            if direct_dl_btn.count() == 0:
+                direct_dl_btn = self.page.locator("[role='menu'] button:visible, [role='menu'] a:visible, [data-radix-popper-content-wrapper] button:visible, [data-radix-popper-content-wrapper] a:visible").filter(has_text=re.compile(r"Download", re.I)).first
+
             if direct_dl_btn.count() == 0:
                 logger.error(f"Could not find 'Direct Download' button for: {name}")
                 try:
@@ -667,9 +676,12 @@ class TorboxBrowserSession:
                 except Exception:
                     pass
                 return None
-                
-            direct_dl_btn.wait_for(state="visible", timeout=10000)
-            
+
+            try:
+                direct_dl_btn.wait_for(state="visible", timeout=6000)
+            except Exception:
+                pass
+
             # 5. Click and await CDN URL capture
             self._intercepted_download_url = None
             direct_dl_btn.evaluate("el => el.click()")

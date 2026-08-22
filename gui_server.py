@@ -114,6 +114,11 @@ class AppState:
         # every /api/status poll (which fires every ~500 ms from the frontend).
         self._disk_cache: dict = {"free_space": "Unknown", "expires": 0.0}
 
+        # Virtual drive (RaiDrive-style mount); "" = auto-pick a free letter.
+        from torbox_downloader.mount.manager import DriveMountManager
+        self.mount_manager = DriveMountManager()
+        self.mount_drive_letter = ""
+
         # Load default token if present
         if os.path.exists("token.txt"):
             try:
@@ -128,6 +133,7 @@ class AppState:
             self.save_settings()
         else:
             self.load_settings()
+        self.mount_manager.set_preferred_letter(self.mount_drive_letter)
 
     def load_settings(self):
         if os.path.exists("settings.json"):
@@ -150,6 +156,9 @@ class AppState:
                         self.watch_mode = bool(data["watch_mode"])
                     if "watch_interval" in data:
                         self.watch_interval = int(data["watch_interval"])
+                    if "mount_drive_letter" in data:
+                        letter = str(data["mount_drive_letter"]).strip().upper().rstrip(":")
+                        self.mount_drive_letter = letter if len(letter) == 1 and letter.isalpha() else ""
             except Exception:
                 pass
 
@@ -164,7 +173,8 @@ class AppState:
                     "disk_profile": self.disk_profile,
                     "write_buffer_mb": self.write_buffer_mb,
                     "watch_mode": self.watch_mode,
-                    "watch_interval": self.watch_interval
+                    "watch_interval": self.watch_interval,
+                    "mount_drive_letter": self.mount_drive_letter
                 }, f)
         except Exception:
             pass
@@ -329,7 +339,9 @@ class AppState:
             "disk_profile": disk_profile,
             "write_buffer_mb": write_buffer_mb,
             "watch_mode": watch_mode,
-            "watch_interval": watch_interval
+            "watch_interval": watch_interval,
+            "mount": self.mount_manager.status_snapshot(),
+            "mount_drive_letter": self.mount_drive_letter
         }
 
 app_state = AppState()
@@ -639,6 +651,13 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     app_state.watch_mode = bool(params["watch_mode"])
                 if "watch_interval" in params:
                     app_state.watch_interval = int(params["watch_interval"])
+                if "mount_drive_letter" in params:
+                    letter = str(params["mount_drive_letter"]).strip().upper().rstrip(":")
+                    if letter == "AUTO" or letter == "":
+                        app_state.mount_drive_letter = ""
+                    elif len(letter) == 1 and letter.isalpha():
+                        app_state.mount_drive_letter = letter
+                    app_state.mount_manager.set_preferred_letter(app_state.mount_drive_letter)
                 app_state.save_settings()
             
             if token_updated:
@@ -876,6 +895,64 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
             return
 
+        elif self.path.startswith("/api/mount_drive"):
+            if not app_state.token:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Save a session token before mounting."}).encode("utf-8"))
+                return
+
+            started = app_state.mount_manager.mount_async(app_state)
+            if not started:
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "A mount or download operation is already in progress."}).encode("utf-8"))
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path.startswith("/api/unmount_drive"):
+            started = app_state.mount_manager.unmount_async(app_state)
+            if not started:
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "No mounted drive to unmount right now."}).encode("utf-8"))
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path.startswith("/api/open_drive"):
+            snap = app_state.mount_manager.status_snapshot()
+            letter = snap.get("drive_letter")
+            if not letter or snap.get("status") != "mounted":
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Drive is not mounted yet."}).encode("utf-8"))
+                return
+            try:
+                os.startfile(f"{letter}:\\")
+                result = {"success": True}
+            except Exception as e:
+                result = {"success": False, "error": f"Could not open {letter}:\\ : {e}"}
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
+            return
+
         elif self.path.startswith("/api/logout"):
             app_state.abort_flag = True
             app_state.cancel_event.set()
@@ -884,7 +961,13 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 app_state.email = ""
                 app_state.queue = []
                 app_state.status = "idle"
-            
+
+            # Tear down any mounted virtual drive before killing the session.
+            try:
+                app_state.mount_manager.unmount_async(app_state)
+            except Exception:
+                pass
+
             app_state.stop_session()
 
             if os.path.exists("token.txt"):
@@ -945,6 +1028,11 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping GUI Server...")
+        # Tear down the virtual drive (net use / fs stop) before the session.
+        try:
+            app_state.mount_manager.unmount_sync()
+        except Exception:
+            pass
         app_state.stop_session()
         try:
             server.server_close()

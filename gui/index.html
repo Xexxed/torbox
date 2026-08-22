@@ -102,6 +102,59 @@
 
                     <!-- Right Column: System Status, Path & Real-time Console -->
                     <div class="right-column">
+                        <!-- Virtual Drive Card -->
+                        <div class="card path-card" id="drive-card">
+                            <div class="card-header">
+                                <h3><svg viewBox="0 0 24 24" width="18" height="18" class="header-icon"><path d="M2 20h20v-4H2v4zm2-3h2v2H4v-2zM2 4v4h20V4H2zm2 3H4V5h2v2zm-2 7h20v-4H2v4zm2-3h2v2H4v-2z"/></svg> Virtual Drive</h3>
+                                <span class="badge" id="drive-status-badge">IDLE</span>
+                            </div>
+                            <div class="card-body">
+                                <div class="path-stats">
+                                    <span class="stat-item"><span class="dot blue"></span> Backend: <strong id="drive-backend-val">-</strong></span>
+                                    <span class="stat-item"><span class="dot emerald"></span> Mounted At: <strong id="drive-letter-val">-</strong></span>
+                                </div>
+                                <div style="display: flex; gap: 12px; margin-top: 14px;">
+                                    <div style="flex: 1;">
+                                        <label for="drive-letter-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Drive Letter</label>
+                                        <select id="drive-letter-input" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;">
+                                            <option value="">Auto</option>
+                                            <option value="Z">Z:</option>
+                                            <option value="Y">Y:</option>
+                                            <option value="X">X:</option>
+                                            <option value="W">W:</option>
+                                            <option value="V">V:</option>
+                                            <option value="U">U:</option>
+                                            <option value="T">T:</option>
+                                            <option value="S">S:</option>
+                                            <option value="R">R:</option>
+                                            <option value="Q">Q:</option>
+                                            <option value="P">P:</option>
+                                            <option value="O">O:</option>
+                                            <option value="N">N:</option>
+                                            <option value="M">M:</option>
+                                            <option value="L">L:</option>
+                                            <option value="K">K:</option>
+                                            <option value="J">J:</option>
+                                            <option value="I">I:</option>
+                                            <option value="H">H:</option>
+                                            <option value="G">G:</option>
+                                            <option value="F">F:</option>
+                                        </select>
+                                    </div>
+                                    <div style="flex: 1; display: flex; align-items: flex-end;">
+                                        <button class="btn btn-primary" id="mount-btn" onclick="mountDrive()" style="width: 100%;">Mount Drive</button>
+                                    </div>
+                                </div>
+                                <div style="display: flex; gap: 10px; margin-top: 12px;">
+                                    <button class="btn btn-secondary" id="open-drive-btn" onclick="openDrive()" style="flex: 1; display: none;">Open Drive</button>
+                                    <button class="btn btn-secondary" id="unmount-btn" onclick="unmountDrive()" style="flex: 1; display: none;">Unmount</button>
+                                </div>
+                                <div style="margin-top: 10px; font-size: 11px; color: var(--text-muted); line-height: 1.5;" id="drive-hint-text">
+                                    Stream your cached torrents as a local drive. Opening a file plays it straight from the cloud; copy-paste downloads to wherever you paste. Nothing is stored on disk.
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Path Card -->
                         <div class="card path-card">
                             <div class="card-header">

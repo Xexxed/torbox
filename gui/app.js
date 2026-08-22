@@ -147,6 +147,8 @@ function saveSettings() {
     const write_buffer_mb = parseFloat((document.getElementById('write-buffer-input') || {}).value) || 0;
     const watch_mode = document.getElementById('watch-mode-input').checked;
     const watch_interval = parseInt(document.getElementById('watch-interval-input').value) || 60;
+    const driveLetterSel = document.getElementById('drive-letter-input');
+    const mount_drive_letter = driveLetterSel ? (driveLetterSel.value || '') : undefined;
     
     const body = {
         token: token,
@@ -159,6 +161,9 @@ function saveSettings() {
         watch_mode: watch_mode,
         watch_interval: watch_interval
     };
+    if (mount_drive_letter !== undefined) {
+        body.mount_drive_letter = mount_drive_letter === '' ? 'AUTO' : mount_drive_letter;
+    }
     
     fetch('/api/settings', {
         method: 'POST',
@@ -781,6 +786,9 @@ function fetchStatus() {
             // Sync free space metric
             document.getElementById('free-space-val').textContent = state.free_space;
 
+            // Sync virtual drive card (mount status / backend / letter)
+            renderDriveState(state.mount, state.mount_drive_letter);
+
             // Sync running status state
             isRunning = (state.status === 'scanning' || state.status === 'downloading');
             const startBtn = document.getElementById('start-btn');
@@ -806,6 +814,102 @@ function fetchStatus() {
             renderCompleted(state.queue);
         })
         .catch(err => console.error("Error fetching state:", err));
+}
+
+// ===== Virtual Drive (RaiDrive-style mount) =====
+
+// Mount the TorBox library as a local read-only drive.
+function mountDrive() {
+    const btn = document.getElementById('mount-btn');
+    btn.disabled = true;
+    fetch('/api/mount_drive', { method: 'POST' })
+        .then(res => res.json().then(d => ({ ok: res.ok, d })))
+        .then(({ ok, d }) => {
+            if (!ok || d.success === false) {
+                showToast('error', 'Mount Failed', d.error || 'Unknown error');
+                btn.disabled = false;
+            } else {
+                showToast('success', 'Mounting Drive', 'Preparing your virtual drive...');
+            }
+        })
+        .catch(err => {
+            showToast('error', 'Mount Failed', String(err));
+            btn.disabled = false;
+        });
+}
+
+// Unmount the drive (removes mapping, stops server).
+function unmountDrive() {
+    const btn = document.getElementById('unmount-btn');
+    btn.disabled = true;
+    fetch('/api/unmount_drive', { method: 'POST' })
+        .then(res => res.json())
+        .then(d => {
+            if (!d.success) showToast('error', 'Unmount Failed', d.error || 'Unknown error');
+        })
+        .catch(err => showToast('error', 'Unmount Failed', String(err)));
+}
+
+// Open the mounted drive in Explorer.
+function openDrive() {
+    fetch('/api/open_drive', { method: 'POST' })
+        .then(res => res.json())
+        .then(d => {
+            if (!d.success) showToast('error', 'Cannot Open Drive', d.error || 'Unknown error');
+        })
+        .catch(err => showToast('error', 'Cannot Open Drive', String(err)));
+}
+
+// Render the virtual-drive card from backend state.
+function renderDriveState(mount, preferred) {
+    if (!mount) return;
+
+    const badge = document.getElementById('drive-status-badge');
+    const mountBtn = document.getElementById('mount-btn');
+    const unmountBtn = document.getElementById('unmount-btn');
+    const openBtn = document.getElementById('open-drive-btn');
+    const backendEl = document.getElementById('drive-backend-val');
+    const letterEl = document.getElementById('drive-letter-val');
+    const hintEl = document.getElementById('drive-hint-text');
+
+    // Sync drive-letter preference unless the user is editing it
+    const sel = document.getElementById('drive-letter-input');
+    if (sel && document.activeElement !== sel && preferred !== undefined) {
+        sel.value = preferred || '';
+    }
+
+    const st = mount.status || 'idle';
+    const mounted = st === 'mounted';
+    const busy = st === 'mounting' || st === 'unmounting';
+
+    if (badge) {
+        badge.textContent = st.toUpperCase();
+        badge.style.background = mounted ? '#04BF8A' : (st === 'error' ? '#e53e3e' : '');
+    }
+    if (backendEl) backendEl.textContent = mounted ? (mount.backend === 'winfsp' ? 'WinFsp (native)' : 'WebDAV (net use)') : '-';
+    if (letterEl) letterEl.textContent = mounted && mount.path ? mount.path : '-';
+
+    if (mountBtn) {
+        mountBtn.style.display = (mounted || busy) ? 'none' : '';
+        mountBtn.disabled = false;
+        mountBtn.textContent = st === 'mounting' ? 'Mounting...' : 'Mount Drive';
+    }
+    if (unmountBtn) {
+        unmountBtn.style.display = (mounted || busy) ? '' : 'none';
+        unmountBtn.disabled = st === 'unmounting';
+        unmountBtn.textContent = st === 'unmounting' ? 'Unmounting...' : 'Unmount';
+    }
+    if (openBtn) openBtn.style.display = mounted ? '' : 'none';
+
+    if (hintEl) {
+        hintEl.textContent = mounted
+            ? (mount.backend === 'webdav'
+                ? "Mounted via WebDAV ('net use'). For a native Explorer drive install WinFsp (https://winfsp.dev/) and remount."
+                : "Streaming live from TorBox CDN - opening plays instantly; copy-paste downloads to the paste target. Nothing is stored on disk.")
+            : (st === 'error'
+                ? (mount.error || 'Mount failed.') + (mount.hint ? ' ' + mount.hint : '')
+                : 'Stream your cached torrents as a local drive. Opening plays straight from the cloud; copy-paste downloads to the paste target. Nothing is stored on disk.');
+    }
 }
 
 // Render Torrent Queue List in UI
