@@ -39,10 +39,22 @@ const TOAST_ICONS = {
     success: '<svg class="toast-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>'
 };
 
+// Escape user-provided strings before injecting into innerHTML templates
+function escapeHtml(text) {
+    return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function escapeAttr(text) {
+    return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function showToast(type, title, message, durationMs = 8000) {
     const container = document.getElementById('toast-container');
     if (!container) return;
-    
+
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
     toast.innerHTML = `
@@ -51,14 +63,14 @@ function showToast(type, title, message, durationMs = 8000) {
             <div class="toast-title">${title}</div>
             <div class="toast-message">${message}</div>
         </div>
-        <button class="toast-close" onclick="this.parentElement.classList.add('toast-hiding'); setTimeout(() => this.parentElement.remove(), 300)">&times;</button>
+        <button class="toast-close" aria-label="Dismiss" onclick="this.parentElement.classList.add('toast-hiding'); setTimeout(() => this.parentElement.remove(), 220)">&times;</button>
     `;
     container.appendChild(toast);
-    
+
     if (durationMs > 0) {
         setTimeout(() => {
             toast.classList.add('toast-hiding');
-            setTimeout(() => toast.remove(), 300);
+            setTimeout(() => toast.remove(), 220);
         }, durationMs);
     }
 }
@@ -174,38 +186,40 @@ function saveSettings() {
     .then(data => {
         if (data.success) {
             console.log("Settings successfully updated!");
-            
+
             // Provide immediate visual feedback on the Login button
             const loginBtn = document.getElementById('login-btn');
             if (loginBtn) {
-                const originalText = loginBtn.textContent;
-                loginBtn.textContent = 'Saved!';
-                loginBtn.style.backgroundColor = '#04BF8A';
-                loginBtn.style.color = '#000000';
-                loginBtn.style.borderColor = '#04BF8A';
-                
+                loginBtn.classList.add('btn-success-flash');
+                loginBtn.textContent = 'Saved';
                 setTimeout(() => {
-                    loginBtn.textContent = originalText;
-                    loginBtn.style.backgroundColor = '';
-                    loginBtn.style.color = '';
-                    loginBtn.style.borderColor = '';
-                }, 2000);
+                    loginBtn.classList.remove('btn-success-flash');
+                    loginBtn.textContent = 'Sign in';
+                }, 1600);
             }
-            
+
             fetchStatus();
         } else if (data.error) {
-            alert("Error saving settings: " + data.error);
+            showToast('error', 'Could not save settings', data.error);
         }
     })
     .catch(err => console.error("Error saving settings:", err));
 }
 
 // Trigger Start/Stop queue execution
+// One source of truth for the start/stop button's look (color, label, icon)
+function setStartButtonVisual(running) {
+    const startBtn = document.getElementById('start-btn');
+    if (!startBtn) return;
+    const startText = document.getElementById('start-btn-text');
+    const iconEl = document.getElementById('start-btn-icon');
+    startBtn.className = `btn ${running ? 'btn-danger' : 'btn-primary'} btn-large`;
+    if (startText) startText.textContent = running ? 'Stop download' : 'Start download';
+    if (iconEl) iconEl.innerHTML = `<path d="${running ? 'M6 6h12v12H6z' : 'M8 5v14l11-7z'}"/>`;
+}
+
 // Trigger Start/Stop queue execution
 function toggleDownloadProcess() {
-    const startBtn = document.getElementById('start-btn');
-    const startText = document.getElementById('start-btn-text');
-
     if (isRunning) {
         // Send Stop signal
         fetch('/api/stop', { method: 'POST' })
@@ -213,14 +227,12 @@ function toggleDownloadProcess() {
             .then(data => {
                 if (data.success) {
                     isRunning = false;
-                    startBtn.classList.remove('btn-secondary');
-                    startBtn.classList.add('btn-primary');
-                    startText.textContent = 'Start Download';
+                    setStartButtonVisual(false);
                 }
             });
     } else {
         if (!selectedTorrentName) {
-            alert("Please select a torrent from the queue list first by clicking on it.");
+            showToast('warning', 'No torrent selected', 'Click a torrent in the queue list to select it before starting.');
             return;
         }
 
@@ -509,20 +521,18 @@ function startSelectedDownload() {
     });
     
     if (checkedFiles.length === 0) {
-        alert("Please select at least one file to download.");
+        showToast('warning', 'Nothing selected', 'Select at least one file to download.');
         return;
     }
-    
+
     closeFilesModal();
-    
-    const startBtn = document.getElementById('start-btn');
-    const startText = document.getElementById('start-btn-text');
+
     const urlInput = "https://torbox.app/download";
-    
+
     fetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
             url: urlInput,
             torrent_name: selectedTorrentName,
             selected_files: checkedFiles
@@ -530,7 +540,7 @@ function startSelectedDownload() {
     })
     .then(res => {
         if (res.status === 400) {
-            alert("Downloader is already running!");
+            showToast('warning', 'Already running', 'The downloader is already running.');
             return;
         }
         return res.json();
@@ -538,14 +548,8 @@ function startSelectedDownload() {
     .then(data => {
         if (data && data.success) {
             isRunning = true;
-            if (startBtn) {
-                startBtn.classList.remove('btn-primary');
-                startBtn.classList.add('btn-secondary');
-            }
-            if (startText) {
-                startText.textContent = 'Stop Download';
-            }
-            showToast("success", "Queue Started", "Downloading only selected files and folders.");
+            setStartButtonVisual(true);
+            showToast("success", "Queue started", "Downloading the selected files and folders.");
         }
     })
     .catch(err => console.error("Error starting selected downloads:", err));
@@ -570,7 +574,7 @@ function openGenerateLinksModal() {
     document.getElementById('gen-links-selected-count').textContent = checkedFileCheckboxes.length;
     
     // Reset progress bar
-    document.getElementById('gen-links-progress-bar').style.width = '0%';
+    document.getElementById('gen-links-progress-bar').style.transform = 'scaleX(0)';
     document.getElementById('gen-links-progress-status').textContent = `Generating: 0 / ${checkedFileCheckboxes.length} completed...`;
     
     const modal = document.getElementById('generate-links-modal');
@@ -673,7 +677,7 @@ async function startGeneratingLinks() {
         
         completed++;
         const percent = Math.round((completed / totalFiles) * 100);
-        document.getElementById('gen-links-progress-bar').style.width = `${percent}%`;
+        document.getElementById('gen-links-progress-bar').style.transform = `scaleX(${(percent / 100).toFixed(4)})`;
         document.getElementById('gen-links-progress-status').textContent = `Generating: ${completed} / ${totalFiles} completed...`;
     }
     
@@ -776,11 +780,11 @@ function fetchStatus() {
             let displayEmail = state.email || "Account";
             const accountEl = document.getElementById('account-status');
             if (accountEl) {
-                const span = accountEl.querySelector('span');
-                if (span) {
-                    span.textContent = displayEmail;
-                    span.style.color = state.token_set ? '#04BF8A' : '';
-                }
+                const span = accountEl.querySelector('.account-meta span');
+                const hint = accountEl.querySelector('.account-hint');
+                if (span) span.textContent = displayEmail;
+                if (hint) hint.textContent = state.token_set ? 'Connected' : 'Not signed in';
+                accountEl.classList.toggle('connected', !!state.token_set);
             }
 
             // Sync free space metric
@@ -791,18 +795,10 @@ function fetchStatus() {
 
             // Sync running status state
             isRunning = (state.status === 'scanning' || state.status === 'downloading');
-            const startBtn = document.getElementById('start-btn');
-            const startText = document.getElementById('start-btn-text');
-            if (isRunning) {
-                startBtn.className = 'btn btn-secondary btn-large';
-                startText.textContent = 'Stop Download';
-            } else {
-                startBtn.className = 'btn btn-primary btn-large';
-                startText.textContent = state.status === 'finished' ? 'Start Download' : 'Start Download';
-            }
+            setStartButtonVisual(isRunning);
 
             // Update badge queue count
-            document.getElementById('queue-count').textContent = `${state.queue.length} TOTAL`;
+            document.getElementById('queue-count').textContent = `${state.queue.length} total`;
 
             // 2. Render Torrent Queue
             renderQueue(state.queue);
@@ -883,8 +879,8 @@ function renderDriveState(mount, preferred) {
     const busy = st === 'mounting' || st === 'unmounting';
 
     if (badge) {
-        badge.textContent = st.toUpperCase();
-        badge.style.background = mounted ? '#04BF8A' : (st === 'error' ? '#e53e3e' : '');
+        badge.textContent = st.charAt(0).toUpperCase() + st.slice(1);
+        badge.className = 'badge' + (mounted ? ' badge-success' : (st === 'error' ? ' badge-error' : (busy ? ' badge-live' : '')));
     }
     if (backendEl) backendEl.textContent = mounted ? (mount.backend === 'winfsp' ? 'WinFsp (native)' : 'WebDAV (net use)') : '-';
     if (letterEl) letterEl.textContent = mounted && mount.path ? mount.path : '-';
@@ -912,52 +908,112 @@ function renderDriveState(mount, preferred) {
     }
 }
 
-// Render Torrent Queue List in UI
+// Render Torrent Queue List in UI.
+// The backend is polled every 800ms, so the list updates in place when the
+// composition is unchanged — progress bars transition instead of resetting,
+// and entrance stagger only plays when the queue actually changes.
+const QUEUE_EMPTY_HTML = `
+    <div class="empty-state">
+        <div class="empty-icon-tile">
+            <svg viewBox="0 0 24 24" width="26" height="26" class="empty-icon"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        </div>
+        <p>Queue is empty</p>
+        <div class="empty-steps">
+            <div class="empty-step"><span class="empty-step-key">01</span><span>Paste your Torbox session token above and sign in.</span></div>
+            <div class="empty-step"><span class="empty-step-key">02</span><span>Click "Start download" to scan your Torbox downloads list.</span></div>
+            <div class="empty-step"><span class="empty-step-key">03</span><span>Select a torrent here, pick its files, and start.</span></div>
+        </div>
+    </div>`;
+
+function queueDotClass(status) {
+    if (status === 'completed') return 'emerald';
+    if (status === 'failed') return 'red';
+    if (status === 'queued') return 'yellow';
+    return 'blue';
+}
+
+function queueItemHtml(item, index) {
+    const isDownloading = item.status === 'downloading';
+    const progressClass = item.status === 'failed' ? 'failed' : (isDownloading ? 'downloading' : '');
+    const isSelected = item.name === selectedTorrentName;
+    const statusLabel = isDownloading ? `Downloading · ${item.speed || ''}` : item.status;
+    const onclickName = item.name.replace(/'/g, "\\'");
+
+    return `
+        <div class="queue-item ${isSelected ? 'selected' : ''}" data-name="${escapeAttr(item.name)}" onclick="selectTorrent('${onclickName}')" style="--i: ${index};">
+            <div class="queue-row">
+                <span class="torrent-name" title="${escapeAttr(item.name)}">${escapeHtml(item.name)}</span>
+                <span class="torrent-size">${escapeHtml(item.size)}</span>
+            </div>
+            <div class="queue-row">
+                <div class="torrent-status">
+                    <span class="dot ${queueDotClass(item.status)}${isDownloading ? ' pulse' : ''}"></span>
+                    <span class="status-text ${item.status}">${escapeHtml(statusLabel)}</span>
+                </div>
+                <span class="torrent-percent">${item.progress}%</span>
+            </div>
+            <div class="progress-container">
+                <div class="progress-bar ${progressClass}" style="transform: scaleX(${(item.progress / 100).toFixed(4)})"></div>
+            </div>
+        </div>
+    `;
+}
+
+function updateQueueItem(el, item) {
+    const isDownloading = item.status === 'downloading';
+    const progressClass = item.status === 'failed' ? 'failed' : (isDownloading ? 'downloading' : '');
+    const statusLabel = isDownloading ? `Downloading · ${item.speed || ''}` : item.status;
+
+    el.classList.toggle('selected', item.name === selectedTorrentName);
+
+    const sizeEl = el.querySelector('.torrent-size');
+    if (sizeEl) sizeEl.textContent = item.size;
+
+    const percentEl = el.querySelector('.torrent-percent');
+    if (percentEl) percentEl.textContent = `${item.progress}%`;
+
+    const dotEl = el.querySelector('.torrent-status .dot');
+    if (dotEl) dotEl.className = `dot ${queueDotClass(item.status)}${isDownloading ? ' pulse' : ''}`;
+
+    const statusEl = el.querySelector('.status-text');
+    if (statusEl) {
+        statusEl.className = `status-text ${item.status}`;
+        statusEl.textContent = statusLabel;
+    }
+
+    const barEl = el.querySelector('.progress-bar');
+    if (barEl) {
+        barEl.className = `progress-bar ${progressClass}`;
+        barEl.style.transform = `scaleX(${(item.progress / 100).toFixed(4)})`;
+    }
+}
+
 function renderQueue(queue) {
     const container = document.getElementById('queue-container');
     if (!container) return;
 
-    if (queue.length === 0) {
-        container.innerHTML = `
-            <div class="empty-state">
-                <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                <p>No torrents in queue.</p>
-                <span>Paste a session token, then click "Start Download" to scan your Torbox downloads list and begin downloading completed torrent folders.</span>
-            </div>
-        `;
+    if (!queue || queue.length === 0) {
+        if (!container.querySelector('.empty-state')) {
+            container.innerHTML = QUEUE_EMPTY_HTML;
+        }
         return;
     }
 
-    let html = '';
-    queue.forEach(item => {
-        const isDownloading = item.status === 'downloading';
-        const progressClass = item.status === 'failed' ? 'failed' : (isDownloading ? 'downloading' : '');
-        
-        const isSelected = item.name === selectedTorrentName;
-        const selectedClass = isSelected ? 'selected' : '';
-        const escapedName = item.name.replace(/'/g, "\\'");
+    const existing = new Map();
+    container.querySelectorAll('.queue-item').forEach(el => existing.set(el.dataset.name, el));
+    const sameSet = queue.length === existing.size && queue.every(item => existing.has(item.name));
 
-        html += `
-            <div class="queue-item ${selectedClass}" onclick="selectTorrent('${escapedName}')" style="cursor: pointer;">
-                <div class="queue-row">
-                    <span class="torrent-name" title="${item.name}">${item.name}</span>
-                    <span class="torrent-size">${item.size}</span>
-                </div>
-                <div class="queue-row">
-                    <div class="torrent-status">
-                        <span class="dot ${item.status === 'completed' ? 'emerald' : (item.status === 'failed' ? 'red' : 'blue')}"></span>
-                        <span class="status-text ${item.status}">${item.status === 'downloading' ? `Downloading - ${item.speed}` : item.status}</span>
-                    </div>
-                    <span class="torrent-percent font-mono">${item.progress}%</span>
-                </div>
-                <div class="progress-container">
-                    <div class="progress-bar ${progressClass}" style="width: ${item.progress}%"></div>
-                </div>
-            </div>
-        `;
-    });
-    
-    container.innerHTML = html;
+    if (sameSet) {
+        // Poll refresh: mutate rows in place so bars and dots animate smoothly
+        queue.forEach(item => updateQueueItem(existing.get(item.name), item));
+        return;
+    }
+
+    // Composition changed: rebuild with a short entrance stagger
+    container.innerHTML = queue.map((item, i) => queueItemHtml(item, i)).join('');
+    container.classList.add('stagger');
+    clearTimeout(container._staggerTimer);
+    container._staggerTimer = setTimeout(() => container.classList.remove('stagger'), 800);
 }
 
 // Select a torrent in the UI list
@@ -967,12 +1023,11 @@ function selectTorrent(name) {
     } else {
         selectedTorrentName = name;
     }
-    
+
     // Quick local visual update for active borders
     const items = document.querySelectorAll('.queue-item');
     items.forEach(el => {
-        const titleEl = el.querySelector('.torrent-name');
-        if (titleEl && titleEl.getAttribute('title') === selectedTorrentName) {
+        if (el.dataset.name === selectedTorrentName) {
             el.classList.add('selected');
         } else {
             el.classList.remove('selected');
@@ -980,126 +1035,103 @@ function selectTorrent(name) {
     });
 }
 
+// Wrap a raw log line's timestamp and level in styled spans
+function formatConsoleLine(line) {
+    const match = String(line).match(/^(\[[^\]]*\])\s*([A-Za-z]+):?\s*(.*)$/);
+    if (match) {
+        const level = match[2].toUpperCase();
+        const levelClass = level === 'ERROR' ? 'level-error'
+            : (level === 'WARN' || level === 'WARNING') ? 'level-warn'
+            : level === 'INFO' ? 'level-info'
+            : 'level-debug';
+        return `<div class="console-line"><span class="log-ts">${escapeHtml(match[1])}</span> <span class="log-level ${levelClass}">${escapeHtml(match[2])}:</span> ${escapeHtml(match[3])}</div>`;
+    }
+    return `<div class="console-line">${escapeHtml(line)}</div>`;
+}
+
+// Build one active-download row for the console tabs.
+// mode: 'downloading' | 'finished' | 'failed'
+function dlItemHtml(filename, fileState, mode) {
+    const progress = fileState.progress || 0;
+    const speed = fileState.speed || '0 KB/s';
+    const downloadedStr = formatBytes(fileState.downloaded);
+    const totalStr = formatBytes(fileState.total);
+
+    let headRight = '';
+    if (mode === 'failed') {
+        const onclickName = filename.replace(/'/g, "\\'");
+        headRight = `
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <button class="btn-mini" onclick="retryFailedFile('${onclickName}')">Retry</button>
+                <span class="dl-state failed">Failed</span>
+            </div>`;
+    } else if (mode === 'finished') {
+        headRight = '<span class="dl-state success">Completed</span>';
+    } else {
+        headRight = `<span class="dl-speed">${escapeHtml(speed)}</span>`;
+    }
+
+    const barClass = mode === 'failed' ? 'failed' : (mode === 'downloading' ? 'downloading' : '');
+
+    return `
+    <div class="dl-item">
+        <div class="dl-head">
+            <span class="dl-name" title="${escapeAttr(filename)}">${escapeHtml(filename)}</span>
+            ${headRight}
+        </div>
+        <div class="progress-container">
+            <div class="progress-bar ${barClass}" style="transform: scaleX(${(progress / 100).toFixed(4)})"></div>
+        </div>
+        <div class="dl-meta">
+            <span>${progress}%</span>
+            <span>${downloadedStr} / ${totalStr}</span>
+        </div>
+    </div>`;
+}
+
 // Render console log entries and active downloads dynamically
 function renderLogs(logs, activeDownloads) {
     const consoleEl = document.getElementById('console-logs');
     const rawEl = document.getElementById('full-raw-logs');
-    
+
     if (!consoleEl || !rawEl) return;
 
-    // Build system logs HTML
-    let systemHtml = '';
-    logs.forEach(line => {
-        let colorClass = 'text-muted';
-        if (line.includes('ERROR')) {
-            colorClass = 'accent-red';
-        } else if (line.includes('WARN')) {
-            colorClass = 'accent-yellow';
-        } else if (line.includes('INFO') || line.includes('Successfully') || line.includes('Finished')) {
-            colorClass = '';
-        }
-        systemHtml += `<div class="console-line ${colorClass}">${line}</div>`;
-    });
+    const entries = Object.entries(activeDownloads || {});
+    const activeCount = entries.filter(([, s]) => s.status === 'downloading').length;
+
+    // Live chip reflects real download activity
+    const chip = document.getElementById('console-live-chip');
+    const chipText = document.getElementById('console-live-text');
+    if (chip && chipText) {
+        chip.classList.toggle('live', activeCount > 0);
+        chipText.textContent = activeCount > 0 ? `${activeCount} active` : 'Idle';
+    }
+
+    const systemHtml = (logs || []).map(formatConsoleLine).join('');
 
     // Populate Console views based on selected console tab
     if (currentConsoleTab === 'downloading') {
-        let downloadingHtml = '';
-        const items = Object.entries(activeDownloads).filter(([_, state]) => state.status === 'downloading');
-        if (items.length > 0) {
-            items.forEach(([filename, fileState]) => {
-                const progress = fileState.progress || 0;
-                const speed = fileState.speed || '0 KB/s';
-                const downloadedStr = formatBytes(fileState.downloaded);
-                const totalStr = formatBytes(fileState.total);
-                
-                downloadingHtml += `
-                <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
-                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${filename}">${filename}</span>
-                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);">${speed}</span>
-                    </div>
-                    <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
-                        <div class="progress-bar-fill" style="background: var(--accent-emerald); width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono);">
-                        <span>${progress}%</span>
-                        <span>${downloadedStr} / ${totalStr}</span>
-                    </div>
-                </div>`;
-            });
-        } else {
-            downloadingHtml = '<div class="console-line text-muted">No files are currently downloading. Select a torrent and click Start Download.</div>';
-        }
-        consoleEl.innerHTML = downloadingHtml;
+        const items = entries.filter(([, state]) => state.status === 'downloading');
+        consoleEl.innerHTML = items.length > 0
+            ? items.map(([filename, fileState]) => dlItemHtml(filename, fileState, 'downloading')).join('')
+            : '<div class="console-line">No files downloading right now. Select a torrent and click Start download.</div>';
     } else if (currentConsoleTab === 'finished') {
-        let finishedHtml = '';
-        const items = Object.entries(activeDownloads).filter(([_, state]) => state.status === 'completed');
-        if (items.length > 0) {
-            items.forEach(([filename, fileState]) => {
-                const progress = fileState.progress || 0;
-                const downloadedStr = formatBytes(fileState.downloaded);
-                const totalStr = formatBytes(fileState.total);
-                
-                finishedHtml += `
-                <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
-                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${filename}">${filename}</span>
-                        <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);"><span style="color: #04BF8A; font-weight: bold;">Completed</span></span>
-                    </div>
-                    <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
-                        <div class="progress-bar-fill" style="background: #04BF8A; width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono);">
-                        <span>${progress}%</span>
-                        <span>${downloadedStr} / ${totalStr}</span>
-                    </div>
-                </div>`;
-            });
-        } else {
-            finishedHtml = '<div class="console-line text-muted">No finished downloads in this session.</div>';
-        }
-        consoleEl.innerHTML = finishedHtml;
+        const items = entries.filter(([, state]) => state.status === 'completed');
+        consoleEl.innerHTML = items.length > 0
+            ? items.map(([filename, fileState]) => dlItemHtml(filename, fileState, 'finished')).join('')
+            : '<div class="console-line">No finished downloads in this session.</div>';
     } else if (currentConsoleTab === 'failed') {
-        let failedHtml = '';
-        const items = Object.entries(activeDownloads).filter(([_, state]) => state.status === 'failed');
-        if (items.length > 0) {
-            items.forEach(([filename, fileState]) => {
-                const progress = fileState.progress || 0;
-                const downloadedStr = formatBytes(fileState.downloaded);
-                const totalStr = formatBytes(fileState.total);
-                
-                failedHtml += `
-                <div class="active-download-item" style="margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center;">
-                        <span class="file-name" style="color: #ffffff; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;" title="${filename}">${filename}</span>
-                        <div style="display: flex; align-items: center; gap: 8px;">
-                            <button onclick="retryFailedFile('${filename.replace(/'/g, "\\'")}')" style="background: var(--accent-emerald); color: #000000; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; border: none; cursor: pointer;">Retry</button>
-                            <span class="file-speed" style="font-size: 11px; font-family: var(--font-mono);"><span style="color: #ff5f56; font-weight: bold;">Failed</span></span>
-                        </div>
-                    </div>
-                    <div class="progress-bar-container" style="background: #1a1a1a; height: 6px; border-radius: 3px; overflow: hidden; width: 100%; border: 1px solid #2a2a2a;">
-                        <div class="progress-bar-fill" style="background: #ff5f56; width: ${progress}%; height: 100%; transition: width 0.2s ease;"></div>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono);">
-                        <span>${progress}%</span>
-                        <span>${downloadedStr} / ${totalStr}</span>
-                    </div>
-                </div>`;
-            });
-        } else {
-            failedHtml = '<div class="console-line text-muted">No failed downloads in this session.</div>';
-        }
-        consoleEl.innerHTML = failedHtml;
+        const items = entries.filter(([, state]) => state.status === 'failed');
+        consoleEl.innerHTML = items.length > 0
+            ? items.map(([filename, fileState]) => dlItemHtml(filename, fileState, 'failed')).join('')
+            : '<div class="console-line">No failed downloads in this session.</div>';
     } else {
-        consoleEl.innerHTML = systemHtml || '<div class="console-line text-muted">System idle. Handshake complete.</div>';
+        consoleEl.innerHTML = systemHtml || '<div class="console-line">System idle. Handshake complete.</div>';
     }
 
     // Populate raw full logs view tab
-    let rawHtml = '';
-    logs.forEach(line => {
-        rawHtml += `<div class="console-line">${line}</div>`;
-    });
-    rawEl.innerHTML = rawHtml || '<div class="console-line text-muted">No raw logs collected yet.</div>';
+    rawEl.innerHTML = (logs || []).map(formatConsoleLine).join('')
+        || '<div class="console-line">No raw logs collected yet.</div>';
 
     // Auto-scroll to bottom of logs if logs tab is open and logs have increased
     if (currentConsoleTab === 'logs' && logs.length > lastLogCount) {
@@ -1125,7 +1157,7 @@ function renderCompleted(queue) {
     const tbody = document.getElementById('completed-table-body');
     if (!tbody) return;
 
-    const completedItems = queue.filter(item => item.status === 'completed');
+    const completedItems = (queue || []).filter(item => item.status === 'completed');
     if (completedItems.length === 0) {
         tbody.innerHTML = `
             <tr>
@@ -1135,35 +1167,22 @@ function renderCompleted(queue) {
         return;
     }
 
-    let html = '';
-    completedItems.forEach(item => {
-        html += `
-            <tr>
-                <td class="font-semibold">${item.name}</td>
-                <td class="text-muted font-mono">${item.path || 'Root'}</td>
-                <td>${item.size}</td>
-                <td class="text-emerald font-semibold">SUCCESS</td>
-            </tr>
-        `;
-    });
-    tbody.innerHTML = html;
+    tbody.innerHTML = completedItems.map(item => `
+        <tr>
+            <td class="font-semibold">${escapeHtml(item.name)}</td>
+            <td class="text-muted cell-mono">${escapeHtml(item.path || 'Root')}</td>
+            <td class="cell-mono">${escapeHtml(item.size)}</td>
+            <td><span class="badge badge-success">Success</span></td>
+        </tr>
+    `).join('');
 }
 
 // Retry a single failed download file
 function retryFailedFile(filename) {
-    const startBtn = document.getElementById('start-btn');
-    const startText = document.getElementById('start-btn-text');
-    
     // Set running UI state immediately
-    if (startBtn) {
-        startBtn.classList.remove('btn-primary');
-        startBtn.classList.add('btn-secondary');
-    }
-    if (startText) {
-        startText.textContent = 'Stop Download';
-    }
+    setStartButtonVisual(true);
     isRunning = true;
-    
+
     fetch('/api/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1172,11 +1191,11 @@ function retryFailedFile(filename) {
     .then(res => res.json())
     .then(data => {
         if (data && data.success) {
-            showToast("success", "Retrying Download", `Retrying: ${filename}`);
+            showToast("success", "Retrying download", filename);
             // Auto switch to Downloading tab
             switchConsoleTab('downloading');
         } else {
-            alert(data ? data.error : "Failed to retry file download.");
+            showToast('error', 'Retry failed', (data && data.error) || 'Could not retry this file.');
             isRunning = false;
             fetchStatus();
         }

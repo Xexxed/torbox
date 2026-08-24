@@ -49,8 +49,11 @@ ehthumbs.db
 *.log
 *.tmp
 *.bak
+scratch/
+.scratch/
 
 # Debug HTML dumps (may contain personal content names)
 torbox_debug*.html
 debug_*.html
 *.html.dump
+

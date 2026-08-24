@@ -3,8 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Torbox Downloader - Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0a0e13">
+    <title>Torbox Downloader — Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2304bf8a'/%3E%3Cpath d='M16 7v11m0 0l-4.5-4.5M16 18l4.5-4.5M9.5 23.5h13' stroke='%2304120c' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,8 +18,8 @@
         <aside class="sidebar">
             <div class="sidebar-header">
                 <div class="logo-icon">
-                    <svg viewBox="0 0 24 24" width="24" height="24">
-                        <path fill="#04BF8A" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
                     </svg>
                 </div>
                 <div class="logo-text">
@@ -22,101 +27,111 @@
                     <span>v1.0.4</span>
                 </div>
             </div>
-            
+
             <nav class="sidebar-menu">
                 <a href="#" class="menu-item active" onclick="switchTab('dashboard')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+                    <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
                     <span>Dashboard</span>
                 </a>
                 <a href="#" class="menu-item" onclick="switchTab('completed')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                    <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
                     <span>Completed</span>
                 </a>
                 <a href="#" class="menu-item" onclick="switchTab('logs')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M13 3H6c-1.1 0-2 .9-2 2v14c0 1.1.89 2 1.99 2H19c1.1 0 2-.9 2-2V8l-6-6zm4 16H7v-2h10v2zm0-4H7v-2h10v2zm-3-4H7V9h7v2zm-1.5-6v4.5h4.5L12.5 5z"/></svg>
-                    <span>System Logs</span>
+                    <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M13 3H6c-1.1 0-2 .9-2 2v14c0 1.1.89 2 1.99 2H19c1.1 0 2-.9 2-2V8l-6-6zm4 16H7v-2h10v2zm0-4H7v-2h10v2zm-3-4H7V9h7v2zm-1.5-6v4.5h4.5L12.5 5z"/></svg>
+                    <span>System logs</span>
                 </a>
             </nav>
 
             <div class="sidebar-footer">
                 <div class="menu-item" id="account-status">
-                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
-                    <span>Account</span>
+                    <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
+                    <div class="account-meta">
+                        <span>Account</span>
+                        <div class="account-hint">Not signed in</div>
+                    </div>
+                    <div class="account-dot" aria-hidden="true"></div>
                 </div>
                 <a href="#" class="menu-item logout" onclick="triggerLogout()">
-                    <svg viewBox="0 0 24 24" width="20" height="20" class="menu-icon"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
-                    <span>Logout</span>
+                    <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+                    <span>Log out</span>
                 </a>
             </div>
         </aside>
 
         <!-- Main Body -->
         <main class="main-content">
-            <!-- Header section -->
+            <!-- Header -->
             <header class="app-header">
                 <div class="header-left">
                     <h1 id="page-title">Torbox Downloader</h1>
                 </div>
-                
+
                 <div class="header-center">
                     <div class="cookie-input-box">
-                        <label for="session-token-input">Cookie / Session Token</label>
+                        <label for="session-token-input">Session</label>
                         <div class="input-wrapper">
-                            <input type="password" id="session-token-input" placeholder="Enter Torbox session token..." />
-                            <button id="login-btn" onclick="saveSettings()">Login</button>
+                            <input type="password" id="session-token-input" placeholder="Paste your Torbox session token…" autocomplete="off" spellcheck="false" />
+                            <button id="login-btn" class="btn btn-primary btn-sm" onclick="saveSettings()">Sign in</button>
                         </div>
                     </div>
                 </div>
 
                 <div class="header-right">
-                    <div class="icon-btn" title="Help"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="#9CA3AF" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg></div>
-                    <div class="icon-btn" title="Settings"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="#9CA3AF" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0-.44-.17-.47-.41l-.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></div>
+                    <button class="icon-btn" title="Help" aria-label="Help"><svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg></button>
+                    <button class="icon-btn" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .43-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></button>
                 </div>
             </header>
 
-            <!-- Page Views (Tab Content) -->
+            <!-- Dashboard View -->
             <div class="tab-content" id="dashboard-view">
                 <div class="dashboard-grid">
-                    <!-- Left Column: Queue Management -->
+                    <!-- Left Column: Queue -->
                     <div class="card torrent-queue-card">
                         <div class="card-header">
-                            <h3>Torrent Queue</h3>
-                            <span class="badge" id="queue-count">0 TOTAL</span>
+                            <h3>Torrent queue</h3>
+                            <span class="badge" id="queue-count">0 total</span>
                         </div>
-                        
+
                         <div class="queue-list" id="queue-container">
                             <div class="empty-state">
-                                <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                                <p>No torrents in queue.</p>
-                                <span>Paste a session token, then click "Start Download" to scan your Torbox downloads list and begin downloading completed torrent folders.</span>
+                                <div class="empty-icon-tile">
+                                    <svg viewBox="0 0 24 24" width="26" height="26" class="empty-icon" aria-hidden="true"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                                </div>
+                                <p>Queue is empty</p>
+                                <div class="empty-steps">
+                                    <div class="empty-step"><span class="empty-step-key">01</span><span>Paste your Torbox session token above and sign in.</span></div>
+                                    <div class="empty-step"><span class="empty-step-key">02</span><span>Click “Start Download” to scan your Torbox downloads list.</span></div>
+                                    <div class="empty-step"><span class="empty-step-key">03</span><span>Select a torrent here, pick its files, and start.</span></div>
+                                </div>
                             </div>
                         </div>
 
                         <div class="card-footer">
                             <button class="btn btn-primary btn-large" id="start-btn" onclick="toggleDownloadProcess()">
-                                <svg viewBox="0 0 24 24" width="18" height="18" class="btn-icon"><path d="M8 5v14l11-7z"/></svg>
-                                <span id="start-btn-text">Start Download</span>
+                                <svg viewBox="0 0 24 24" width="17" height="17" class="btn-icon" id="start-btn-icon" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                                <span id="start-btn-text">Start download</span>
                             </button>
                         </div>
                     </div>
 
-                    <!-- Right Column: System Status, Path & Real-time Console -->
+                    <!-- Right Column -->
                     <div class="right-column">
                         <!-- Virtual Drive Card -->
                         <div class="card path-card" id="drive-card">
                             <div class="card-header">
-                                <h3><svg viewBox="0 0 24 24" width="18" height="18" class="header-icon"><path d="M2 20h20v-4H2v4zm2-3h2v2H4v-2zM2 4v4h20V4H2zm2 3H4V5h2v2zm-2 7h20v-4H2v4zm2-3h2v2H4v-2z"/></svg> Virtual Drive</h3>
-                                <span class="badge" id="drive-status-badge">IDLE</span>
+                                <h3><svg viewBox="0 0 24 24" width="15" height="15" class="header-icon" aria-hidden="true"><path d="M2 20h20v-4H2v4zm2-3h2v2H4v-2zM2 4v4h20V4H2zm2 3H4V5h2v2zm-2 7h20v-4H2v4zm2-3h2v2H4v-2z"/></svg> Virtual drive</h3>
+                                <span class="badge" id="drive-status-badge">Idle</span>
                             </div>
                             <div class="card-body">
                                 <div class="path-stats">
-                                    <span class="stat-item"><span class="dot blue"></span> Backend: <strong id="drive-backend-val">-</strong></span>
-                                    <span class="stat-item"><span class="dot emerald"></span> Mounted At: <strong id="drive-letter-val">-</strong></span>
+                                    <span class="stat-item"><span class="dot blue"></span> Backend: <strong id="drive-backend-val">—</strong></span>
+                                    <span class="stat-item"><span class="dot emerald"></span> Mounted at: <strong id="drive-letter-val">—</strong></span>
                                 </div>
-                                <div style="display: flex; gap: 12px; margin-top: 14px;">
-                                    <div style="flex: 1;">
-                                        <label for="drive-letter-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Drive Letter</label>
-                                        <select id="drive-letter-input" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;">
+                                <div class="field-grid">
+                                    <div>
+                                        <label class="field-label" for="drive-letter-input">Drive letter</label>
+                                        <select id="drive-letter-input" class="field" onchange="saveSettings()">
                                             <option value="">Auto</option>
                                             <option value="Z">Z:</option>
                                             <option value="Y">Y:</option>
@@ -141,88 +156,90 @@
                                             <option value="F">F:</option>
                                         </select>
                                     </div>
-                                    <div style="flex: 1; display: flex; align-items: flex-end;">
-                                        <button class="btn btn-primary" id="mount-btn" onclick="mountDrive()" style="width: 100%;">Mount Drive</button>
+                                    <div style="display: flex; align-items: flex-end;">
+                                        <button class="btn btn-primary" id="mount-btn" onclick="mountDrive()" style="width: 100%;">Mount drive</button>
                                     </div>
                                 </div>
                                 <div style="display: flex; gap: 10px; margin-top: 12px;">
-                                    <button class="btn btn-secondary" id="open-drive-btn" onclick="openDrive()" style="flex: 1; display: none;">Open Drive</button>
+                                    <button class="btn btn-secondary" id="open-drive-btn" onclick="openDrive()" style="flex: 1; display: none;">Open drive</button>
                                     <button class="btn btn-secondary" id="unmount-btn" onclick="unmountDrive()" style="flex: 1; display: none;">Unmount</button>
                                 </div>
-                                <div style="margin-top: 10px; font-size: 11px; color: var(--text-muted); line-height: 1.5;" id="drive-hint-text">
+                                <p class="hint-text" style="margin-top: 12px;" id="drive-hint-text">
                                     Stream your cached torrents as a local drive. Opening a file plays it straight from the cloud; copy-paste downloads to wherever you paste. Nothing is stored on disk.
-                                </div>
+                                </p>
                             </div>
                         </div>
 
-                        <!-- Path Card -->
+                        <!-- Destination Card -->
                         <div class="card path-card">
                             <div class="card-header">
-                                <h3><svg viewBox="0 0 24 24" width="18" height="18" class="header-icon"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg> Destination Management</h3>
+                                <h3><svg viewBox="0 0 24 24" width="15" height="15" class="header-icon" aria-hidden="true"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg> Destination &amp; transfer</h3>
                             </div>
                             <div class="card-body">
-                                <label for="download-path-input">Local PC Download Path</label>
+                                <label class="field-label" for="download-path-input">Local download path</label>
                                 <div class="path-input-wrapper">
-                                    <input type="text" id="download-path-input" value="downloads" placeholder="E.g., D:\Downloads\torbox" />
-                                    <button class="btn btn-secondary" onclick="saveSettings()">Change Location</button>
+                                    <input type="text" id="download-path-input" class="field" value="downloads" placeholder="E.g., D:\Downloads\torbox" spellcheck="false" />
+                                    <button class="btn btn-secondary" onclick="saveSettings()">Save</button>
                                 </div>
-                                <div style="display: flex; gap: 16px; margin-top: 14px; margin-bottom: 14px;">
-                                    <div style="flex: 1;">
-                                        <label for="parallel-downloads-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Parallel Files</label>
-                                        <select id="parallel-downloads-input" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;">
-                                            <option value="1">1 (Sequential)</option>
-                                            <option value="2">2 Files</option>
-                                            <option value="3">3 Files</option>
-                                            <option value="4">4 Files</option>
-                                            <option value="5">5 Files</option>
+                                <div class="field-grid">
+                                    <div>
+                                        <label class="field-label" for="parallel-downloads-input">Parallel files</label>
+                                        <select id="parallel-downloads-input" class="field" onchange="saveSettings()">
+                                            <option value="1">1 (sequential)</option>
+                                            <option value="2">2 files</option>
+                                            <option value="3">3 files</option>
+                                            <option value="4">4 files</option>
+                                            <option value="5">5 files</option>
                                         </select>
                                     </div>
-                                    <div style="flex: 1;">
-                                        <label for="delay-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Delay Between Files (s)</label>
-                                    <input type="number" id="delay-input" min="0" max="60" value="5" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;" />
+                                    <div>
+                                        <label class="field-label" for="delay-input">Delay between files (s)</label>
+                                        <input type="number" id="delay-input" class="field" min="0" max="60" value="5" onchange="saveSettings()" />
+                                    </div>
                                 </div>
-                            </div>
-                            <div style="margin-top: 12px;">
-                                <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #e5e7eb; cursor: pointer;">
-                                    <input type="checkbox" id="parallel-connections-input" checked onchange="saveSettings()" />
-                                    <span>Use parallel connections (multi-part download, up to 4)</span>
-                                </label>
-                            </div>
-                            <div style="display: flex; gap: 16px; margin-top: 14px;">
-                                <div style="flex: 1;">
-                                    <label for="disk-profile-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Storage Type</label>
-                                    <select id="disk-profile-input" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;">
-                                        <option value="auto">Auto-detect</option>
-                                        <option value="hdd">HDD (low disk usage)</option>
-                                        <option value="ssd">SSD / NVMe (max speed)</option>
-                                    </select>
+                                <div style="margin-top: 14px;">
+                                    <label class="switch-row">
+                                        <input type="checkbox" id="parallel-connections-input" class="switch-input" checked onchange="saveSettings()" />
+                                        <span class="switch-track" aria-hidden="true"></span>
+                                        <span class="switch-label">Parallel connections <em>· multi-part, up to 4</em></span>
+                                    </label>
                                 </div>
-                                <div style="flex: 1;">
-                                    <label for="write-buffer-input" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;">Write Buffer (MB, 0 = auto)</label>
-                                    <input type="number" id="write-buffer-input" min="0" max="256" step="4" value="0" onchange="saveSettings()" style="width: 100%; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 8px 12px; font-size: 13px; outline: none; box-sizing: border-box;" />
+                                <div class="field-grid">
+                                    <div>
+                                        <label class="field-label" for="disk-profile-input">Storage type</label>
+                                        <select id="disk-profile-input" class="field" onchange="saveSettings()">
+                                            <option value="auto">Auto-detect</option>
+                                            <option value="hdd">HDD (low disk usage)</option>
+                                            <option value="ssd">SSD / NVMe (max speed)</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="field-label" for="write-buffer-input">Write buffer (MB, 0 = auto)</label>
+                                        <input type="number" id="write-buffer-input" class="field" min="0" max="256" step="4" value="0" onchange="saveSettings()" />
+                                    </div>
                                 </div>
-                            </div>
-                            <div style="margin-top: 8px; font-size: 11px; color: var(--text-muted); line-height: 1.5;">
-                                On a hard drive, several download streams writing at once force the head to seek constantly, pinning disk usage at 100% while throughput stays low. The HDD profile writes one file at a time through a large buffer.
-                            </div>
-                            <div style="margin-top: 12px; display: flex; align-items: center; gap: 16px;">
-                                <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #e5e7eb; cursor: pointer;">
-                                    <input type="checkbox" id="watch-mode-input" onchange="saveSettings()" />
-                                    <span>Enable Watch Mode (auto-scan/download)</span>
-                                </label>
-                                <div style="display: flex; align-items: center; gap: 8px;">
-                                    <label for="watch-interval-input" style="font-size: 12px; color: var(--text-muted);">Interval (s):</label>
-                                    <input type="number" id="watch-interval-input" min="10" max="3600" value="60" onchange="saveSettings()" style="width: 70px; background: #1a1a1a; border: 1px solid var(--border-color); border-radius: 6px; color: #ffffff; padding: 4px 8px; font-size: 12px; outline: none; box-sizing: border-box;" />
+                                <p class="hint-text" style="margin-top: 12px;">
+                                    On a hard drive, several download streams writing at once force the head to seek constantly, pinning disk usage at 100% while throughput stays low. The HDD profile writes one file at a time through a large buffer.
+                                </p>
+                                <div style="margin-top: 14px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
+                                    <label class="switch-row">
+                                        <input type="checkbox" id="watch-mode-input" class="switch-input" onchange="saveSettings()" />
+                                        <span class="switch-track" aria-hidden="true"></span>
+                                        <span class="switch-label">Watch mode <em>· auto-scan &amp; download</em></span>
+                                    </label>
+                                    <div style="display: flex; align-items: center; gap: 8px;">
+                                        <label class="field-label" for="watch-interval-input" style="margin-bottom: 0;">Interval (s)</label>
+                                        <input type="number" id="watch-interval-input" class="field" min="10" max="3600" value="60" onchange="saveSettings()" style="width: 76px;" />
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="path-stats">
-                                    <span class="stat-item"><span class="dot emerald"></span> Free Space: <strong id="free-space-val">Scanning...</strong></span>
-                                    <span class="stat-item"><span class="dot blue"></span> Mount Point: Local PC</span>
+                                <div class="path-stats" style="margin-top: 14px;">
+                                    <span class="stat-item"><span class="dot emerald"></span> Free space: <strong id="free-space-val">Scanning…</strong></span>
+                                    <span class="stat-item"><span class="dot blue"></span> Mount point: local PC</span>
                                 </div>
                             </div>
                         </div>
 
-                        <!-- Console Logs Card -->
+                        <!-- Console Card -->
                         <div class="card console-card">
                             <div class="card-header flex-header">
                                 <div class="tabs-sub">
@@ -231,19 +248,16 @@
                                     <span class="sub-tab" id="sub-tab-failed" onclick="switchConsoleTab('failed')">Failed</span>
                                     <span class="sub-tab" id="sub-tab-logs" onclick="switchConsoleTab('logs')">Logs</span>
                                 </div>
-                                <div class="window-controls">
-                                    <span class="w-dot red"></span>
-                                    <span class="w-dot yellow"></span>
-                                    <span class="w-dot green"></span>
-                                </div>
+                                <span class="live-chip" id="console-live-chip">
+                                    <span class="live-dot" aria-hidden="true"></span>
+                                    <span id="console-live-text">Idle</span>
+                                </span>
                             </div>
                             <div class="console-body" id="console-logs">
-                                <div class="console-line text-muted">[2026-07-04 12:00:00] INFO: Torbox Downloader dashboard initialized.</div>
+                                <div class="console-line">[—:—:—] <span class="log-level level-info">INFO:</span> <span class="log-msg">Dashboard ready. Waiting for backend status…</span></div>
                             </div>
                             <div class="console-footer">
-                                <div class="console-actions">
-                                    <button onclick="clearConsoleLogs()" class="clear-btn">Clear Console</button>
-                                </div>
+                                <button onclick="clearConsoleLogs()" class="clear-btn">Clear console</button>
                             </div>
                         </div>
                     </div>
@@ -254,14 +268,14 @@
             <div class="tab-content hidden" id="completed-view">
                 <div class="card full-width-card">
                     <div class="card-header">
-                        <h3>Completed Downloads</h3>
+                        <h3>Completed downloads</h3>
                     </div>
                     <div class="card-body">
                         <table class="data-table">
                             <thead>
                                 <tr>
-                                    <th>Filename</th>
-                                    <th>Folder / Path</th>
+                                    <th>File</th>
+                                    <th>Folder / path</th>
                                     <th>Size</th>
                                     <th>Status</th>
                                 </tr>
@@ -280,11 +294,11 @@
             <div class="tab-content hidden" id="logs-view">
                 <div class="card full-width-card logs-full-card">
                     <div class="card-header flex-header">
-                        <h3>Full Raw System Logs</h3>
-                        <button onclick="clearConsoleLogs()" class="btn btn-secondary btn-sm">Clear All Logs</button>
+                        <h3>Full raw system logs</h3>
+                        <button onclick="clearConsoleLogs()" class="btn btn-secondary btn-sm">Clear all logs</button>
                     </div>
                     <div class="console-body full-height" id="full-raw-logs">
-                        <div class="console-line text-muted">No raw logs collected yet.</div>
+                        <div class="console-line">No raw logs collected yet.</div>
                     </div>
                 </div>
             </div>
@@ -295,28 +309,30 @@
     <div id="files-modal" class="modal-overlay" style="display: none;">
         <div class="modal-content">
             <div class="modal-header">
-                <h3>Select Files to Download</h3>
-                <span class="close-modal" onclick="closeFilesModal()">&times;</span>
+                <h3>Select files to download</h3>
+                <button class="close-modal" onclick="closeFilesModal()" aria-label="Close">&times;</button>
             </div>
             <div class="modal-body">
                 <div id="modal-loading-state" class="modal-loading-overlay">
                     <div class="spinner"></div>
-                    <p>Scraping torrent files structure...</p>
+                    <p>Scraping torrent file structure…</p>
                 </div>
                 <div id="modal-error-state" class="modal-error-container" style="display: none;">
-                    <div class="error-icon">⚠️</div>
+                    <div class="error-icon">
+                        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>
+                    </div>
                     <p id="modal-error-msg">Failed to load files structure.</p>
                     <button class="btn btn-secondary btn-sm" onclick="retryFetchStructure()">Retry</button>
                 </div>
                 <div id="modal-tree-content" style="display: none;">
                     <div class="torrent-modal-details">
-                        <p>Torrent Name: <strong id="modal-torrent-name"></strong></p>
+                        <p>Torrent: <strong id="modal-torrent-name"></strong></p>
                     </div>
                     <div class="modal-actions-bar">
                         <label class="select-all-label">
                             <input type="checkbox" id="modal-select-all" checked onchange="toggleSelectAllFiles(this)" />
-                            <span>Select All Files</span>
-                            <span id="modal-selected-count" style="margin-left: 8px; font-weight: normal; color: #a0aec0;"></span>
+                            <span>Select all files</span>
+                            <span id="modal-selected-count" class="selected-count"></span>
                         </label>
                     </div>
                     <div class="files-tree-container" id="modal-files-tree">
@@ -326,11 +342,11 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeFilesModal()">Cancel</button>
-                <button class="btn btn-secondary" id="modal-generate-links-btn" onclick="openGenerateLinksModal()" style="display: none; align-items: center; gap: 8px;">
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display: block;"><path d="M16 5v2h-2V5h2m4-2H12c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H12V5h8v14zM4 7H2v14c0 1.1.9 2 2 2h14v-2H4V7z"/></svg>
-                    <span>Generate DL Links</span>
+                <button class="btn btn-secondary" id="modal-generate-links-btn" onclick="openGenerateLinksModal()" style="display: none;">
+                    <svg viewBox="0 0 24 24" width="15" height="15" class="btn-icon" aria-hidden="true"><path d="M16 5v2h-2V5h2m4-2H12c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H12V5h8v14zM4 7H2v14c0 1.1.9 2 2 2h14v-2H4V7z"/></svg>
+                    <span>Generate links</span>
                 </button>
-                <button class="btn btn-primary" id="modal-download-btn" onclick="startSelectedDownload()" style="display: none;">Download Selected</button>
+                <button class="btn btn-primary" id="modal-download-btn" onclick="startSelectedDownload()" style="display: none;">Download selected</button>
             </div>
         </div>
     </div>
@@ -339,45 +355,45 @@
     <div id="generate-links-modal" class="modal-overlay" style="display: none;">
         <div class="modal-content">
             <div class="modal-header">
-                <h3>Generate Download Links</h3>
-                <span class="close-modal" onclick="closeGenerateLinksModal()">&times;</span>
+                <h3>Generate download links</h3>
+                <button class="close-modal" onclick="closeGenerateLinksModal()" aria-label="Close">&times;</button>
             </div>
             <div class="modal-body">
                 <div id="gen-links-setup">
-                    <p style="margin-bottom: 16px; color: var(--text-secondary);">
-                        Generate direct download links for the <strong id="gen-links-selected-count" style="color: var(--text-primary);">0</strong> selected files.
+                    <p class="hint-text" style="margin-bottom: 16px;">
+                        Direct download links for the <strong id="gen-links-selected-count" style="color: var(--text-primary);">0</strong> selected files.
                     </p>
-                    <div style="margin-bottom: 20px;">
-                        <label style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); margin-bottom: 8px;">Link Format Option</label>
+                    <div style="margin-bottom: 18px;">
+                        <label class="field-label" style="margin-bottom: 8px;">Link format</label>
                         <div class="link-format-options">
                             <label class="link-format-option">
                                 <input type="radio" name="link-format" value="just-link" checked />
-                                <span>1. Just link (e.g., https://...)</span>
+                                <span>Link only <em style="color: var(--text-muted); font-style: normal; font-family: var(--font-mono); font-size: 11.5px;">https://…</em></span>
                             </label>
                             <label class="link-format-option">
                                 <input type="radio" name="link-format" value="link-title" />
-                                <span>2. link:title (e.g., https://...:filename.ext)</span>
+                                <span>link:title <em style="color: var(--text-muted); font-style: normal; font-family: var(--font-mono); font-size: 11.5px;">https://…:filename.ext</em></span>
                             </label>
                         </div>
                     </div>
-                    <button class="btn btn-primary btn-large" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;" id="gen-links-start-btn" onclick="startGeneratingLinks()">
-                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
-                        <span>Generate Links</span>
+                    <button class="btn btn-primary btn-large" style="width: 100%;" id="gen-links-start-btn" onclick="startGeneratingLinks()">
+                        <svg viewBox="0 0 24 24" width="16" height="16" class="btn-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                        <span>Generate links</span>
                     </button>
                 </div>
-                
+
                 <div id="gen-links-progress-container" style="display: none; margin-top: 10px; flex-grow: 1; flex-direction: column; justify-content: center;">
                     <div class="progress-bar-wrapper">
                         <div id="gen-links-progress-bar"></div>
                     </div>
-                    <p id="gen-links-progress-status" style="font-size: 13px; text-align: center; color: var(--text-secondary);">Generating: 0 / 0 completed...</p>
+                    <p id="gen-links-progress-status" class="hint-text" style="text-align: center;">Generating: 0 / 0 completed…</p>
                 </div>
 
-                <div id="gen-links-result-container" style="display: none; margin-top: 10px; flex-grow: 1; display: flex; flex-direction: column;">
-                    <label for="gen-links-textarea" style="display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); margin-bottom: 8px;">Generated Links</label>
+                <div id="gen-links-result-container" style="display: none; margin-top: 10px; flex-grow: 1; flex-direction: column;">
+                    <label class="field-label" for="gen-links-textarea" style="margin-bottom: 8px;">Generated links</label>
                     <textarea id="gen-links-textarea" readonly></textarea>
                     <div style="margin-top: 12px; display: flex; gap: 10px;">
-                        <button class="btn btn-primary" style="flex: 1;" onclick="copyGeneratedLinks()">Copy to Clipboard</button>
+                        <button class="btn btn-primary" style="flex: 1;" onclick="copyGeneratedLinks()">Copy to clipboard</button>
                     </div>
                 </div>
             </div>
@@ -387,7 +403,7 @@
         </div>
     </div>
 
-    <div id="toast-container"></div>
+    <div id="toast-container" role="status" aria-live="polite"></div>
     <script src="app.js"></script>
 </body>
 </html>
