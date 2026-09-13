@@ -16,6 +16,7 @@ import threading
 import time
 
 from torbox_downloader.browser_lock import (
+    BrowserBusyError,
     DEFAULT_BROWSER_OP_TIMEOUT_S,
     browser_op,
 )
@@ -211,7 +212,14 @@ class TorboxVfs:
     def _expand(self, torrent_dir):
         """Scrape and build the subtree for one torrent. Caller holds lock."""
         try:
-            files = self._session.fetch_structure(torrent_dir.original_name) or []
+            # Scraping navigates the shared browser, so it takes the same lock
+            # as link generation. BrowserBusyError is not a VfsError: callers
+            # distinguish "try again" from "this torrent is broken".
+            with browser_op(self._browser_lock, self._browser_op_timeout,
+                            "expand a torrent"):
+                files = self._session.fetch_structure(torrent_dir.original_name) or []
+        except BrowserBusyError:
+            raise
         except Exception as e:
             raise VfsError(f"Could not expand torrent '{torrent_dir.original_name}': {e}") from e
 
@@ -308,6 +316,54 @@ class TorboxVfs:
                 (name, child.is_dir, 0 if child.is_dir else getattr(child, "size_bytes", 0))
                 for name, child in node.children.items()
             ]
+
+    def listdir_entries(self, path):
+        """Structured listing for the Stream page: one dict per child.
+
+        Each entry carries only already-scraped metadata -- never a URL,
+        selector or CDN field -- so rendering a folder can never resolve a
+        link (see the plan's invariant 2).
+        """
+        path = str(path)
+        with self._lock:
+            if path in ("", "/"):
+                return [
+                    {
+                        "name": name,
+                        "is_dir": True,
+                        "size": 0,
+                        "size_str": getattr(child, "total_size_str", "Unknown"),
+                        "kind": "folder",
+                        "playable": False,
+                    }
+                    for name, child in self._torrents.items()
+                ]
+
+            node = self._resolve(path)
+            if not node.is_dir:
+                raise VfsNotADirectory(f"Not a directory: {path}")
+
+            entries = []
+            for name, child in node.children.items():
+                if child.is_dir:
+                    entries.append({
+                        "name": name,
+                        "is_dir": True,
+                        "size": 0,
+                        "size_str": "Unknown",
+                        "kind": "folder",
+                        "playable": False,
+                    })
+                else:
+                    entries.append({
+                        "name": name,
+                        "is_dir": False,
+                        "size": getattr(child, "size_bytes", 0),
+                        "size_str": getattr(child, "size_str", "Unknown"),
+                        "kind": classify_kind(getattr(child, "name", name)),
+                        "playable": is_browser_playable(getattr(child, "name", name)),
+                    })
+            return entries
 
     # --- link resolution ------------------------------------------------------
 

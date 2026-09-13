@@ -24,6 +24,22 @@ def _fmt_speed(bps: float) -> str:
     return "0 KB/s"
 
 
+def _clean_vfs_path(raw):
+    """Validate and normalize a client-supplied virtual-filesystem path.
+
+    Returns a '/'-rooted path. Raises ValueError for anything that is not a
+    plain absolute path (empty, NUL bytes, or traversal segments).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("A non-empty 'path' is required.")
+    if "\x00" in raw:
+        raise ValueError("Invalid path.")
+    segments = [s for s in raw.strip().replace("\\", "/").split("/") if s]
+    if any(s in (".", "..") for s in segments):
+        raise ValueError("Path traversal is not allowed.")
+    return "/" + "/".join(segments)
+
+
 # In-memory cache for static GUI files. Files never change at runtime so we
 # read each one once and serve from RAM on every subsequent request.
 _static_cache: dict = {}
@@ -582,6 +598,21 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _send_json(self, payload, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+    def _stream_error(self, exc):
+        """Map a Stream exception to a JSON error body. A stale token logs the
+        session out once instead of surfacing an error per card."""
+        message = str(exc)
+        if "session token has expired or is invalid" in message:
+            app_state.handle_token_expired()
+            message = "Your Torbox session token has expired or is invalid."
+        return {"success": False, "error": message}
+
     def verify_api_key(self):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
@@ -608,6 +639,16 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(app_state.get_serializable_state()).encode("utf-8"))
+            return
+
+        if self.path.startswith("/api/stream/library"):
+            # Root torrent listing for the Stream tab. Metadata only: no links.
+            try:
+                entries = app_state.get_vfs().listdir_entries("/")
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "path": "/", "entries": entries})
             return
 
         # Serve static UI files from /gui subfolder
@@ -750,6 +791,31 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path.startswith("/api/stream/list"):
+            # Folder listing for the Stream tab. Expanding a torrent here does
+            # navigate the browser, but it never resolves a file's link.
+            try:
+                path = _clean_vfs_path(params.get("path", "/"))
+            except ValueError as e:
+                self._send_json({"success": False, "error": str(e)}, status=400)
+                return
+            try:
+                entries = app_state.get_vfs().listdir_entries(path)
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "path": path, "entries": entries})
+            return
+
+        elif self.path.startswith("/api/stream/refresh"):
+            try:
+                torrents = app_state.get_vfs().refresh() or []
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "torrents": len(torrents)})
             return
 
         elif self.path.startswith("/api/fetch_structure"):
