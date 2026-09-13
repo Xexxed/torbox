@@ -11,6 +11,8 @@ import mimetypes
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from torbox_downloader import remux
+
 logger = logging.getLogger(__name__)
 
 # Size of each block written to the client by the Stream content proxy.
@@ -696,6 +698,26 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self._send_text(400, "Requested path is a directory, not a file.")
             return
 
+        # A Matroska-style container is relayed through FFmpeg instead. The
+        # decision is made here rather than trusted from the client, and
+        # `raw=1` opts out -- that is how FFmpeg's own request gets the plain
+        # byte stream. Downloads never remux: the user asked for the original
+        # file, subtitles and all, not a converted copy.
+        #
+        # HEAD is exempt. Deciding the mode can probe the file, and probing
+        # resolves a CDN link, which HEAD must never do -- a length probe is
+        # supposed to be free. HEAD therefore keeps describing the stored file.
+        raw = (query.get("raw", ["0"])[0] or "0").lower() in ("1", "true", "yes")
+        if not raw and not download and not head_only:
+            try:
+                needs_remux = vfs.media_mode(path) == "remux"
+            except Exception as exc:
+                logger.debug("Playback mode check failed for %r: %s", path, exc)
+                needs_remux = False
+            if needs_remux:
+                self._stream_remux(path, query)
+                return
+
         size = int(st.get("size") or 0)
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
 
@@ -749,6 +771,89 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             pass            # client seeked away or closed the player
         except Exception as exc:
             logger.warning(f"Stream read failed for {path!r}: {exc}")
+
+    def _self_content_url(self, path):
+        """A URL back to this server's own raw content endpoint.
+
+        Built from the address the client actually reached us on, so it works
+        whether the server ended up bound to IPv4 or IPv6 loopback.
+        """
+        from urllib.parse import quote
+        try:
+            host = self.connection.getsockname()[0]
+            port = self.server.server_address[1]
+        except Exception:
+            return None
+        if ":" in host:                     # IPv6 literal needs brackets
+            host = "[%s]" % host
+        url = "http://%s:%s/api/stream/content?path=%s&raw=1" % (
+            host, port, quote(path, safe=""))
+        key = getattr(app_state, "api_key", None)
+        if key:
+            url += "&api_key=" + quote(str(key), safe="")
+        return url
+
+    def _stream_remux(self, path, query, head_only=False):
+        """Relay FFmpeg's fragmented-MP4 output for a Matroska-style file.
+
+        FFmpeg reads from this server's own content endpoint rather than the
+        CDN URL. That matters for anything feature-length: the CDN link is only
+        valid for ~30 minutes, and the existing ChunkedRemoteReader regenerates
+        it transparently, so a two-hour film keeps streaming. It also means
+        FFmpeg gets a range-capable input, which it needs to read Matroska cues.
+
+        The response has no Content-Length and no range support -- the size is
+        not knowable up front and a pipe cannot be seeked -- so it is framed by
+        the connection closing.
+        """
+        start = 0.0
+        raw_start = (query.get("start", [""])[0] or "").strip()
+        if raw_start:
+            try:
+                start = max(0.0, float(raw_start))
+            except ValueError:
+                self._send_text(400, "Invalid 'start' value.")
+                return
+
+        if head_only:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "none")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+
+        source = self._self_content_url(path)
+        if source is None:
+            self._send_text(500, "Could not build the remux source URL.")
+            return
+
+        try:
+            stream = remux.stream_remux(source, start=start or None)
+        except remux.RemuxError as exc:
+            logger.warning("Remux unavailable for %r: %s", path, exc)
+            self._send_text(503, str(exc))
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "none")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            for chunk in stream:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass                            # the player was closed
+        except Exception as exc:
+            logger.warning(f"Remux stream failed for {path!r}: {exc}")
+        finally:
+            # Closing the generator runs its finally block, which reaps ffmpeg.
+            # Without this a closed player would leave the encoder running.
+            stream.close()
 
     def verify_api_key(self):
         from urllib.parse import urlparse, parse_qs
@@ -978,12 +1083,19 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 from torbox_downloader.mount.vfs import CDN_LINK_TTL_S
                 vfs = app_state.get_vfs()
                 url = vfs.resolve_link(path)
-                name = path.rsplit("/", 1)[-1]
+                # Deciding how to play may cost one ffprobe run. It is cached
+                # per path, and only containers the browser cannot read are
+                # probed at all, so a normal mp4 never pays for it.
+                info = vfs.playback_info(path)
                 payload = {
                     "success": True,
                     "url": url,
-                    "kind": vfs.classify_kind(name),
-                    "playable": vfs.is_browser_playable(name),
+                    "kind": info["kind"],
+                    "mode": info["mode"],
+                    "playable": info["mode"] == "direct",
+                    "duration": info["duration"],
+                    "video_codec": info["video_codec"],
+                    "audio_codec": info["audio_codec"],
                     "expires_at": time.time() + CDN_LINK_TTL_S,
                 }
             except Exception as e:

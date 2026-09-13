@@ -2292,6 +2292,31 @@ input[type="checkbox"]:not(.switch-input) {
     object-fit: contain;
 }
 
+/* A remuxed video carries a line of explanation underneath it. */
+.stream-player-video {
+    align-items: center;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 100%;
+    max-width: 100%;
+    min-height: 0;
+}
+
+.stream-player-video .stream-player-media {
+    flex: 0 1 auto;
+    min-height: 0;
+}
+
+.stream-player-notice {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0;
+    max-width: 660px;
+    text-align: center;
+}
+
 /* Unsupported container / no-preview panel */
 .stream-player-note {
     align-items: center;

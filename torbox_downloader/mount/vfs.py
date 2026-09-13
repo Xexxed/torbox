@@ -22,6 +22,7 @@ from torbox_downloader.browser_lock import (
 )
 from torbox_downloader.downloader import parse_size_to_bytes
 from torbox_downloader.mount.streaming import ChunkedRemoteReader
+from torbox_downloader import remux
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,13 @@ class TorboxVfs:
         self._reader_cache_max = max(1, int(reader_cache_max))
         self._reader_idle_ttl = max(0.0, float(reader_idle_ttl))
 
+        # Codec/duration probes keyed by normalized path. A file's codecs never
+        # change, so a successful probe is cached for the life of the tree.
+        # Only successes are stored: a transient ffprobe failure must not
+        # permanently demote a playable file to the download panel.
+        self._probe_lock = threading.Lock()
+        self._probes = {}
+
     # --- population ---------------------------------------------------------
 
     def scan(self):
@@ -210,6 +218,10 @@ class TorboxVfs:
         self.close_all_readers()
         with self._lock:
             self._torrents = {}
+        # Probes are keyed by path, and a refresh can hand the same path to a
+        # different file, so they go as well.
+        with self._probe_lock:
+            self._probes = {}
         return self.scan()
 
     # --- internals ----------------------------------------------------------
@@ -441,6 +453,69 @@ class TorboxVfs:
     def is_browser_playable(name):
         """True only for containers a browser can decode natively."""
         return is_browser_playable(name)
+
+    # --- playback mode --------------------------------------------------------
+
+    def probe_media(self, path, force=False):
+        """Return {'video', 'audio', 'duration'} for a file, or None.
+
+        Costs one ffprobe run, so the result is cached per path. A failure is
+        not cached -- a flaky CDN response should be retried, not remembered.
+        """
+        key = self._normalize_key(path)
+        if not force:
+            with self._probe_lock:
+                if key in self._probes:
+                    return self._probes[key]
+
+        if not remux.available():
+            return None
+
+        info = None
+        try:
+            url = self.resolve_link(path)
+            info = remux.probe(url)
+        except Exception as exc:
+            logger.debug("Codec probe failed for %s: %s", key, exc)
+
+        if info is not None:
+            with self._probe_lock:
+                self._probes[key] = info
+        return info
+
+    def media_mode(self, path):
+        """How `path` should be played.
+
+        'direct'   -- the browser decodes the file as it is, so the range proxy
+                      serves it and seeking works normally.
+        'remux'    -- a container the browser cannot read, but whose codecs
+                      survive a swap to fragmented MP4, so FFmpeg can relay it
+                      without re-encoding. No seeking.
+        'external' -- neither: the UI offers copy / download / open instead.
+        """
+        name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        kind = classify_kind(name)
+
+        if kind != "video":
+            return "direct"
+        if is_browser_playable(name):
+            return "direct"
+        if not remux.available():
+            return "external"
+        return "remux" if remux.can_remux(self.probe_media(path)) else "external"
+
+    def playback_info(self, path):
+        """Everything the UI needs to pick a player for `path`."""
+        name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        mode = self.media_mode(path)
+        info = self.probe_media(path) if mode == "remux" else None
+        return {
+            "kind": classify_kind(name),
+            "mode": mode,
+            "duration": (info or {}).get("duration"),
+            "video_codec": (info or {}).get("video"),
+            "audio_codec": (info or {}).get("audio"),
+        }
 
     # --- readers --------------------------------------------------------------
 
