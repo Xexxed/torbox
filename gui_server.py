@@ -709,6 +709,21 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         # supposed to be free. HEAD therefore keeps describing the stored file.
         raw = (query.get("raw", ["0"])[0] or "0").lower() in ("1", "true", "yes")
         if not raw and not download and not head_only:
+            # Re-encoding costs real CPU or GPU, so it never happens as part of
+            # the mode decision: the client has to ask for it by name, which it
+            # only does when the user clicks the button on the external panel.
+            wants_transcode = (
+                (query.get("transcode", ["0"])[0] or "0").lower()
+                in ("1", "true", "yes")
+            )
+            if wants_transcode:
+                if not remux.can_transcode():
+                    self._send_text(
+                        503, "No usable H.264 encoder is available.")
+                    return
+                self._stream_remux(path, query, transcode=True)
+                return
+
             try:
                 needs_remux = vfs.media_mode(path) == "remux"
             except Exception as exc:
@@ -793,14 +808,20 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             url += "&api_key=" + quote(str(key), safe="")
         return url
 
-    def _stream_remux(self, path, query, head_only=False):
-        """Relay FFmpeg's fragmented-MP4 output for a Matroska-style file.
+    def _stream_remux(self, path, query, head_only=False, transcode=False):
+        """Relay FFmpeg's fragmented-MP4 output for a file the browser refuses.
 
-        FFmpeg reads from this server's own content endpoint rather than the
-        CDN URL. That matters for anything feature-length: the CDN link is only
-        valid for ~30 minutes, and the existing ChunkedRemoteReader regenerates
-        it transparently, so a two-hour film keeps streaming. It also means
-        FFmpeg gets a range-capable input, which it needs to read Matroska cues.
+        `transcode=False` copies the existing codecs into a new container, which
+        costs nothing. `transcode=True` re-encodes to H.264 + AAC, which is the
+        only way an HEVC file can play at all but costs real CPU or GPU -- so it
+        is only ever reached on an explicit request.
+
+        Either way FFmpeg reads from this server's own content endpoint rather
+        than the CDN URL. That matters for anything feature-length: the CDN link
+        is only valid for ~30 minutes, and the existing ChunkedRemoteReader
+        regenerates it transparently, so a two-hour film keeps streaming. It
+        also means FFmpeg gets a range-capable input, which it needs to read
+        Matroska cues.
 
         The response has no Content-Length and no range support -- the size is
         not knowable up front and a pipe cannot be seeked -- so it is framed by
@@ -826,13 +847,17 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
 
         source = self._self_content_url(path)
         if source is None:
-            self._send_text(500, "Could not build the remux source URL.")
+            self._send_text(500, "Could not build the media source URL.")
             return
 
+        what = "transcode" if transcode else "remux"
         try:
-            stream = remux.stream_remux(source, start=start or None)
+            if transcode:
+                stream = remux.stream_transcode(source, start=start or None)
+            else:
+                stream = remux.stream_remux(source, start=start or None)
         except remux.RemuxError as exc:
-            logger.warning("Remux unavailable for %r: %s", path, exc)
+            logger.warning("Cannot %s %r: %s", what, path, exc)
             self._send_text(503, str(exc))
             return
 
@@ -849,7 +874,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass                            # the player was closed
         except Exception as exc:
-            logger.warning(f"Remux stream failed for {path!r}: {exc}")
+            logger.warning("Failed to %s %r: %s", what, path, exc)
         finally:
             # Closing the generator runs its finally block, which reaps ffmpeg.
             # Without this a closed player would leave the encoder running.
@@ -1097,6 +1122,8 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     "duration": info["duration"],
                     "video_codec": info["video_codec"],
                     "audio_codec": info["audio_codec"],
+                    "can_transcode": info["can_transcode"],
+                    "transcode_encoder": info["transcode_encoder"],
                     "expires_at": time.time() + CDN_LINK_TTL_S,
                 }
             except Exception as e:
@@ -1437,6 +1464,13 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
     # Start watch mode polling loop
     t_watch = threading.Thread(target=watch_mode_loop, name="TorboxWatchThread", daemon=True)
     t_watch.start()
+
+    # Work out which H.264 encoder this machine can actually use, now rather
+    # than on the user's first click: the probe costs a couple of seconds, and
+    # paying it inside a resolve request would look like a hang.
+    threading.Thread(
+        target=remux.pick_encoder, name="TorboxEncoderProbe", daemon=True
+    ).start()
 
     server = ThreadingHTTPServer(("localhost", port), GUIRequestHandler)
     print(f"Torbox Downloader Web GUI is running at: http://localhost:{port}")

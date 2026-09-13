@@ -538,6 +538,11 @@ class TorboxVfs:
         # into "the video track is HEVC" -- the probe already ran, so discarding
         # its result would only hide the real cause from the user.
         info = plan["info"] or {}
+        # A re-encode is the one remaining option for a file that cannot play,
+        # so the UI needs to know whether it is possible. Only looked up for an
+        # 'external' verdict: the common paths must not pay for it, and the
+        # answer would be meaningless for a file that already plays.
+        encoder = remux.pick_encoder() if plan["mode"] == "external" else None
         return {
             "kind": classify_kind(name),
             "mode": plan["mode"],
@@ -545,6 +550,8 @@ class TorboxVfs:
             "duration": info.get("duration"),
             "video_codec": info.get("video"),
             "audio_codec": info.get("audio"),
+            "can_transcode": bool(encoder),
+            "transcode_encoder": encoder,
         }
 
     # --- readers --------------------------------------------------------------

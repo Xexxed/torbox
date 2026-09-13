@@ -1,17 +1,26 @@
-"""On-the-fly MKV remuxing, so Matroska files can play in a browser.
+"""FFmpeg-backed live playback preparation, so a browser can play anything.
 
-Browsers cannot decode the Matroska container at all. But most scene-release
-MKVs already hold H.264 video and AAC audio -- codecs every browser decodes.
-For those files the *container* is the only problem, and swapping Matroska for
-fragmented MP4 costs no encoding whatsoever: FFmpeg copies the packets across
-and playback starts in well under a second.
+Browsers are fussy about two separate things: the *container* and the *codecs*.
+This module fixes each with the cheapest tool that works, and never writes to
+disk.
 
-Anything whose codecs are not browser-safe (HEVC, DTS, TrueHD, ...) cannot be
-fixed this way. Re-encoding would fix it, but that is a deliberate non-goal --
-it burns the user's CPU and the plan for this feature is remux-only.
+**Remux** -- the container is the only problem. Browsers cannot read Matroska at
+all, but most scene-release MKVs already hold H.264 video and AAC audio, codecs
+every browser decodes. Swapping Matroska for fragmented MP4 costs no encoding
+whatsoever: FFmpeg copies the packets across and playback starts in well under a
+second.
 
-Nothing here writes to disk. FFmpeg reads from a URL and writes fragmented MP4
-to stdout, which the caller relays to the client.
+**Transcode** -- the codecs are the problem, which is the normal case for a
+modern library: x265 releases are HEVC, and HEVC is not something browsers
+decode reliably (Chrome and Edge need the HEVC Video Extensions *and* hardware
+support, and 10-bit often fails even then). A remux cannot help, because it
+copies codecs unchanged. Re-encoding to H.264 is the only thing that plays such
+a file, so it is offered -- but only behind an explicit click, since it is the
+one operation here that costs real CPU or GPU.
+
+Both paths pipe fragmented MP4 to stdout, which the caller relays to the client.
+Nothing is written to disk, and neither output is seekable: a live conversion
+has no fixed length to seek within.
 """
 
 import json
@@ -34,6 +43,33 @@ IDLE_KILL_S = 45.0
 # to these is what makes "copy, never encode" safe to promise.
 REMUXABLE_VIDEO = frozenset({"h264"})
 REMUXABLE_AUDIO = frozenset({"aac", "mp3"})
+
+# Preference order for re-encoding: hardware first, software last. Every
+# candidate is *tested* rather than trusted, because a build can list an encoder
+# it cannot actually run -- h264_nvenc ships in most Windows builds whether or
+# not the machine has an NVIDIA GPU, and it fails at encode time, not load time.
+ENCODER_CANDIDATES = (
+    "h264_nvenc",          # NVIDIA
+    "h264_qsv",            # Intel Quick Sync
+    "h264_amf",            # AMD
+    "h264_videotoolbox",   # macOS
+    "libx264",             # software; present in any normal build
+)
+
+# Per-encoder tuning. The target is "watchable now", not "archival": this runs
+# live, so a slow preset starves the player instead of producing a nicer file.
+ENCODER_ARGS = {
+    "h264_nvenc": ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
+    "h264_qsv": ["-preset", "veryfast", "-global_quality", "23"],
+    "h264_amf": ["-quality", "speed", "-rc", "cqp", "-qp_i", "22", "-qp_p", "22"],
+    "h264_videotoolbox": ["-q:v", "55"],
+    "libx264": ["-preset", "veryfast", "-crf", "21"],
+}
+
+ENCODER_PROBE_TIMEOUT_S = 20.0
+
+_encoder_cache = None
+_encoder_lock = threading.Lock()
 
 
 class RemuxError(RuntimeError):
@@ -140,6 +176,66 @@ def can_remux(info):
     return True
 
 
+def _encoder_works(name):
+    """Encode one synthetic frame, so we learn the truth rather than the list.
+
+    `ffmpeg -encoders` only reports what the build was compiled with. A machine
+    with no NVIDIA driver still lists h264_nvenc, and discovering that at
+    playback time means the user waits for a failure instead of watching a
+    film. One 320x240 frame costs a fraction of a second and settles it.
+    """
+    binary = ffmpeg_path()
+    if not binary:
+        return False
+    command = [
+        binary, "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25:d=0.2",
+        "-frames:v", "1", "-c:v", name, "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=ENCODER_PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def pick_encoder(force=False):
+    """The best usable H.264 encoder, or None. Detected once, then cached."""
+    global _encoder_cache
+    with _encoder_lock:
+        if _encoder_cache is not None and not force:
+            return _encoder_cache or None
+        _encoder_cache = ""
+        for name in ENCODER_CANDIDATES:
+            if _encoder_works(name):
+                _encoder_cache = name
+                logger.info("Transcoding will use the %s encoder.", name)
+                break
+        else:
+            logger.warning(
+                "No usable H.264 encoder found; transcoding is unavailable."
+            )
+        return _encoder_cache or None
+
+
+def reset_encoder_cache():
+    """Forget the detected encoder. For tests; a real run never needs this."""
+    global _encoder_cache
+    with _encoder_lock:
+        _encoder_cache = None
+
+
+def can_transcode():
+    """True when a re-encode is actually possible on this machine."""
+    return bool(available() and pick_encoder())
+
+
 def remux_command(url, start=None):
     """The FFmpeg invocation that produces a streamable fragmented MP4.
 
@@ -170,22 +266,73 @@ def remux_command(url, start=None):
     return command
 
 
-def stream_remux(url, start=None, block=STREAM_READ_BYTES):
-    """Yield fragmented-MP4 bytes read from a live FFmpeg process.
+def transcode_command(url, start=None, encoder=None):
+    """The FFmpeg invocation that re-encodes a file into playable H.264.
 
-    The process is always reaped -- on normal end, on the caller closing the
-    generator early (which is what happens when the client disconnects), and on
-    a stall longer than IDLE_KILL_S. Callers should drive this in a
-    try/finally and call `.close()` so an abandoned stream cannot leave FFmpeg
-    running.
+    This is the expensive path, and the only one that can rescue HEVC, DTS or
+    TrueHD -- none of which a browser decodes, and none of which a remux can
+    change. Video becomes H.264, audio becomes AAC, and the result is the same
+    fragmented MP4 on stdout, so the no-disk promise is unchanged.
+    """
+    encoder = encoder or pick_encoder()
+    if not encoder:
+        raise RemuxError("No usable H.264 encoder is available.")
+
+    command = [ffmpeg_path() or "ffmpeg", "-nostdin", "-loglevel", "error"]
+    if start and start > 0:
+        command += ["-ss", "%.3f" % start]
+    command += [
+        "-i", url,
+        # Same optional maps as the remux path: a file with no audio track is
+        # still playable, and subtitles cannot be carried in MP4.
+        "-map", "0:v:0?", "-map", "0:a:0?",
+        "-sn", "-dn",
+        "-c:v", encoder,
+        # 10-bit HEVC is the common case in x265 releases and 10-bit H.264 is
+        # not something browsers accept. Forcing 8-bit is what makes the output
+        # playable at all rather than merely well-encoded.
+        "-pix_fmt", "yuv420p",
+    ]
+    command += ENCODER_ARGS.get(encoder, [])
+    command += [
+        # Audio is re-encoded rather than copied: "the audio codec is not
+        # browser-safe" is exactly the situation that leads here, and AAC is
+        # cheap to produce.
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
+        "pipe:1",
+    ]
+    return command
+
+
+def _stream_command(command, what, url, start=None, block=STREAM_READ_BYTES):
+    """Yield stdout of a live FFmpeg process running `command`.
+
+    Shared by the remux and transcode paths, which differ only in the command
+    they hand FFmpeg: both are a long-running process writing fragmented MP4 to
+    a pipe, and both need the same three guarantees.
+
+    - **The stderr pipe is drained.** FFmpeg writes progress there, and if
+      nobody reads it the pipe buffer fills and FFmpeg blocks forever -- which
+      looks exactly like a slow network.
+    - **A stalled encoder is killed**, or a dead CDN read leaves an orphaned
+      process holding a socket.
+    - **The process is always reaped** -- on normal end, on the idle timeout,
+      and on the caller abandoning the generator, which is what happens when
+      the client disconnects. Callers should still drive this in a try/finally
+      and call `.close()`.
     """
     binary = ffmpeg_path()
     if not binary:
         raise RemuxError("ffmpeg is not installed.")
 
-    command = remux_command(url, start)
+    command = list(command)
     command[0] = binary
-    logger.info("Remuxing %s (start=%s).", _redact(url), ("%.1fs" % start) if start else "0")
+    logger.info(
+        "%s %s (start=%s).", what, _redact(url),
+        ("%.1fs" % start) if start else "0",
+    )
 
     try:
         proc = subprocess.Popen(
@@ -224,7 +371,7 @@ def stream_remux(url, start=None, block=STREAM_READ_BYTES):
                 continue
             if time.monotonic() - state["last_read"] > IDLE_KILL_S:
                 logger.warning(
-                    "Remux stalled for %.0fs; killing ffmpeg.", IDLE_KILL_S
+                    "%s stalled for %.0fs; killing ffmpeg.", what, IDLE_KILL_S
                 )
                 try:
                     proc.kill()
@@ -261,3 +408,23 @@ def stream_remux(url, start=None, block=STREAM_READ_BYTES):
             proc.wait(timeout=5)
         except Exception:
             pass
+
+
+def stream_remux(url, start=None, block=STREAM_READ_BYTES):
+    """Yield fragmented-MP4 bytes copied out of the source container."""
+    return _stream_command(remux_command(url, start), "Remuxing", url, start, block)
+
+
+def stream_transcode(url, start=None, encoder=None, block=STREAM_READ_BYTES):
+    """Yield fragmented-MP4 bytes re-encoded to H.264 + AAC.
+
+    Costs real CPU or GPU, so callers must only reach this on an explicit user
+    request -- never as part of deciding how a file should play.
+    """
+    encoder = encoder or pick_encoder()
+    if not encoder:
+        raise RemuxError("No usable H.264 encoder is available.")
+    command = transcode_command(url, start, encoder)
+    return _stream_command(
+        command, "Transcoding via %s" % encoder, url, start, block
+    )
