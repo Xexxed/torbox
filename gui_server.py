@@ -7,9 +7,14 @@ import threading
 import webbrowser
 import uuid
 import logging
+import mimetypes
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logger = logging.getLogger(__name__)
+
+# Size of each block written to the client by the Stream content proxy.
+STREAM_BLOCK_BYTES = 1024 * 1024
 
 
 def _fmt_speed(bps: float) -> str:
@@ -24,9 +29,31 @@ def _fmt_speed(bps: float) -> str:
     return "0 KB/s"
 
 
+def _clean_vfs_path(raw):
+    """Validate and normalize a client-supplied virtual-filesystem path.
+
+    Returns a '/'-rooted path. Raises ValueError for anything that is not a
+    plain absolute path (empty, NUL bytes, or traversal segments).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("A non-empty 'path' is required.")
+    if "\x00" in raw:
+        raise ValueError("Invalid path.")
+    segments = [s for s in raw.strip().replace("\\", "/").split("/") if s]
+    if any(s in (".", "..") for s in segments):
+        raise ValueError("Path traversal is not allowed.")
+    return "/" + "/".join(segments)
+
+
 # In-memory cache for static GUI files. Files never change at runtime so we
-# read each one once and serve from RAM on every subsequent request.
+# read each one once and serve from RAM on every subsequent request. Set
+# TORBOX_GUI_NOCACHE=1 during frontend work to bypass the cache entirely, so
+# edits to gui/*.js and gui/*.css show up on reload without a restart.
 _static_cache: dict = {}
+
+
+def _static_cache_enabled() -> bool:
+    return not os.environ.get("TORBOX_GUI_NOCACHE")
 
 
 def extract_email_from_token(token):
@@ -82,7 +109,14 @@ def send_os_notification(title, message):
 class AppState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.fetch_lock = threading.Lock()  # Serialize fetch_structure browser launches
+        # One lock guards every browser-mutating operation (structure scrapes
+        # and link generation). It is held per operation, never for a whole
+        # download, so the Stream page and the download pipeline cannot corrupt
+        # each other's SPA state while still interleaving between files.
+        # `fetch_lock` is kept as an alias for existing call sites.
+        self.browser_op_lock = threading.Lock()
+        self.fetch_lock = self.browser_op_lock
+        self.browser_op_lock_timeout_s = 60.0
         self.token = ""
         self.email = ""
         self.dest_dir = "downloads"
@@ -108,6 +142,11 @@ class AppState:
         self.session = None
         self.session_lock = threading.Lock()
         self.api_key = str(uuid.uuid4())
+        # Shared virtual filesystem (TorboxVfs). Owned here so the drive mount
+        # and the Stream page reuse one tree and one CDN-link cache instead of
+        # each building their own. Lazily created by get_vfs().
+        self._vfs = None
+        self._vfs_lock = threading.RLock()
         # O(1) name → queue-index mapping; rebuilt whenever update_queue() runs.
         self._queue_index: dict = {}
         # TTL cache for shutil.disk_usage() to avoid a filesystem syscall on
@@ -159,6 +198,11 @@ class AppState:
                     if "mount_drive_letter" in data:
                         letter = str(data["mount_drive_letter"]).strip().upper().rstrip(":")
                         self.mount_drive_letter = letter if len(letter) == 1 and letter.isalpha() else ""
+                    if "browser_op_lock_timeout_s" in data:
+                        try:
+                            self.browser_op_lock_timeout_s = max(1.0, float(data["browser_op_lock_timeout_s"]))
+                        except (TypeError, ValueError):
+                            pass
             except Exception:
                 pass
 
@@ -174,7 +218,8 @@ class AppState:
                     "write_buffer_mb": self.write_buffer_mb,
                     "watch_mode": self.watch_mode,
                     "watch_interval": self.watch_interval,
-                    "mount_drive_letter": self.mount_drive_letter
+                    "mount_drive_letter": self.mount_drive_letter,
+                    "browser_op_lock_timeout_s": self.browser_op_lock_timeout_s
                 }, f)
         except Exception:
             pass
@@ -190,6 +235,7 @@ class AppState:
             self.error_message = "Your Torbox session token has expired or is invalid."
         
         self.stop_session()
+        self.drop_vfs()
 
         if os.path.exists("token.txt"):
             try:
@@ -218,6 +264,48 @@ class AppState:
                 except Exception:
                     pass
                 self.session = None
+
+    def get_vfs(self):
+        """Return the shared TorboxVfs for the current session, creating it on
+        first use.
+
+        A single instance is shared by the drive mount and the Stream page so
+        both reuse the same tree and the same CDN-link cache. It is rebuilt
+        automatically when the underlying browser session was replaced (token
+        change / re-login), which keeps a stale tree from outliving its session.
+        """
+        with self._vfs_lock:
+            session = self.get_or_create_session()
+            if session is None:
+                raise RuntimeError("No valid session token provided.")
+            current = self._vfs
+            if current is None or getattr(current, "_session", None) is not session:
+                from torbox_downloader.mount.vfs import TorboxVfs
+                rebuilt = current is not None
+                current = TorboxVfs(
+                    session,
+                    browser_lock=self.browser_op_lock,
+                    browser_op_timeout=self.browser_op_lock_timeout_s,
+                )
+                self._vfs = current
+                logger.info(
+                    "Shared VFS %s for the Stream page and drive mount.",
+                    "rebuilt (session changed)" if rebuilt else "created",
+                )
+            return current
+
+    def drop_vfs(self):
+        """Forget the shared VFS. Called when the session ends (logout/token
+        expiry) so a stale tree cannot be served to a new session."""
+        with self._vfs_lock:
+            vfs = self._vfs
+            self._vfs = None
+        if vfs is not None:
+            logger.info("Shared VFS dropped (session ended).")
+            try:
+                vfs.close_all_readers()
+            except Exception:
+                pass
 
     def clear_logs(self):
         with self.lock:
@@ -455,7 +543,9 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             cancel_event=app_state.cancel_event,
             session=session,
             disk_profile=disk_profile,
-            buffer_mb=(write_buffer_mb or None)
+            buffer_mb=(write_buffer_mb or None),
+            browser_lock=app_state.browser_op_lock,
+            browser_op_timeout=app_state.browser_op_lock_timeout_s
         )
         app_state.set_status("finished")
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")
@@ -525,6 +615,141 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _send_json(self, payload, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+    def _stream_error(self, exc):
+        """Map a Stream exception to a JSON error body. A stale token logs the
+        session out once instead of surfacing an error per card."""
+        message = str(exc)
+        if "session token has expired or is invalid" in message:
+            app_state.handle_token_expired()
+            message = "Your Torbox session token has expired or is invalid."
+        return {"success": False, "error": message}
+
+    def _send_text(self, status, message):
+        body = str(message).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_range(range_header, size):
+        """Parse a single-range header. Returns (start, end) or None."""
+        match = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", range_header or "")
+        if not match:
+            return None
+        start_txt, end_txt = match.group(1), match.group(2)
+        if not start_txt and not end_txt:
+            return None
+        if start_txt:
+            start = int(start_txt)
+            end = int(end_txt) if end_txt else size - 1
+        else:
+            suffix = int(end_txt)          # "bytes=-N" = last N bytes
+            if suffix <= 0:
+                return None
+            start, end = max(0, size - suffix), size - 1
+        if start > end or start >= size:
+            return None
+        return start, min(end, size - 1)
+
+    def _handle_stream_content(self, head_only=False):
+        """Serve one file through the shared ChunkedRemoteReader.
+
+        Range requests are honored so the player can seek. The reader resolves
+        the CDN link lazily on its first read -- which only happens because the
+        user clicked the file, so listing a folder never resolves anything.
+        """
+        from urllib.parse import urlparse, parse_qs
+        query = parse_qs(urlparse(self.path).query)
+        raw_path = query.get("path", [""])[0] or ""
+        download = (query.get("download", ["0"])[0] or "0").lower() in ("1", "true", "yes")
+
+        try:
+            path = _clean_vfs_path(raw_path)
+        except ValueError as exc:
+            self._send_text(400, str(exc))
+            return
+
+        try:
+            vfs = app_state.get_vfs()
+            st = vfs.stat(path)
+        except Exception as exc:
+            if "session token has expired or is invalid" in str(exc):
+                app_state.handle_token_expired()
+            self._send_text(404, "File not found.")
+            return
+
+        if st is None:
+            self._send_text(404, "File not found.")
+            return
+        if st.get("is_dir"):
+            self._send_text(400, "Requested path is a directory, not a file.")
+            return
+
+        size = int(st.get("size") or 0)
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+        start, end, partial = 0, max(0, size - 1), False
+        range_header = self.headers.get("Range")
+        if range_header and size > 0:
+            parsed = self._parse_range(range_header, size)
+            if parsed is None:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            start, end = parsed
+            partial = True
+
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes" if size > 0 else "none")
+        self.send_header("Cache-Control", "no-store")
+        if download:
+            filename = path.rsplit("/", 1)[-1].replace('"', "")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        if size > 0:
+            self.send_header("Content-Length", str(max(0, end - start + 1)))
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if head_only:
+            return
+
+        try:
+            reader = vfs.get_or_open_reader(path)
+        except Exception as exc:
+            logger.warning(f"Stream open failed for {path!r}: {exc}")
+            return
+
+        remaining = (end - start + 1) if size > 0 else None
+        offset = start
+        try:
+            while remaining is None or remaining > 0:
+                want = STREAM_BLOCK_BYTES if remaining is None else min(STREAM_BLOCK_BYTES, remaining)
+                chunk = reader.read_range(offset, want)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                offset += len(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass            # client seeked away or closed the player
+        except Exception as exc:
+            logger.warning(f"Stream read failed for {path!r}: {exc}")
+
     def verify_api_key(self):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
@@ -553,6 +778,20 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(app_state.get_serializable_state()).encode("utf-8"))
             return
 
+        if self.path.startswith("/api/stream/library"):
+            # Root torrent listing for the Stream tab. Metadata only: no links.
+            try:
+                entries = app_state.get_vfs().listdir_entries("/")
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "path": "/", "entries": entries})
+            return
+
+        if self.path.startswith("/api/stream/content"):
+            self._handle_stream_content()
+            return
+
         # Serve static UI files from /gui subfolder
         target_path = self.path
         if target_path == "/" or target_path.startswith("/?"):
@@ -563,10 +802,14 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         file_path = os.path.join(os.path.dirname(__file__), "gui", sanitized_path)
 
         if os.path.exists(file_path) and os.path.isfile(file_path):
-            if file_path not in _static_cache:
+            if _static_cache_enabled():
+                if file_path not in _static_cache:
+                    with open(file_path, "rb") as f:
+                        _static_cache[file_path] = f.read()
+                content = _static_cache[file_path]
+            else:
                 with open(file_path, "rb") as f:
-                    _static_cache[file_path] = f.read()
-            content = _static_cache[file_path]
+                    content = f.read()
             self.send_response(200)
             if file_path.endswith(".html"):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -583,6 +826,18 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"404 Not Found")
+
+    def do_HEAD(self):
+        # Players probe length/type before requesting the body.
+        if self.path.startswith("/api/") and not self.verify_api_key():
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path.startswith("/api/stream/content"):
+            self._handle_stream_content(head_only=True)
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         if self.path.startswith("/api/"):
@@ -693,6 +948,57 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path.startswith("/api/stream/list"):
+            # Folder listing for the Stream tab. Expanding a torrent here does
+            # navigate the browser, but it never resolves a file's link.
+            try:
+                path = _clean_vfs_path(params.get("path", "/"))
+            except ValueError as e:
+                self._send_json({"success": False, "error": str(e)}, status=400)
+                return
+            try:
+                entries = app_state.get_vfs().listdir_entries(path)
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "path": path, "entries": entries})
+            return
+
+        elif self.path.startswith("/api/stream/resolve"):
+            # The only place a file's CDN link is resolved, and only because
+            # the user clicked that file.
+            try:
+                path = _clean_vfs_path(params.get("path", ""))
+            except ValueError as e:
+                self._send_json({"success": False, "error": str(e)}, status=400)
+                return
+            try:
+                from torbox_downloader.mount.vfs import CDN_LINK_TTL_S
+                vfs = app_state.get_vfs()
+                url = vfs.resolve_link(path)
+                name = path.rsplit("/", 1)[-1]
+                payload = {
+                    "success": True,
+                    "url": url,
+                    "kind": vfs.classify_kind(name),
+                    "playable": vfs.is_browser_playable(name),
+                    "expires_at": time.time() + CDN_LINK_TTL_S,
+                }
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json(payload)
+            return
+
+        elif self.path.startswith("/api/stream/refresh"):
+            try:
+                torrents = app_state.get_vfs().refresh() or []
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "torrents": len(torrents)})
             return
 
         elif self.path.startswith("/api/fetch_structure"):
@@ -969,6 +1275,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 pass
 
             app_state.stop_session()
+            app_state.drop_vfs()
 
             if os.path.exists("token.txt"):
                 try:

@@ -32,6 +32,7 @@ downloads/
 .vscode/
 .kilo/
 .agents/
+.workbuddy-ai/
 *.suo
 *.ntvs*
 *.njsproj
@@ -57,3 +58,4 @@ torbox_debug*.html
 debug_*.html
 *.html.dump
 
+.workbuddy-ai/memory/2026-09-13.md

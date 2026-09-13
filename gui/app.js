@@ -120,8 +120,12 @@ function switchTab(tabName) {
     // Dynamic header title update
     const titleEl = document.getElementById('page-title');
     if (tabName === 'dashboard') titleEl.textContent = 'Torbox Downloader';
+    if (tabName === 'stream') titleEl.textContent = 'Stream';
     if (tabName === 'completed') titleEl.textContent = 'Completed Downloads';
     if (tabName === 'logs') titleEl.textContent = 'Raw System Logs';
+
+    // Let the Stream page lazy-load its library the first time it is opened.
+    if (tabName === 'stream' && window.StreamPage) window.StreamPage.activate();
 }
 
 // Switch Console View Tabs

@@ -15,12 +15,62 @@ import re
 import threading
 import time
 
+from torbox_downloader.browser_lock import (
+    BrowserBusyError,
+    DEFAULT_BROWSER_OP_TIMEOUT_S,
+    browser_op,
+)
 from torbox_downloader.downloader import parse_size_to_bytes
 from torbox_downloader.mount.streaming import ChunkedRemoteReader
 
 logger = logging.getLogger(__name__)
 
 _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# How long a resolved CDN link is reused before it is regenerated. Inherited
+# from the mount feature; see the plan's "CDN link TTL is an assumption" note.
+CDN_LINK_TTL_S = 1800
+
+# Bounds for the shared reader cache (one ChunkedRemoteReader per open file).
+# Consecutive HTTP range requests for the same file reuse the reader's in-RAM
+# chunk cache instead of refetching; idle readers are closed and evicted.
+DEFAULT_READER_CACHE_MAX = 4
+DEFAULT_READER_IDLE_TTL_S = 300
+
+# Media classification. "video"/"image" drive the Stream page's card kind;
+# only _BROWSER_PLAYABLE_EXTS can be decoded inline by a browser (the proxy
+# relays bytes but never transcodes, so e.g. mkv resolves to a download).
+_VIDEO_EXTS = frozenset({
+    "mkv", "mp4", "m4v", "webm", "mov", "avi", "ts", "m2ts",
+    "mpg", "mpeg", "wmv", "flv",
+})
+_IMAGE_EXTS = frozenset({
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "tiff", "tif", "heic",
+})
+_BROWSER_PLAYABLE_EXTS = frozenset({"mp4", "m4v", "webm", "mov", "ogg"})
+
+
+def _file_extension(name):
+    """Lower-cased extension without the dot; '' when there is none."""
+    text = str(name or "")
+    if "." not in text:
+        return ""
+    return text.rsplit(".", 1)[1].strip().lower()
+
+
+def classify_kind(name):
+    """Return 'video' | 'image' | 'other' for a filename."""
+    ext = _file_extension(name)
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _IMAGE_EXTS:
+        return "image"
+    return "other"
+
+
+def is_browser_playable(name):
+    """True only for containers a browser can decode natively."""
+    return _file_extension(name) in _BROWSER_PLAYABLE_EXTS
 
 
 def sanitize_fs_name(name):
@@ -103,12 +153,32 @@ class TorrentDir(_DirBase):
 class TorboxVfs:
     """Read-only tree over scan_torrents()/fetch_structure()/link generation."""
 
-    def __init__(self, session):
+    def __init__(self, session, reader_cache_max=DEFAULT_READER_CACHE_MAX,
+                 reader_idle_ttl=DEFAULT_READER_IDLE_TTL_S,
+                 browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S):
         self._session = session
         self._lock = threading.RLock()
         self._torrents = {}                 # display name -> TorrentDir
         self.total_bytes = 0
         self.file_count = 0
+
+        # Shared lock guarding every browser-mutating operation. Injected by
+        # AppState so the mount, the Stream page and the downloader all
+        # serialize against each other; None means "own the browser outright".
+        self._browser_lock = browser_lock
+        self._browser_op_timeout = browser_op_timeout
+
+        # Per-file locks so two rapid clicks on one file coalesce into a single
+        # browser link generation instead of racing.
+        self._link_locks = {}               # path -> threading.Lock
+        self._link_locks_guard = threading.Lock()
+
+        # Bounded cache of open readers keyed by normalized vfs path, so a
+        # player's successive range requests share one chunk cache.
+        self._reader_lock = threading.RLock()
+        self._readers = {}                  # path -> {"reader", "last_used"}
+        self._reader_cache_max = max(1, int(reader_cache_max))
+        self._reader_idle_ttl = max(0.0, float(reader_idle_ttl))
 
     # --- population ---------------------------------------------------------
 
@@ -136,6 +206,8 @@ class TorboxVfs:
         return torrents
 
     def refresh(self):
+        # Drop open readers too: the tree they were resolved against is gone.
+        self.close_all_readers()
         with self._lock:
             self._torrents = {}
         return self.scan()
@@ -145,7 +217,14 @@ class TorboxVfs:
     def _expand(self, torrent_dir):
         """Scrape and build the subtree for one torrent. Caller holds lock."""
         try:
-            files = self._session.fetch_structure(torrent_dir.original_name) or []
+            # Scraping navigates the shared browser, so it takes the same lock
+            # as link generation. BrowserBusyError is not a VfsError: callers
+            # distinguish "try again" from "this torrent is broken".
+            with browser_op(self._browser_lock, self._browser_op_timeout,
+                            "expand a torrent"):
+                files = self._session.fetch_structure(torrent_dir.original_name) or []
+        except BrowserBusyError:
+            raise
         except Exception as e:
             raise VfsError(f"Could not expand torrent '{torrent_dir.original_name}': {e}") from e
 
@@ -243,19 +322,97 @@ class TorboxVfs:
                 for name, child in node.children.items()
             ]
 
-    def open_reader(self, path, chunk_size=None, cache_budget=None):
-        """Open a file for zero-temp streaming via a ChunkedRemoteReader."""
+    def listdir_entries(self, path):
+        """Structured listing for the Stream page: one dict per child.
+
+        Each entry carries only already-scraped metadata -- never a URL,
+        selector or CDN field -- so rendering a folder can never resolve a
+        link (see the plan's invariant 2).
+        """
+        path = str(path)
+        with self._lock:
+            if path in ("", "/"):
+                return [
+                    {
+                        "name": name,
+                        "is_dir": True,
+                        "size": 0,
+                        "size_str": getattr(child, "total_size_str", "Unknown"),
+                        "kind": "folder",
+                        "playable": False,
+                    }
+                    for name, child in self._torrents.items()
+                ]
+
+            node = self._resolve(path)
+            if not node.is_dir:
+                raise VfsNotADirectory(f"Not a directory: {path}")
+
+            entries = []
+            for name, child in node.children.items():
+                if child.is_dir:
+                    entries.append({
+                        "name": name,
+                        "is_dir": True,
+                        "size": 0,
+                        "size_str": "Unknown",
+                        "kind": "folder",
+                        "playable": False,
+                    })
+                else:
+                    entries.append({
+                        "name": name,
+                        "is_dir": False,
+                        "size": getattr(child, "size_bytes", 0),
+                        "size_str": getattr(child, "size_str", "Unknown"),
+                        "kind": classify_kind(getattr(child, "name", name)),
+                        "playable": is_browser_playable(getattr(child, "name", name)),
+                    })
+            return entries
+
+    # --- link resolution ------------------------------------------------------
+
+    def resolve_link(self, path, force_refresh=False):
+        """Resolve (and cache) the CDN URL for a single file.
+
+        This is the only place a link is generated. Callers invoke it when a
+        user opens/acts on a specific file -- never while listing a folder --
+        which keeps the "no links resolved upfront" guarantee.
+        """
         node = self._resolve(str(path))
         if not isinstance(node, FileEntry):
             raise VfsIsADirectory(f"Not a file: {path}")
+        # Serialize per file: a second click waits, then hits the link cache.
+        with self._link_lock_for(self._normalize_key(path)):
+            return self._resolve_node_link(node, force_refresh)
+
+    def _link_lock_for(self, key):
+        with self._link_locks_guard:
+            lock = self._link_locks.get(key)
+            if lock is None:
+                if len(self._link_locks) > 512:
+                    self._link_locks.clear()
+                lock = threading.Lock()
+                self._link_locks[key] = lock
+            return lock
+
+    def _resolve_node_link(self, node, force_refresh=False):
+        """Cached CDN link for a FileEntry. Reused by open_reader() so the
+        mount and the Stream page share one link cache."""
+        now = time.time()
+        if not force_refresh and node.cdn_url and now < node.cdn_url_expires:
+            return node.cdn_url
 
         session = self._session
         torrent = node.torrent
 
-        def url_provider(force_refresh=False):
-            now = time.time()
-            if not force_refresh and node.cdn_url and now < node.cdn_url_expires:
-                return node.cdn_url
+        # Expanding a torrent and generating its link must be atomic: another
+        # caller (the downloader, another stream click) could navigate the
+        # page in between and leave the row we want off-screen.
+        with browser_op(self._browser_lock, self._browser_op_timeout,
+                        "resolve a download link"):
+            # The browser session can only hold one expanded torrent at a
+            # time, so re-expand when it is showing something else.
             current = getattr(session, "current_torrent_name", None)
             if force_refresh or current != torrent.original_name:
                 try:
@@ -269,9 +426,36 @@ class TorboxVfs:
                 raise VfsError(f"Link generation failed for '{node.name}': {e}") from e
             if not url:
                 raise VfsError(f"No CDN link returned for '{node.name}'")
-            node.cdn_url = url
-            node.cdn_url_expires = time.time() + 1800  # cache 30 mins
-            return url
+        node.cdn_url = url
+        node.cdn_url_expires = time.time() + CDN_LINK_TTL_S
+        return url
+
+    # --- media classification -------------------------------------------------
+
+    @staticmethod
+    def classify_kind(name):
+        """'video' | 'image' | 'other' for a filename."""
+        return classify_kind(name)
+
+    @staticmethod
+    def is_browser_playable(name):
+        """True only for containers a browser can decode natively."""
+        return is_browser_playable(name)
+
+    # --- readers --------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_key(path):
+        return "/" + "/".join(p for p in str(path).replace("\\", "/").split("/") if p)
+
+    def open_reader(self, path, chunk_size=None, cache_budget=None):
+        """Open a file for zero-temp streaming via a ChunkedRemoteReader."""
+        node = self._resolve(str(path))
+        if not isinstance(node, FileEntry):
+            raise VfsIsADirectory(f"Not a file: {path}")
+
+        def url_provider(force_refresh=False):
+            return self._resolve_node_link(node, force_refresh)
 
         kwargs = {}
         if chunk_size is not None:
@@ -279,3 +463,60 @@ class TorboxVfs:
         if cache_budget is not None:
             kwargs["cache_budget"] = cache_budget
         return ChunkedRemoteReader(node.size_bytes, url_provider, **kwargs)
+
+    def get_or_open_reader(self, path, chunk_size=None, cache_budget=None):
+        """Return a cached reader for `path`, opening one on first use.
+
+        A player issues many range requests for one file; reusing the reader
+        keeps its in-RAM chunk cache warm. The cache is bounded and idle
+        readers are closed.
+        """
+        key = self._normalize_key(path)
+        now = time.time()
+        with self._reader_lock:
+            self._evict_idle_readers(now)
+            entry = self._readers.get(key)
+            if entry is not None:
+                entry["last_used"] = now
+                return entry["reader"]
+
+            reader = self.open_reader(path, chunk_size=chunk_size, cache_budget=cache_budget)
+            self._readers[key] = {"reader": reader, "last_used": now}
+            logger.debug("Opened stream reader for %s (%d cached).", key, len(self._readers))
+
+            # Bound the cache by least-recently-used eviction.
+            while len(self._readers) > self._reader_cache_max:
+                oldest = min(self._readers, key=lambda k: self._readers[k]["last_used"])
+                if oldest == key:
+                    break
+                self._close_reader_locked(oldest, reason="lru")
+            return reader
+
+    def _close_reader_locked(self, key, reason="closed"):
+        entry = self._readers.pop(key, None)
+        if entry is not None:
+            logger.debug("Released stream reader for %s (%s).", key, reason)
+            try:
+                entry["reader"].close()
+            except Exception:
+                pass
+
+    def _evict_idle_readers(self, now):
+        if self._reader_idle_ttl <= 0:
+            return
+        stale = [k for k, e in self._readers.items()
+                 if now - e["last_used"] > self._reader_idle_ttl]
+        for key in stale:
+            self._close_reader_locked(key, reason="idle")
+
+    def close_reader(self, path):
+        with self._reader_lock:
+            self._close_reader_locked(self._normalize_key(path))
+
+    def close_all_readers(self):
+        with self._reader_lock:
+            count = len(self._readers)
+            for key in list(self._readers.keys()):
+                self._close_reader_locked(key, reason="session reset")
+            if count:
+                logger.debug("Closed %d stream reader(s).", count)
