@@ -1874,3 +1874,327 @@ input[type="checkbox"]:not(.switch-input) {
         display: none;
     }
 }
+
+/* ============================================================
+   Stream tab — a lazy media browser.
+   Reuses the app's charcoal/emerald tokens; the rails are the one
+   borrowed idea, not a Netflix clone.
+   ============================================================ */
+
+#stream-view {
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.stream-shell {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    min-width: 0;
+    overflow: hidden;
+    gap: 16px;
+}
+
+.stream-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+}
+
+.stream-back-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    background: var(--bg-panel);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 150ms var(--ease-out), color 150ms var(--ease-out);
+}
+
+.stream-back-btn:hover {
+    background: var(--bg-raised);
+    color: var(--text-primary);
+    border-color: var(--border-hover);
+}
+
+.stream-back-btn svg {
+    fill: currentColor;
+}
+
+.stream-breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-grow: 1;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.stream-breadcrumb::-webkit-scrollbar {
+    display: none;
+}
+
+.stream-crumb {
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font: inherit;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: var(--radius-sm);
+    transition: color 150ms var(--ease-out), background 150ms var(--ease-out);
+}
+
+.stream-crumb:hover {
+    color: var(--accent-emerald-bright);
+    background: var(--accent-emerald-dim);
+}
+
+.stream-crumb--current {
+    color: var(--text-primary);
+    font-weight: 600;
+    padding: 4px 6px;
+}
+
+.stream-crumb-sep {
+    color: var(--border-hover);
+}
+
+.stream-hero {
+    position: relative;
+    flex-shrink: 0;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 20px 22px;
+    overflow: hidden;
+    background:
+        radial-gradient(520px 220px at 12% -40%, rgba(4, 191, 138, 0.16), transparent 70%),
+        linear-gradient(135deg, var(--bg-raised), var(--bg-panel));
+}
+
+.stream-hero-kicker {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent-emerald);
+    margin-bottom: 6px;
+}
+
+.stream-hero-inner h2 {
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.stream-hero-inner p {
+    margin-top: 5px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+}
+
+.stream-body {
+    flex-grow: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding-bottom: 6px;
+}
+
+.stream-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.stream-rail-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.stream-rail-head h3 {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--text-primary);
+}
+
+.stream-rail-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.stream-rail-track {
+    display: flex;
+    gap: 12px;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    padding-bottom: 6px;
+}
+
+.stream-rail-track::-webkit-scrollbar {
+    height: 8px;
+}
+
+.stream-rail-track::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 4px;
+}
+
+.stream-card {
+    scroll-snap-align: start;
+    flex: 0 0 auto;
+    width: 138px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 0;
+    border: none;
+    background: none;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+}
+
+.stream-card-poster {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    aspect-ratio: 2 / 3;
+    width: 100%;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: linear-gradient(160deg, var(--bg-raised), var(--bg-inset));
+    color: var(--text-muted);
+    transition: border-color 160ms var(--ease-out), transform 160ms var(--ease-out),
+        box-shadow 160ms var(--ease-out), color 160ms var(--ease-out);
+}
+
+.stream-card-poster svg {
+    fill: currentColor;
+    opacity: 0.75;
+}
+
+.stream-card:hover .stream-card-poster,
+.stream-card:focus-visible .stream-card-poster {
+    border-color: var(--accent-emerald);
+    transform: translateY(-3px);
+    box-shadow: var(--shadow-pop);
+    color: var(--accent-emerald-bright);
+}
+
+.stream-card:focus-visible {
+    outline: none;
+}
+
+.stream-card--folder .stream-card-poster {
+    background: linear-gradient(160deg, var(--bg-raised), var(--bg-panel));
+    color: var(--text-secondary);
+}
+
+.stream-card-badge {
+    position: absolute;
+    top: 7px;
+    right: 7px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent-emerald-bright);
+    background: rgba(4, 191, 138, 0.14);
+    border: 1px solid rgba(4, 191, 138, 0.28);
+    border-radius: 999px;
+    padding: 2px 6px;
+}
+
+.stream-card-name {
+    font-size: 12px;
+    color: var(--text-primary);
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+}
+
+.stream-card-meta {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-muted);
+}
+
+.stream-card--skeleton {
+    cursor: default;
+}
+
+.stream-card--skeleton .stream-card-poster {
+    border-style: dashed;
+    animation: stream-pulse 1.4s ease-in-out infinite;
+}
+
+.stream-skeleton-line {
+    height: 9px;
+    border-radius: 4px;
+    background: var(--bg-raised);
+    animation: stream-pulse 1.4s ease-in-out infinite;
+}
+
+.stream-skeleton-line.short {
+    width: 55%;
+}
+
+@keyframes stream-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 0.95; }
+}
+
+.stream-message {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    flex-grow: 1;
+    padding: 40px 20px;
+    text-align: center;
+    color: var(--text-secondary);
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-lg);
+}
+
+.stream-message--error {
+    color: var(--accent-red);
+    border-color: rgba(255, 107, 96, 0.35);
+}
+
+.stream-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    flex-grow: 1;
+    color: var(--text-muted);
+}

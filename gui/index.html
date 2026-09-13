@@ -33,6 +33,10 @@
                     <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
                     <span>Dashboard</span>
                 </a>
+                <a href="#" class="menu-item" onclick="switchTab('stream')">
+                    <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l7 4.5-7 4.5z"/></svg>
+                    <span>Stream</span>
+                </a>
                 <a href="#" class="menu-item" onclick="switchTab('completed')">
                     <svg viewBox="0 0 24 24" width="18" height="18" class="menu-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
                     <span>Completed</span>
@@ -264,6 +268,35 @@
                 </div>
             </div>
 
+            <!-- Stream View -->
+            <div class="tab-content hidden" id="stream-view">
+                <div class="stream-shell">
+                    <div class="stream-toolbar">
+                        <button class="stream-back-btn" id="stream-back-btn" onclick="StreamPage.goUp()"
+                                title="Up one level" aria-label="Up one level" style="display:none;">
+                            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+                        </button>
+                        <nav class="stream-breadcrumb" id="stream-breadcrumb" aria-label="Breadcrumb"></nav>
+                        <button class="btn btn-secondary btn-sm" id="stream-refresh-btn" onclick="StreamPage.refresh()">Refresh</button>
+                    </div>
+
+                    <div class="stream-hero">
+                        <div class="stream-hero-inner">
+                            <span class="stream-hero-kicker">Library</span>
+                            <h2 id="stream-hero-title">Your library</h2>
+                            <p id="stream-hero-sub">Browse your TorBox torrents as posters. No link is resolved until you open a file.</p>
+                        </div>
+                    </div>
+
+                    <div class="stream-body" id="stream-body">
+                        <div class="stream-loading">
+                            <div class="spinner"></div>
+                            <p>Reading folder…</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Completed View -->
             <div class="tab-content hidden" id="completed-view">
                 <div class="card full-width-card">
@@ -405,5 +438,6 @@
 
     <div id="toast-container" role="status" aria-live="polite"></div>
     <script src="app.js"></script>
+    <script src="stream.js"></script>
 </body>
 </html>
