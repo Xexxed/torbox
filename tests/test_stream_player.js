@@ -2,9 +2,10 @@
  *
  * Loads the real index.html into jsdom with a fake library and a fake resolve
  * endpoint, then drives the player: assert nothing is resolved while browsing,
- * that clicking a file resolves exactly that file, that a playable video gets a
- * proxied <video>, that an .mkv gets the unsupported-container panel instead,
- * that the image lightbox pages lazily, and that closing tears the media down.
+ * that clicking a file resolves exactly that file, that a natively playable
+ * video gets a proxied <video>, that a remuxable MKV also gets a <video> but
+ * with the no-seeking notice, that an unplayable codec gets the panel instead,
+ * that the image lightbox pages lazily, and that closing tears media down.
  *
  * Run from the repo root:
  *   NODE_PATH=<node workspace>/node_modules node tests/test_stream_player.js
@@ -31,14 +32,30 @@ const PLAYABLE_EXTS = ['mp4', 'm4v', 'webm', 'mov', 'ogg'];
 
 function classify(name) {
     const ext = String(name).split('.').pop().toLowerCase();
-    if (IMAGE_EXTS.includes(ext)) return { kind: 'image', playable: true };
-    if (PLAYABLE_EXTS.includes(ext)) return { kind: 'video', playable: true };
-    if (ext === 'txt') return { kind: 'other', playable: false };
-    return { kind: 'video', playable: false };
+    if (IMAGE_EXTS.includes(ext)) {
+        return { kind: 'image', playable: true, mode: 'direct' };
+    }
+    if (PLAYABLE_EXTS.includes(ext)) {
+        return { kind: 'video', playable: true, mode: 'direct' };
+    }
+    if (ext === 'txt') {
+        return { kind: 'other', playable: false, mode: 'direct' };
+    }
+    if (name === 'hevc.mkv') {
+        // Container is fine to swap, but the browser cannot decode HEVC.
+        return { kind: 'video', playable: false, mode: 'external',
+                 video_codec: 'hevc', audio_codec: 'dts' };
+    }
+    if (ext === 'mkv') {
+        // H.264 + AAC: remuxable, so it plays as a live conversion.
+        return { kind: 'video', playable: false, mode: 'remux',
+                 video_codec: 'h264', audio_codec: 'aac', duration: 5400 };
+    }
+    return { kind: 'video', playable: false, mode: 'external' };
 }
 
 function fakeEntry(name, isDir) {
-    const cls = isDir ? { kind: 'folder', playable: false } : classify(name);
+    const cls = isDir ? { kind: 'folder', playable: false, mode: 'direct' } : classify(name);
     return {
         name,
         is_dir: !!isDir,
@@ -54,6 +71,7 @@ const LIBRARY = {
     '/Torrent One': [
         fakeEntry('movie.mp4', false),
         fakeEntry('show.mkv', false),
+        fakeEntry('hevc.mkv', false),
         fakeEntry('a.jpg', false),
         fakeEntry('b.jpg', false),
         fakeEntry('c.jpg', false),
@@ -100,6 +118,10 @@ function buildDom() {
                 url: 'https://cdn.test/' + encodeURIComponent(name),
                 kind: cls.kind,
                 playable: cls.playable,
+                mode: cls.mode,
+                duration: cls.duration || null,
+                video_codec: cls.video_codec || null,
+                audio_codec: cls.audio_codec || null,
                 expires_at: Math.floor(Date.now() / 1000) + 1800,
             };
         } else if (target.includes('/api/status')) {
@@ -149,17 +171,19 @@ function key(window, doc, keyName) {
     check('drilling into a folder resolves nothing', resolvePaths.length === 0);
     check('overlay stays hidden while browsing', overlay.style.display === 'none');
 
-    // --- playable video -----------------------------------------------------
+    // --- natively playable video -------------------------------------------
+    let before = resolvePaths.length;
     cardByName(doc, 'movie.mp4').click();
     await tick();
 
     check('clicking a video resolves exactly that path',
-        resolvePaths.length === 1 && resolvePaths[0] === '/Torrent One/movie.mp4');
+        resolvePaths.length === before + 1 &&
+        resolvePaths[resolvePaths.length - 1] === '/Torrent One/movie.mp4');
 
-    const video = stage.querySelector('video');
+    let video = stage.querySelector('video');
     check('a playable video mounts a <video> element', !!video);
 
-    const videoSrc = video ? video.getAttribute('src') : '';
+    let videoSrc = video ? video.getAttribute('src') : '';
     check('video src is the same-origin content proxy',
         videoSrc.indexOf('/api/stream/content') === 0);
     check('video src carries the vfs path',
@@ -172,11 +196,13 @@ function key(window, doc, keyName) {
         doc.getElementById('stream-player-kind').textContent === 'Video');
     check('title shows the file name',
         doc.getElementById('stream-player-title').textContent === 'movie.mp4');
+    check('a directly playable video shows no notice',
+        stage.querySelector('.stream-player-notice') === null);
 
     // --- link actions -------------------------------------------------------
-    const openHref = doc.getElementById('stream-player-open').getAttribute('href');
+    check('Open in new tab points at the direct CDN link',
+        doc.getElementById('stream-player-open').getAttribute('href') === 'https://cdn.test/movie.mp4');
     const dlHref = doc.getElementById('stream-player-download').getAttribute('href');
-    check('Open in new tab points at the direct CDN link', openHref === 'https://cdn.test/movie.mp4');
     check('Download goes through the proxy with download=1',
         dlHref.includes('/api/stream/content') && dlHref.includes('download=1'));
 
@@ -189,23 +215,65 @@ function key(window, doc, keyName) {
     check('closing leaves no src behind', stage.innerHTML === '');
 
     // --- same file again is served from the link cache ----------------------
+    before = resolvePaths.length;
     cardByName(doc, 'movie.mp4').click();
     await tick();
-    check('re-opening the same file does not re-resolve', resolvePaths.length === 1);
+    check('re-opening the same file does not re-resolve', resolvePaths.length === before);
     doc.getElementById('stream-player-close').click();
     await tick();
     check('the close button also closes the overlay', overlay.style.display === 'none');
 
-    // --- non-playable container --------------------------------------------
+    // --- remuxable MKV ------------------------------------------------------
+    before = resolvePaths.length;
     cardByName(doc, 'show.mkv').click();
     await tick();
 
-    check('clicking the .mkv resolves it', resolvePaths.length === 2);
-    check('an .mkv does NOT mount a <video>', stage.querySelector('video') === null);
-    check('an .mkv shows the unsupported-container panel',
-        !!stage.querySelector('.stream-player-note'));
-    check('the panel explains the container',
-        stage.textContent.includes('cannot play in the browser'));
+    check('clicking the .mkv resolves it', resolvePaths.length === before + 1);
+    video = stage.querySelector('video');
+    check('a remuxable .mkv DOES mount a <video>', !!video);
+    check('a remuxable .mkv does not show the unsupported panel',
+        stage.querySelector('.stream-player-note') === null);
+    check('kind chip flags the remux',
+        doc.getElementById('stream-player-kind').textContent === 'Video · remuxed');
+
+    videoSrc = video ? video.getAttribute('src') : '';
+    check('the remuxed video uses the content proxy',
+        videoSrc.indexOf('/api/stream/content') === 0);
+    check('the remuxed video does NOT ask for raw mode',
+        !videoSrc.includes('raw='), 'the server decides the mode, not the client');
+    check('the remuxed video does not point at the CDN',
+        videoSrc.indexOf('cdn.test') === -1);
+
+    const notice = stage.querySelector('.stream-player-notice');
+    check('a remuxed video shows a notice', !!notice);
+    check('the notice explains the remux',
+        (notice ? notice.textContent : '').includes('Remuxed to MP4'));
+    check('the notice warns that seeking is unavailable',
+        (notice ? notice.textContent : '').toLowerCase().includes('seeking is unavailable'));
+    check('the notice names the codecs',
+        (notice ? notice.textContent : '').includes('H264') &&
+        (notice ? notice.textContent : '').includes('AAC'));
+    check('the notice reports the duration',
+        (notice ? notice.textContent : '').includes('1:30:00'));
+    check('the remuxed video still offers a download',
+        doc.getElementById('stream-player-download')
+            .getAttribute('href').includes('download=1'));
+
+    key(window, doc, 'Escape');
+    await tick();
+
+    // --- unplayable codec ---------------------------------------------------
+    before = resolvePaths.length;
+    cardByName(doc, 'hevc.mkv').click();
+    await tick();
+
+    check('clicking the HEVC file resolves it', resolvePaths.length === before + 1);
+    check('an HEVC file does NOT mount a <video>', stage.querySelector('video') === null);
+    check('an HEVC file shows the panel', !!stage.querySelector('.stream-player-note'));
+    check('the panel names the offending codec',
+        stage.textContent.includes('HEVC'));
+    check('the panel explains the codec is the problem',
+        stage.textContent.includes('codec cannot play'));
     check('the panel offers copy / open / download actions',
         !!stage.querySelector('[data-action="player-copy"]') &&
         !!stage.querySelector('[data-action="player-open"]') &&
@@ -213,14 +281,14 @@ function key(window, doc, keyName) {
     check('the panel download link uses the proxy with download=1',
         stage.querySelector('[data-action="player-download"]')
             .getAttribute('href').includes('download=1'));
-    check('kind chip flags the external container',
+    check('kind chip flags the external file',
         doc.getElementById('stream-player-kind').textContent === 'Video · external');
 
     key(window, doc, 'Escape');
     await tick();
 
     // --- image lightbox -----------------------------------------------------
-    const resolvesBeforeImages = resolvePaths.length;
+    before = resolvePaths.length;
     cardByName(doc, 'b.jpg').click();
     await tick();
 
@@ -231,7 +299,7 @@ function key(window, doc, keyName) {
     check('the image src carries the vfs path',
         decodeURIComponent(img.getAttribute('src')).includes('path=/Torrent One/b.jpg'));
     check('only the clicked image was resolved',
-        resolvePaths.length === resolvesBeforeImages + 1 &&
+        resolvePaths.length === before + 1 &&
         resolvePaths[resolvePaths.length - 1] === '/Torrent One/b.jpg');
     check('lightbox shows the counter for 3 images',
         (stage.querySelector('.stream-lightbox-counter') || {}).textContent === '2 / 3');
@@ -240,10 +308,11 @@ function key(window, doc, keyName) {
         !!stage.querySelector('[data-nav-dir="next"]'));
 
     // --- lazy paging --------------------------------------------------------
+    before = resolvePaths.length;
     stage.querySelector('[data-nav-dir="next"]').click();
     await tick();
     check('next resolves only the next image, lazily',
-        resolvePaths.length === resolvesBeforeImages + 2 &&
+        resolvePaths.length === before + 1 &&
         resolvePaths[resolvePaths.length - 1] === '/Torrent One/c.jpg');
     check('next advanced the counter',
         stage.querySelector('.stream-lightbox-counter').textContent === '3 / 3');
@@ -261,8 +330,6 @@ function key(window, doc, keyName) {
     await tick();
     check('arrow key wraps backwards to the last image',
         stage.querySelector('.stream-lightbox-counter').textContent === '3 / 3');
-
-    // --- images have no video player ---------------------------------------
     check('an image never mounts a <video>', stage.querySelector('video') === null);
 
     key(window, doc, 'Escape');

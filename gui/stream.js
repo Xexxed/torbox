@@ -330,7 +330,15 @@
         const record = {
             url: data.url,
             kind: data.kind || 'other',
+            // 'direct'   -- the browser plays the file as-is (seekable)
+            // 'remux'    -- Matroska-style container, relayed through FFmpeg
+            //               as fragmented MP4 (not seekable)
+            // 'external' -- neither; offer copy/download/open instead
+            mode: data.mode || (data.playable ? 'direct' : 'external'),
             playable: !!data.playable,
+            duration: typeof data.duration === 'number' ? data.duration : null,
+            video_codec: data.video_codec || null,
+            audio_codec: data.audio_codec || null,
             expires_at: data.expires_at || 0,
         };
         links.set(path, record);
@@ -417,9 +425,39 @@
         });
     }
 
-    function renderVideo(path, name, record) {
+    function formatDuration(seconds) {
+        if (!seconds || seconds <= 0) return '';
+        const total = Math.round(seconds);
+        const pad = (n) => (n < 10 ? '0' + n : String(n));
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const s = total % 60;
+        return h ? h + ':' + pad(m) + ':' + pad(s) : m + ':' + pad(s);
+    }
+
+    function remuxNotice(record) {
+        const codecs = [record.video_codec, record.audio_codec]
+            .filter(Boolean)
+            .map((c) => escapeHtml(String(c).toUpperCase()))
+            .join(' + ');
+        const parts = [
+            'Remuxed to MP4 on the fly' +
+            (codecs ? ' (' + codecs + ', copied without re-encoding)' : '') + '.',
+            'Seeking is unavailable, because a live conversion has no fixed length.',
+        ];
+        const duration = formatDuration(record.duration);
+        if (duration) parts.push('Runs about ' + duration + '.');
+        return parts.join(' ');
+    }
+
+    function renderVideo(path, name, record, options) {
         const stage = stageEl();
         if (!stage) return;
+        const opts = options || {};
+
+        const wrap = document.createElement('div');
+        wrap.className = 'stream-player-video';
+
         const video = document.createElement('video');
         video.className = 'stream-player-media';
         video.controls = true;
@@ -429,8 +467,17 @@
         video.setAttribute('controlsList', 'nodownload');
         attachRetry(video, path);
         video.src = contentUrl(path);
+        wrap.appendChild(video);
+
+        if (opts.notice) {
+            const note = document.createElement('p');
+            note.className = 'stream-player-notice';
+            note.innerHTML = opts.notice;
+            wrap.appendChild(note);
+        }
+
         stage.innerHTML = '';
-        stage.appendChild(video);
+        stage.appendChild(wrap);
     }
 
     function navButton(dir) {
@@ -478,20 +525,33 @@
         const ext = (String(name).split('.').pop() || '').toLowerCase();
         const icon = '<svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true">' +
             glyph(isVideo ? 'video' : 'other') + '</svg>';
-        const heading = isVideo
-            ? 'This container cannot play in the browser'
-            : 'No inline preview for this file type';
-        const detail = isVideo
-            ? 'Browsers only decode MP4, WebM, MOV and OGG natively. ' +
-              (ext ? (ext.toUpperCase() + ' needs transcoding, ') : 'This format needs transcoding, ') +
-              'which this server does not do — so the file is offered as a link instead.'
-            : 'Download it, or open the direct link in an app that handles this format.';
+
+        const codec = record.video_codec ? String(record.video_codec).toUpperCase() : '';
+        let heading;
+        let detail;
+
+        if (isVideo && codec && codec !== 'H264') {
+            // We probed the file, so we can name the real culprit.
+            heading = 'This video\'s codec cannot play in the browser';
+            detail = 'The video track is ' + escapeHtml(codec) + ', which browsers cannot decode. ' +
+                'Converting it would mean re-encoding, which this server deliberately does not do. ' +
+                'Download it and open it in a player like VLC.';
+        } else if (isVideo) {
+            heading = 'This container cannot play in the browser';
+            detail = 'Browsers only decode MP4, WebM, MOV and OGG natively. ' +
+                escapeHtml(ext ? ext.toUpperCase() : 'This format') +
+                ' needs re-encoding, which this server deliberately does not do. ' +
+                'Download it and open it in a player like VLC.';
+        } else {
+            heading = 'No inline preview for this file type';
+            detail = 'Download it, or open the direct link in an app that handles this format.';
+        }
 
         stage.innerHTML =
             '<div class="stream-player-note">' +
             '<div class="stream-player-note-icon">' + icon + '</div>' +
             '<h4>' + escapeHtml(heading) + '</h4>' +
-            '<p>' + escapeHtml(detail) + '</p>' +
+            '<p>' + detail + '</p>' +
             '<div class="stream-player-note-actions">' +
             '<button class="btn btn-secondary btn-sm" data-action="player-copy">Copy link</button>' +
             '<a class="btn btn-secondary btn-sm" data-action="player-open" target="_blank" rel="noopener noreferrer">Open in new tab</a>' +
@@ -513,7 +573,8 @@
             kindEl.textContent = record.kind === 'image'
                 ? 'Image'
                 : record.kind === 'video'
-                    ? (record.playable ? 'Video' : 'Video · external')
+                    ? (record.mode === 'direct' ? 'Video'
+                        : record.mode === 'remux' ? 'Video · remuxed' : 'Video · external')
                     : 'File';
         }
 
@@ -527,7 +588,10 @@
 
         if (record.kind === 'image') {
             renderImage(path, name, record);
-        } else if (record.kind === 'video' && record.playable) {
+        } else if (record.mode === 'remux') {
+            // Playable, but only as a live conversion: no seeking.
+            renderVideo(path, name, record, { notice: remuxNotice(record) });
+        } else if (record.kind === 'video' && record.mode === 'direct') {
             renderVideo(path, name, record);
         } else {
             renderUnsupported(path, name, record);

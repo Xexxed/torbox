@@ -2044,26 +2044,15 @@ input[type="checkbox"]:not(.switch-input) {
 }
 
 .stream-rail-track {
-    display: flex;
-    gap: 12px;
-    overflow-x: auto;
-    scroll-snap-type: x proximity;
-    padding-bottom: 6px;
-}
-
-.stream-rail-track::-webkit-scrollbar {
-    height: 8px;
-}
-
-.stream-rail-track::-webkit-scrollbar-thumb {
-    background: var(--border-strong);
-    border-radius: 4px;
+    display: grid;
+    /* auto-fill (not auto-fit) keeps the empty tracks, so a rail with two
+       items keeps normal-sized cards instead of stretching them. min() keeps
+       the track from overflowing a container narrower than one card. */
+    grid-template-columns: repeat(auto-fill, minmax(min(138px, 100%), 1fr));
+    gap: 16px 14px;
 }
 
 .stream-card {
-    scroll-snap-align: start;
-    flex: 0 0 auto;
-    width: 138px;
     display: flex;
     flex-direction: column;
     gap: 7px;
@@ -2301,6 +2290,31 @@ input[type="checkbox"]:not(.switch-input) {
     background: none;
     box-shadow: none;
     object-fit: contain;
+}
+
+/* A remuxed video carries a line of explanation underneath it. */
+.stream-player-video {
+    align-items: center;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 100%;
+    max-width: 100%;
+    min-height: 0;
+}
+
+.stream-player-video .stream-player-media {
+    flex: 0 1 auto;
+    min-height: 0;
+}
+
+.stream-player-notice {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0;
+    max-width: 660px;
+    text-align: center;
 }
 
 /* Unsupported container / no-preview panel */
