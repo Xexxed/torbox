@@ -249,7 +249,13 @@ class AppState:
         """Forget the shared VFS. Called when the session ends (logout/token
         expiry) so a stale tree cannot be served to a new session."""
         with self._vfs_lock:
+            vfs = self._vfs
             self._vfs = None
+        if vfs is not None:
+            try:
+                vfs.close_all_readers()
+            except Exception:
+                pass
 
     def clear_logs(self):
         with self.lock:

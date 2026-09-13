@@ -22,6 +22,51 @@ logger = logging.getLogger(__name__)
 
 _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
+# How long a resolved CDN link is reused before it is regenerated. Inherited
+# from the mount feature; see the plan's "CDN link TTL is an assumption" note.
+CDN_LINK_TTL_S = 1800
+
+# Bounds for the shared reader cache (one ChunkedRemoteReader per open file).
+# Consecutive HTTP range requests for the same file reuse the reader's in-RAM
+# chunk cache instead of refetching; idle readers are closed and evicted.
+DEFAULT_READER_CACHE_MAX = 4
+DEFAULT_READER_IDLE_TTL_S = 300
+
+# Media classification. "video"/"image" drive the Stream page's card kind;
+# only _BROWSER_PLAYABLE_EXTS can be decoded inline by a browser (the proxy
+# relays bytes but never transcodes, so e.g. mkv resolves to a download).
+_VIDEO_EXTS = frozenset({
+    "mkv", "mp4", "m4v", "webm", "mov", "avi", "ts", "m2ts",
+    "mpg", "mpeg", "wmv", "flv",
+})
+_IMAGE_EXTS = frozenset({
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "tiff", "tif", "heic",
+})
+_BROWSER_PLAYABLE_EXTS = frozenset({"mp4", "m4v", "webm", "mov", "ogg"})
+
+
+def _file_extension(name):
+    """Lower-cased extension without the dot; '' when there is none."""
+    text = str(name or "")
+    if "." not in text:
+        return ""
+    return text.rsplit(".", 1)[1].strip().lower()
+
+
+def classify_kind(name):
+    """Return 'video' | 'image' | 'other' for a filename."""
+    ext = _file_extension(name)
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _IMAGE_EXTS:
+        return "image"
+    return "other"
+
+
+def is_browser_playable(name):
+    """True only for containers a browser can decode natively."""
+    return _file_extension(name) in _BROWSER_PLAYABLE_EXTS
+
 
 def sanitize_fs_name(name):
     """Make a torrent/file name safe as a Windows path component."""
@@ -103,12 +148,20 @@ class TorrentDir(_DirBase):
 class TorboxVfs:
     """Read-only tree over scan_torrents()/fetch_structure()/link generation."""
 
-    def __init__(self, session):
+    def __init__(self, session, reader_cache_max=DEFAULT_READER_CACHE_MAX,
+                 reader_idle_ttl=DEFAULT_READER_IDLE_TTL_S):
         self._session = session
         self._lock = threading.RLock()
         self._torrents = {}                 # display name -> TorrentDir
         self.total_bytes = 0
         self.file_count = 0
+
+        # Bounded cache of open readers keyed by normalized vfs path, so a
+        # player's successive range requests share one chunk cache.
+        self._reader_lock = threading.RLock()
+        self._readers = {}                  # path -> {"reader", "last_used"}
+        self._reader_cache_max = max(1, int(reader_cache_max))
+        self._reader_idle_ttl = max(0.0, float(reader_idle_ttl))
 
     # --- population ---------------------------------------------------------
 
@@ -136,6 +189,8 @@ class TorboxVfs:
         return torrents
 
     def refresh(self):
+        # Drop open readers too: the tree they were resolved against is gone.
+        self.close_all_readers()
         with self._lock:
             self._torrents = {}
         return self.scan()
@@ -243,35 +298,75 @@ class TorboxVfs:
                 for name, child in node.children.items()
             ]
 
+    # --- link resolution ------------------------------------------------------
+
+    def resolve_link(self, path, force_refresh=False):
+        """Resolve (and cache) the CDN URL for a single file.
+
+        This is the only place a link is generated. Callers invoke it when a
+        user opens/acts on a specific file -- never while listing a folder --
+        which keeps the "no links resolved upfront" guarantee.
+        """
+        node = self._resolve(str(path))
+        if not isinstance(node, FileEntry):
+            raise VfsIsADirectory(f"Not a file: {path}")
+        return self._resolve_node_link(node, force_refresh)
+
+    def _resolve_node_link(self, node, force_refresh=False):
+        """Cached CDN link for a FileEntry. Reused by open_reader() so the
+        mount and the Stream page share one link cache."""
+        now = time.time()
+        if not force_refresh and node.cdn_url and now < node.cdn_url_expires:
+            return node.cdn_url
+
+        session = self._session
+        torrent = node.torrent
+
+        # The browser session can only hold one expanded torrent at a time, so
+        # re-expand when it is showing something else (or when forced).
+        current = getattr(session, "current_torrent_name", None)
+        if force_refresh or current != torrent.original_name:
+            try:
+                session.fetch_structure(torrent.original_name)
+            except Exception as e:
+                raise VfsError(
+                    f"Could not expand torrent '{torrent.original_name}': {e}") from e
+        try:
+            url = session.generate_download_link(node.name, node.size_str, node.selector)
+        except Exception as e:
+            raise VfsError(f"Link generation failed for '{node.name}': {e}") from e
+        if not url:
+            raise VfsError(f"No CDN link returned for '{node.name}'")
+        node.cdn_url = url
+        node.cdn_url_expires = time.time() + CDN_LINK_TTL_S
+        return url
+
+    # --- media classification -------------------------------------------------
+
+    @staticmethod
+    def classify_kind(name):
+        """'video' | 'image' | 'other' for a filename."""
+        return classify_kind(name)
+
+    @staticmethod
+    def is_browser_playable(name):
+        """True only for containers a browser can decode natively."""
+        return is_browser_playable(name)
+
+    # --- readers --------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_key(path):
+        return "/" + "/".join(p for p in str(path).replace("\\", "/").split("/") if p)
+
     def open_reader(self, path, chunk_size=None, cache_budget=None):
         """Open a file for zero-temp streaming via a ChunkedRemoteReader."""
         node = self._resolve(str(path))
         if not isinstance(node, FileEntry):
             raise VfsIsADirectory(f"Not a file: {path}")
 
-        session = self._session
-        torrent = node.torrent
-
         def url_provider(force_refresh=False):
-            now = time.time()
-            if not force_refresh and node.cdn_url and now < node.cdn_url_expires:
-                return node.cdn_url
-            current = getattr(session, "current_torrent_name", None)
-            if force_refresh or current != torrent.original_name:
-                try:
-                    session.fetch_structure(torrent.original_name)
-                except Exception as e:
-                    raise VfsError(
-                        f"Could not expand torrent '{torrent.original_name}': {e}") from e
-            try:
-                url = session.generate_download_link(node.name, node.size_str, node.selector)
-            except Exception as e:
-                raise VfsError(f"Link generation failed for '{node.name}': {e}") from e
-            if not url:
-                raise VfsError(f"No CDN link returned for '{node.name}'")
-            node.cdn_url = url
-            node.cdn_url_expires = time.time() + 1800  # cache 30 mins
-            return url
+            return self._resolve_node_link(node, force_refresh)
 
         kwargs = {}
         if chunk_size is not None:
@@ -279,3 +374,55 @@ class TorboxVfs:
         if cache_budget is not None:
             kwargs["cache_budget"] = cache_budget
         return ChunkedRemoteReader(node.size_bytes, url_provider, **kwargs)
+
+    def get_or_open_reader(self, path, chunk_size=None, cache_budget=None):
+        """Return a cached reader for `path`, opening one on first use.
+
+        A player issues many range requests for one file; reusing the reader
+        keeps its in-RAM chunk cache warm. The cache is bounded and idle
+        readers are closed.
+        """
+        key = self._normalize_key(path)
+        now = time.time()
+        with self._reader_lock:
+            self._evict_idle_readers(now)
+            entry = self._readers.get(key)
+            if entry is not None:
+                entry["last_used"] = now
+                return entry["reader"]
+
+            reader = self.open_reader(path, chunk_size=chunk_size, cache_budget=cache_budget)
+            self._readers[key] = {"reader": reader, "last_used": now}
+
+            # Bound the cache by least-recently-used eviction.
+            while len(self._readers) > self._reader_cache_max:
+                oldest = min(self._readers, key=lambda k: self._readers[k]["last_used"])
+                if oldest == key:
+                    break
+                self._close_reader_locked(oldest)
+            return reader
+
+    def _close_reader_locked(self, key):
+        entry = self._readers.pop(key, None)
+        if entry is not None:
+            try:
+                entry["reader"].close()
+            except Exception:
+                pass
+
+    def _evict_idle_readers(self, now):
+        if self._reader_idle_ttl <= 0:
+            return
+        stale = [k for k, e in self._readers.items()
+                 if now - e["last_used"] > self._reader_idle_ttl]
+        for key in stale:
+            self._close_reader_locked(key)
+
+    def close_reader(self, path):
+        with self._reader_lock:
+            self._close_reader_locked(self._normalize_key(path))
+
+    def close_all_readers(self):
+        with self._reader_lock:
+            for key in list(self._readers.keys()):
+                self._close_reader_locked(key)
