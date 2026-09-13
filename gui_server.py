@@ -82,7 +82,14 @@ def send_os_notification(title, message):
 class AppState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.fetch_lock = threading.Lock()  # Serialize fetch_structure browser launches
+        # One lock guards every browser-mutating operation (structure scrapes
+        # and link generation). It is held per operation, never for a whole
+        # download, so the Stream page and the download pipeline cannot corrupt
+        # each other's SPA state while still interleaving between files.
+        # `fetch_lock` is kept as an alias for existing call sites.
+        self.browser_op_lock = threading.Lock()
+        self.fetch_lock = self.browser_op_lock
+        self.browser_op_lock_timeout_s = 60.0
         self.token = ""
         self.email = ""
         self.dest_dir = "downloads"
@@ -164,6 +171,11 @@ class AppState:
                     if "mount_drive_letter" in data:
                         letter = str(data["mount_drive_letter"]).strip().upper().rstrip(":")
                         self.mount_drive_letter = letter if len(letter) == 1 and letter.isalpha() else ""
+                    if "browser_op_lock_timeout_s" in data:
+                        try:
+                            self.browser_op_lock_timeout_s = max(1.0, float(data["browser_op_lock_timeout_s"]))
+                        except (TypeError, ValueError):
+                            pass
             except Exception:
                 pass
 
@@ -179,7 +191,8 @@ class AppState:
                     "write_buffer_mb": self.write_buffer_mb,
                     "watch_mode": self.watch_mode,
                     "watch_interval": self.watch_interval,
-                    "mount_drive_letter": self.mount_drive_letter
+                    "mount_drive_letter": self.mount_drive_letter,
+                    "browser_op_lock_timeout_s": self.browser_op_lock_timeout_s
                 }, f)
         except Exception:
             pass
@@ -241,7 +254,11 @@ class AppState:
             current = self._vfs
             if current is None or getattr(current, "_session", None) is not session:
                 from torbox_downloader.mount.vfs import TorboxVfs
-                current = TorboxVfs(session)
+                current = TorboxVfs(
+                    session,
+                    browser_lock=self.browser_op_lock,
+                    browser_op_timeout=self.browser_op_lock_timeout_s,
+                )
                 self._vfs = current
             return current
 
@@ -493,7 +510,9 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             cancel_event=app_state.cancel_event,
             session=session,
             disk_profile=disk_profile,
-            buffer_mb=(write_buffer_mb or None)
+            buffer_mb=(write_buffer_mb or None),
+            browser_lock=app_state.browser_op_lock,
+            browser_op_timeout=app_state.browser_op_lock_timeout_s
         )
         app_state.set_status("finished")
         app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: All downloads finished successfully!")

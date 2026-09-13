@@ -7,6 +7,7 @@ import logging
 from torbox_downloader.detector import TorboxDetector
 from torbox_downloader.creator import create_folder_structure
 from torbox_downloader.downloader import download_file
+from torbox_downloader.browser_lock import DEFAULT_BROWSER_OP_TIMEOUT_S, browser_op
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +22,7 @@ except ImportError:
     logger.error("Playwright is not installed. Please run: pip install playwright && playwright install")
     sys.exit(1)
 
-def download_files_pipeline(session, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None, delay=0, parallel_connections=True, cancel_event=None, disk_profile="auto", buffer_mb=None):
+def download_files_pipeline(session, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None, delay=0, parallel_connections=True, cancel_event=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S):
     from threading import Lock, Semaphore, Thread
     from concurrent.futures import ThreadPoolExecutor
     import queue
@@ -146,7 +147,12 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
                     if cancel_event and cancel_event.is_set():
                         break
                     try:
-                        download_url = session.generate_download_link(name, size, selector)
+                        # Hold the shared browser lock for just this one link
+                        # generation so a Stream-page click can interleave
+                        # between files instead of waiting for the whole batch.
+                        with browser_op(browser_lock, browser_op_timeout,
+                                        "generate a download link"):
+                            download_url = session.generate_download_link(name, size, selector)
                         if download_url:
                             break
                     except Exception as e:
@@ -286,7 +292,7 @@ def get_torrent_files_structure(token, url, target_torrent_name, browser_type='c
         session.stop()
 
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None):
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S):
     """
     Runs the full automation workflow:
     1. Launches/uses TorboxBrowserSession.
@@ -333,7 +339,8 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
 
                     print(f"\n[{idx + 1}/{len(torrents)}] Expanding torrent: {torrent['name']}")
                     try:
-                        files = session.fetch_structure(torrent['name'])
+                        with browser_op(browser_lock, browser_op_timeout, "expand a torrent"):
+                            files = session.fetch_structure(torrent['name'])
                     except Exception as exp_err:
                         print(f"Could not expand torrent card: {exp_err}")
                         files = []
@@ -363,7 +370,9 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
                         parallel_connections=parallel_connections,
                         cancel_event=cancel_event,
                         disk_profile=disk_profile,
-                        buffer_mb=buffer_mb
+                        buffer_mb=buffer_mb,
+                        browser_lock=browser_lock,
+                        browser_op_timeout=browser_op_timeout
                     )
 
                     try:
@@ -434,7 +443,9 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             parallel_connections=parallel_connections,
             cancel_event=cancel_event,
             disk_profile=disk_profile,
-            buffer_mb=buffer_mb
+            buffer_mb=buffer_mb,
+            browser_lock=browser_lock,
+            browser_op_timeout=browser_op_timeout
         )
     finally:
         if local_session:

@@ -15,6 +15,10 @@ import re
 import threading
 import time
 
+from torbox_downloader.browser_lock import (
+    DEFAULT_BROWSER_OP_TIMEOUT_S,
+    browser_op,
+)
 from torbox_downloader.downloader import parse_size_to_bytes
 from torbox_downloader.mount.streaming import ChunkedRemoteReader
 
@@ -149,12 +153,19 @@ class TorboxVfs:
     """Read-only tree over scan_torrents()/fetch_structure()/link generation."""
 
     def __init__(self, session, reader_cache_max=DEFAULT_READER_CACHE_MAX,
-                 reader_idle_ttl=DEFAULT_READER_IDLE_TTL_S):
+                 reader_idle_ttl=DEFAULT_READER_IDLE_TTL_S,
+                 browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S):
         self._session = session
         self._lock = threading.RLock()
         self._torrents = {}                 # display name -> TorrentDir
         self.total_bytes = 0
         self.file_count = 0
+
+        # Shared lock guarding every browser-mutating operation. Injected by
+        # AppState so the mount, the Stream page and the downloader all
+        # serialize against each other; None means "own the browser outright".
+        self._browser_lock = browser_lock
+        self._browser_op_timeout = browser_op_timeout
 
         # Bounded cache of open readers keyed by normalized vfs path, so a
         # player's successive range requests share one chunk cache.
@@ -322,21 +333,26 @@ class TorboxVfs:
         session = self._session
         torrent = node.torrent
 
-        # The browser session can only hold one expanded torrent at a time, so
-        # re-expand when it is showing something else (or when forced).
-        current = getattr(session, "current_torrent_name", None)
-        if force_refresh or current != torrent.original_name:
+        # Expanding a torrent and generating its link must be atomic: another
+        # caller (the downloader, another stream click) could navigate the
+        # page in between and leave the row we want off-screen.
+        with browser_op(self._browser_lock, self._browser_op_timeout,
+                        "resolve a download link"):
+            # The browser session can only hold one expanded torrent at a
+            # time, so re-expand when it is showing something else.
+            current = getattr(session, "current_torrent_name", None)
+            if force_refresh or current != torrent.original_name:
+                try:
+                    session.fetch_structure(torrent.original_name)
+                except Exception as e:
+                    raise VfsError(
+                        f"Could not expand torrent '{torrent.original_name}': {e}") from e
             try:
-                session.fetch_structure(torrent.original_name)
+                url = session.generate_download_link(node.name, node.size_str, node.selector)
             except Exception as e:
-                raise VfsError(
-                    f"Could not expand torrent '{torrent.original_name}': {e}") from e
-        try:
-            url = session.generate_download_link(node.name, node.size_str, node.selector)
-        except Exception as e:
-            raise VfsError(f"Link generation failed for '{node.name}': {e}") from e
-        if not url:
-            raise VfsError(f"No CDN link returned for '{node.name}'")
+                raise VfsError(f"Link generation failed for '{node.name}': {e}") from e
+            if not url:
+                raise VfsError(f"No CDN link returned for '{node.name}'")
         node.cdn_url = url
         node.cdn_url_expires = time.time() + CDN_LINK_TTL_S
         return url
