@@ -2198,3 +2198,205 @@ input[type="checkbox"]:not(.switch-input) {
     flex-grow: 1;
     color: var(--text-muted);
 }
+
+/* ============================================================
+   Stream player — video, image lightbox and link actions
+   ============================================================ */
+
+.stream-player {
+    position: fixed;
+    inset: 0;
+    z-index: 1200;
+    display: flex;
+    flex-direction: column;
+    background: rgba(4, 7, 11, 0.94);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    opacity: 0;
+    transition: opacity 0.18s ease-out;
+}
+
+.stream-player.active {
+    opacity: 1;
+}
+
+.stream-player-bar {
+    align-items: center;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    flex-shrink: 0;
+    gap: 16px;
+    justify-content: space-between;
+    padding: 12px 18px;
+}
+
+.stream-player-heading {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+    min-width: 0;
+}
+
+.stream-player-kind {
+    background: var(--accent-emerald-dim);
+    border: 1px solid rgba(4, 191, 138, 0.3);
+    border-radius: 999px;
+    color: var(--accent-emerald-bright);
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    padding: 3px 9px;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.stream-player-kind:empty {
+    display: none;
+}
+
+.stream-player-title {
+    color: var(--text-primary);
+    font-size: 14.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.stream-player-actions {
+    align-items: center;
+    display: flex;
+    flex-shrink: 0;
+    gap: 8px;
+}
+
+/* .btn sets its own display, so the hidden attribute needs to win here. */
+.stream-player-actions [hidden],
+.stream-player-note-actions [hidden] {
+    display: none;
+}
+
+.stream-player-stage {
+    align-items: center;
+    display: flex;
+    flex-grow: 1;
+    justify-content: center;
+    min-height: 0;
+    overflow: hidden;
+    padding: 20px;
+}
+
+.stream-player-media {
+    background: #000;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-modal);
+    max-height: 100%;
+    max-width: 100%;
+}
+
+.stream-player-media--image {
+    background: none;
+    box-shadow: none;
+    object-fit: contain;
+}
+
+/* Unsupported container / no-preview panel */
+.stream-player-note {
+    align-items: center;
+    color: var(--text-secondary);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 440px;
+    text-align: center;
+}
+
+.stream-player-note h4 {
+    color: var(--text-primary);
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+}
+
+.stream-player-note p {
+    font-size: 13.5px;
+    line-height: 1.6;
+    margin: 0;
+}
+
+.stream-player-note-icon {
+    align-items: center;
+    background: var(--bg-raised);
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    color: var(--text-muted);
+    display: flex;
+    height: 66px;
+    justify-content: center;
+    width: 66px;
+}
+
+.stream-player-note-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    margin-top: 4px;
+}
+
+.stream-player-note--error {
+    color: var(--accent-red);
+}
+
+/* Image lightbox */
+.stream-lightbox {
+    align-items: center;
+    display: flex;
+    height: 100%;
+    justify-content: center;
+    position: relative;
+    width: 100%;
+}
+
+.stream-lightbox-nav {
+    align-items: center;
+    background: rgba(16, 21, 29, 0.82);
+    border: 1px solid var(--border-strong);
+    border-radius: 50%;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    height: 46px;
+    justify-content: center;
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    transition: background-color 0.15s ease-out, border-color 0.15s ease-out;
+    width: 46px;
+}
+
+.stream-lightbox-nav:hover {
+    background: var(--bg-raised);
+    border-color: var(--border-hover);
+}
+
+.stream-lightbox-nav--prev { left: 8px; }
+.stream-lightbox-nav--next { right: 8px; }
+
+.stream-lightbox-counter {
+    background: rgba(16, 21, 29, 0.82);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    bottom: 10px;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    left: 50%;
+    padding: 4px 12px;
+    position: absolute;
+    transform: translateX(-50%);
+}

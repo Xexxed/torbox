@@ -7,9 +7,14 @@ import threading
 import webbrowser
 import uuid
 import logging
+import mimetypes
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logger = logging.getLogger(__name__)
+
+# Size of each block written to the client by the Stream content proxy.
+STREAM_BLOCK_BYTES = 1024 * 1024
 
 
 def _fmt_speed(bps: float) -> str:
@@ -613,6 +618,126 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             message = "Your Torbox session token has expired or is invalid."
         return {"success": False, "error": message}
 
+    def _send_text(self, status, message):
+        body = str(message).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_range(range_header, size):
+        """Parse a single-range header. Returns (start, end) or None."""
+        match = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", range_header or "")
+        if not match:
+            return None
+        start_txt, end_txt = match.group(1), match.group(2)
+        if not start_txt and not end_txt:
+            return None
+        if start_txt:
+            start = int(start_txt)
+            end = int(end_txt) if end_txt else size - 1
+        else:
+            suffix = int(end_txt)          # "bytes=-N" = last N bytes
+            if suffix <= 0:
+                return None
+            start, end = max(0, size - suffix), size - 1
+        if start > end or start >= size:
+            return None
+        return start, min(end, size - 1)
+
+    def _handle_stream_content(self, head_only=False):
+        """Serve one file through the shared ChunkedRemoteReader.
+
+        Range requests are honored so the player can seek. The reader resolves
+        the CDN link lazily on its first read -- which only happens because the
+        user clicked the file, so listing a folder never resolves anything.
+        """
+        from urllib.parse import urlparse, parse_qs
+        query = parse_qs(urlparse(self.path).query)
+        raw_path = query.get("path", [""])[0] or ""
+        download = (query.get("download", ["0"])[0] or "0").lower() in ("1", "true", "yes")
+
+        try:
+            path = _clean_vfs_path(raw_path)
+        except ValueError as exc:
+            self._send_text(400, str(exc))
+            return
+
+        try:
+            vfs = app_state.get_vfs()
+            st = vfs.stat(path)
+        except Exception as exc:
+            if "session token has expired or is invalid" in str(exc):
+                app_state.handle_token_expired()
+            self._send_text(404, "File not found.")
+            return
+
+        if st is None:
+            self._send_text(404, "File not found.")
+            return
+        if st.get("is_dir"):
+            self._send_text(400, "Requested path is a directory, not a file.")
+            return
+
+        size = int(st.get("size") or 0)
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+        start, end, partial = 0, max(0, size - 1), False
+        range_header = self.headers.get("Range")
+        if range_header and size > 0:
+            parsed = self._parse_range(range_header, size)
+            if parsed is None:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            start, end = parsed
+            partial = True
+
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes" if size > 0 else "none")
+        self.send_header("Cache-Control", "no-store")
+        if download:
+            filename = path.rsplit("/", 1)[-1].replace('"', "")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        if size > 0:
+            self.send_header("Content-Length", str(max(0, end - start + 1)))
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if head_only:
+            return
+
+        try:
+            reader = vfs.get_or_open_reader(path)
+        except Exception as exc:
+            logger.warning(f"Stream open failed for {path!r}: {exc}")
+            return
+
+        remaining = (end - start + 1) if size > 0 else None
+        offset = start
+        try:
+            while remaining is None or remaining > 0:
+                want = STREAM_BLOCK_BYTES if remaining is None else min(STREAM_BLOCK_BYTES, remaining)
+                chunk = reader.read_range(offset, want)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                offset += len(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass            # client seeked away or closed the player
+        except Exception as exc:
+            logger.warning(f"Stream read failed for {path!r}: {exc}")
+
     def verify_api_key(self):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
@@ -651,6 +776,10 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "path": "/", "entries": entries})
             return
 
+        if self.path.startswith("/api/stream/content"):
+            self._handle_stream_content()
+            return
+
         # Serve static UI files from /gui subfolder
         target_path = self.path
         if target_path == "/" or target_path.startswith("/?"):
@@ -681,6 +810,18 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"404 Not Found")
+
+    def do_HEAD(self):
+        # Players probe length/type before requesting the body.
+        if self.path.startswith("/api/") and not self.verify_api_key():
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path.startswith("/api/stream/content"):
+            self._handle_stream_content(head_only=True)
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         if self.path.startswith("/api/"):
@@ -807,6 +948,32 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(self._stream_error(e))
                 return
             self._send_json({"success": True, "path": path, "entries": entries})
+            return
+
+        elif self.path.startswith("/api/stream/resolve"):
+            # The only place a file's CDN link is resolved, and only because
+            # the user clicked that file.
+            try:
+                path = _clean_vfs_path(params.get("path", ""))
+            except ValueError as e:
+                self._send_json({"success": False, "error": str(e)}, status=400)
+                return
+            try:
+                from torbox_downloader.mount.vfs import CDN_LINK_TTL_S
+                vfs = app_state.get_vfs()
+                url = vfs.resolve_link(path)
+                name = path.rsplit("/", 1)[-1]
+                payload = {
+                    "success": True,
+                    "url": url,
+                    "kind": vfs.classify_kind(name),
+                    "playable": vfs.is_browser_playable(name),
+                    "expires_at": time.time() + CDN_LINK_TTL_S,
+                }
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json(payload)
             return
 
         elif self.path.startswith("/api/stream/refresh"):

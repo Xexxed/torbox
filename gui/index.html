@@ -436,6 +436,26 @@
         </div>
     </div>
 
+    <!-- Stream playback overlay: video player, image lightbox, link actions -->
+    <div id="stream-player" class="stream-player" role="dialog" aria-modal="true"
+         aria-labelledby="stream-player-title" style="display: none;">
+        <div class="stream-player-bar">
+            <div class="stream-player-heading">
+                <span class="stream-player-kind" id="stream-player-kind"></span>
+                <h3 class="stream-player-title" id="stream-player-title"></h3>
+            </div>
+            <div class="stream-player-actions">
+                <button class="btn btn-secondary btn-sm" id="stream-player-copy"
+                        data-action="player-copy" hidden>Copy link</button>
+                <a class="btn btn-secondary btn-sm" id="stream-player-open" target="_blank"
+                   rel="noopener noreferrer" hidden>Open in new tab</a>
+                <a class="btn btn-secondary btn-sm" id="stream-player-download" hidden>Download</a>
+                <button class="close-modal" id="stream-player-close" aria-label="Close player" title="Close">&times;</button>
+            </div>
+        </div>
+        <div class="stream-player-stage" id="stream-player-stage"></div>
+    </div>
+
     <div id="toast-container" role="status" aria-live="polite"></div>
     <script src="app.js"></script>
     <script src="stream.js"></script>

@@ -168,6 +168,11 @@ class TorboxVfs:
         self._browser_lock = browser_lock
         self._browser_op_timeout = browser_op_timeout
 
+        # Per-file locks so two rapid clicks on one file coalesce into a single
+        # browser link generation instead of racing.
+        self._link_locks = {}               # path -> threading.Lock
+        self._link_locks_guard = threading.Lock()
+
         # Bounded cache of open readers keyed by normalized vfs path, so a
         # player's successive range requests share one chunk cache.
         self._reader_lock = threading.RLock()
@@ -377,7 +382,19 @@ class TorboxVfs:
         node = self._resolve(str(path))
         if not isinstance(node, FileEntry):
             raise VfsIsADirectory(f"Not a file: {path}")
-        return self._resolve_node_link(node, force_refresh)
+        # Serialize per file: a second click waits, then hits the link cache.
+        with self._link_lock_for(self._normalize_key(path)):
+            return self._resolve_node_link(node, force_refresh)
+
+    def _link_lock_for(self, key):
+        with self._link_locks_guard:
+            lock = self._link_locks.get(key)
+            if lock is None:
+                if len(self._link_locks) > 512:
+                    self._link_locks.clear()
+                lock = threading.Lock()
+                self._link_locks[key] = lock
+            return lock
 
     def _resolve_node_link(self, node, force_refresh=False):
         """Cached CDN link for a FileEntry. Reused by open_reader() so the
