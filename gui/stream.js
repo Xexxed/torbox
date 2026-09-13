@@ -335,6 +335,9 @@
             //               as fragmented MP4 (not seekable)
             // 'external' -- neither; offer copy/download/open instead
             mode: data.mode || (data.playable ? 'direct' : 'external'),
+            // Why the mode was chosen, so the panel can name the real cause:
+            // 'native' | 'remuxable' | 'codec' | 'no-ffmpeg' | 'unprobeable'
+            reason: data.reason || null,
             playable: !!data.playable,
             duration: typeof data.duration === 'number' ? data.duration : null,
             video_codec: data.video_codec || null,
@@ -527,24 +530,50 @@
             glyph(isVideo ? 'video' : 'other') + '</svg>';
 
         const codec = record.video_codec ? String(record.video_codec).toUpperCase() : '';
+        const audio = record.audio_codec ? String(record.audio_codec).toUpperCase() : '';
+        // The server tells us *why* this file landed on the external panel.
+        // Falling back to "we have a codec" keeps an older server readable.
+        const reason = record.reason || (codec ? 'codec' : null);
+        const container = escapeHtml(ext ? ext.toUpperCase() : 'This format');
         let heading;
         let detail;
 
-        if (isVideo && codec && codec !== 'H264') {
-            // We probed the file, so we can name the real culprit.
-            heading = 'This video\'s codec cannot play in the browser';
-            detail = 'The video track is ' + escapeHtml(codec) + ', which browsers cannot decode. ' +
-                'Converting it would mean re-encoding, which this server deliberately does not do. ' +
-                'Download it and open it in a player like VLC.';
-        } else if (isVideo) {
-            heading = 'This container cannot play in the browser';
-            detail = 'Browsers only decode MP4, WebM, MOV and OGG natively. ' +
-                escapeHtml(ext ? ext.toUpperCase() : 'This format') +
-                ' needs re-encoding, which this server deliberately does not do. ' +
-                'Download it and open it in a player like VLC.';
-        } else {
+        if (!isVideo) {
             heading = 'No inline preview for this file type';
             detail = 'Download it, or open the direct link in an app that handles this format.';
+        } else if (reason === 'codec' && codec) {
+            // The probe ran, so name the real culprit: it is the codec, not the
+            // container. Swapping containers would not help, and saying "MKV
+            // needs re-encoding" would point the user at the wrong thing.
+            const named = codec === 'HEVC' ? 'HEVC (H.265)' : escapeHtml(codec);
+            heading = 'This video\'s codec cannot play in the browser';
+            detail = 'The video track is ' + escapeHtml(codec) +
+                (audio ? ' with ' + escapeHtml(audio) + ' audio' : '') +
+                ', and browsers cannot decode ' + named + '. Remuxing copies the codecs ' +
+                'unchanged, so it cannot rescue this file — playing it would need a full ' +
+                're-encode, which this server deliberately does not do. ' +
+                'Download it and open it in a player like VLC.';
+        } else if (reason === 'no-ffmpeg') {
+            heading = 'FFmpeg is not available';
+            detail = container + ' files have to be remuxed before a browser will take them, ' +
+                'and the server could not find <code>ffmpeg</code> and <code>ffprobe</code> on ' +
+                'its PATH. Install FFmpeg and restart the app, or download the file and open ' +
+                'it in a player like VLC.';
+        } else if (reason === 'unprobeable') {
+            heading = 'Could not read this file';
+            detail = 'The server could not inspect ' + container + '\'s streams, so it cannot ' +
+                'tell whether they are browser-safe. That usually means a stale link or an ' +
+                'unusual container. Download it and open it in a player like VLC.';
+        } else if (reason === 'codec') {
+            heading = 'This video\'s codec cannot play in the browser';
+            detail = container + ' holds a codec browsers cannot decode. Playing it would need ' +
+                'a full re-encode, which this server deliberately does not do. ' +
+                'Download it and open it in a player like VLC.';
+        } else {
+            heading = 'This container cannot play in the browser';
+            detail = 'Browsers only decode MP4, WebM, MOV and OGG natively. ' + container +
+                ' needs re-encoding, which this server deliberately does not do. ' +
+                'Download it and open it in a player like VLC.';
         }
 
         stage.innerHTML =
@@ -570,11 +599,16 @@
         const kindEl = $('stream-player-kind');
         if (title) title.textContent = name;
         if (kindEl) {
+            // When a file cannot play inline, naming the codec is far more
+            // useful than a generic "external" badge.
             kindEl.textContent = record.kind === 'image'
                 ? 'Image'
                 : record.kind === 'video'
                     ? (record.mode === 'direct' ? 'Video'
-                        : record.mode === 'remux' ? 'Video · remuxed' : 'Video · external')
+                        : record.mode === 'remux' ? 'Video · remuxed'
+                            : record.video_codec
+                                ? 'Video · ' + String(record.video_codec).toUpperCase()
+                                : 'Video · external')
                     : 'File';
         }
 

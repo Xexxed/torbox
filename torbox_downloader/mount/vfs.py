@@ -483,38 +483,68 @@ class TorboxVfs:
                 self._probes[key] = info
         return info
 
-    def media_mode(self, path):
-        """How `path` should be played.
+    def playback_plan(self, path):
+        """Decide how `path` should be played, and carry the evidence back.
 
-        'direct'   -- the browser decodes the file as it is, so the range proxy
-                      serves it and seeking works normally.
-        'remux'    -- a container the browser cannot read, but whose codecs
-                      survive a swap to fragmented MP4, so FFmpeg can relay it
-                      without re-encoding. No seeking.
-        'external' -- neither: the UI offers copy / download / open instead.
+        Returns `{"mode": ..., "reason": ..., "info": ...}`.
+
+        mode:
+          'direct'   -- the browser decodes the file as it is, so the range
+                        proxy serves it and seeking works normally.
+          'remux'    -- a container the browser cannot read, but whose codecs
+                        survive a swap to fragmented MP4, so FFmpeg can relay it
+                        without re-encoding. No seeking.
+          'external' -- neither: the UI offers copy / download / open instead.
+
+        reason -- the *cause*, so the UI can explain itself instead of showing
+        one catch-all message. This matters because "the container is odd" and
+        "the codec is HEVC" and "ffmpeg is missing" need three different
+        answers from the user's point of view:
+          'native'      the browser decodes this container as-is
+          'remuxable'   a container swap keeps the codecs playable
+          'codec'       probed successfully, but the codecs are not browser-safe
+          'no-ffmpeg'   ffmpeg/ffprobe are not installed, so we cannot know
+          'unprobeable' the probe failed (dead link, or a container ffprobe
+                        cannot read)
+
+        info -- the raw probe result when one was taken, else None. It is
+        returned rather than re-read from the cache so that the caller and the
+        decision can never disagree about what was measured.
         """
         name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
         kind = classify_kind(name)
 
-        if kind != "video":
-            return "direct"
-        if is_browser_playable(name):
-            return "direct"
+        if kind != "video" or is_browser_playable(name):
+            return {"mode": "direct", "reason": "native", "info": None}
         if not remux.available():
-            return "external"
-        return "remux" if remux.can_remux(self.probe_media(path)) else "external"
+            return {"mode": "external", "reason": "no-ffmpeg", "info": None}
+
+        info = self.probe_media(path)
+        if info is None:
+            return {"mode": "external", "reason": "unprobeable", "info": None}
+        if remux.can_remux(info):
+            return {"mode": "remux", "reason": "remuxable", "info": info}
+        return {"mode": "external", "reason": "codec", "info": info}
+
+    def media_mode(self, path):
+        """'direct' / 'remux' / 'external' -- see `playback_plan` for the why."""
+        return self.playback_plan(path)["mode"]
 
     def playback_info(self, path):
         """Everything the UI needs to pick a player for `path`."""
         name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
-        mode = self.media_mode(path)
-        info = self.probe_media(path) if mode == "remux" else None
+        plan = self.playback_plan(path)
+        # Naming the codec is what turns a useless "this container cannot play"
+        # into "the video track is HEVC" -- the probe already ran, so discarding
+        # its result would only hide the real cause from the user.
+        info = plan["info"] or {}
         return {
             "kind": classify_kind(name),
-            "mode": mode,
-            "duration": (info or {}).get("duration"),
-            "video_codec": (info or {}).get("video"),
-            "audio_codec": (info or {}).get("audio"),
+            "mode": plan["mode"],
+            "reason": plan["reason"],
+            "duration": info.get("duration"),
+            "video_codec": info.get("video"),
+            "audio_codec": info.get("audio"),
         }
 
     # --- readers --------------------------------------------------------------

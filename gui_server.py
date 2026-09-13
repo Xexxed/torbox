@@ -1092,6 +1092,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     "url": url,
                     "kind": info["kind"],
                     "mode": info["mode"],
+                    "reason": info["reason"],
                     "playable": info["mode"] == "direct",
                     "duration": info["duration"],
                     "video_codec": info["video_codec"],

@@ -69,6 +69,13 @@ reader with an in-RAM chunk cache. That gives the browser working seeking via HT
 | `remux` | A container browsers cannot read, holding codecs they can — H.264 video with AAC or MP3 audio | Fragmented MP4 produced live by FFmpeg, copied without re-encoding. |
 | `external` | Everything else — HEVC, DTS, TrueHD, … | A panel with **Copy link**, **Open in new tab** and **Download**, to hand to VLC or a download manager. |
 
+**The external panel names the cause.** "This container cannot play" is not always the
+truth — a `.mkv` holding HEVC is refused because of its *codec*, and a `.mkv` on a machine
+without FFmpeg is refused because the server cannot remux it. Those need different fixes,
+so the panel distinguishes them: it names the offending codec (HEVC, DTS, …) and explains
+that remuxing copies codecs unchanged and therefore cannot rescue such a file. The kind
+chip does the same, reading `Video · HEVC` rather than a generic `Video · external`.
+
 **Remuxing, not transcoding.** The browser's only problem with a typical scene-release MKV
 is the *container*; the H.264 and AAC inside it are already playable. So FFmpeg is asked to
 `-c copy` those streams into fragmented MP4 and write it to stdout, which the server relays

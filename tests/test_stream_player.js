@@ -43,12 +43,20 @@ function classify(name) {
     }
     if (name === 'hevc.mkv') {
         // Container is fine to swap, but the browser cannot decode HEVC.
-        return { kind: 'video', playable: false, mode: 'external',
+        return { kind: 'video', playable: false, mode: 'external', reason: 'codec',
                  video_codec: 'hevc', audio_codec: 'dts' };
+    }
+    if (name === 'noffmpeg.mkv') {
+        // No ffprobe, so the server cannot even learn the codec.
+        return { kind: 'video', playable: false, mode: 'external', reason: 'no-ffmpeg' };
+    }
+    if (name === 'broken.mkv') {
+        // Probed, but the probe itself failed.
+        return { kind: 'video', playable: false, mode: 'external', reason: 'unprobeable' };
     }
     if (ext === 'mkv') {
         // H.264 + AAC: remuxable, so it plays as a live conversion.
-        return { kind: 'video', playable: false, mode: 'remux',
+        return { kind: 'video', playable: false, mode: 'remux', reason: 'remuxable',
                  video_codec: 'h264', audio_codec: 'aac', duration: 5400 };
     }
     return { kind: 'video', playable: false, mode: 'external' };
@@ -72,6 +80,8 @@ const LIBRARY = {
         fakeEntry('movie.mp4', false),
         fakeEntry('show.mkv', false),
         fakeEntry('hevc.mkv', false),
+        fakeEntry('noffmpeg.mkv', false),
+        fakeEntry('broken.mkv', false),
         fakeEntry('a.jpg', false),
         fakeEntry('b.jpg', false),
         fakeEntry('c.jpg', false),
@@ -119,6 +129,7 @@ function buildDom() {
                 kind: cls.kind,
                 playable: cls.playable,
                 mode: cls.mode,
+                reason: cls.reason || null,
                 duration: cls.duration || null,
                 video_codec: cls.video_codec || null,
                 audio_codec: cls.audio_codec || null,
@@ -281,8 +292,40 @@ function key(window, doc, keyName) {
     check('the panel download link uses the proxy with download=1',
         stage.querySelector('[data-action="player-download"]')
             .getAttribute('href').includes('download=1'));
-    check('kind chip flags the external file',
-        doc.getElementById('stream-player-kind').textContent === 'Video · external');
+    check('kind chip names the offending codec',
+        doc.getElementById('stream-player-kind').textContent === 'Video · HEVC');
+    check('the HEVC panel says remuxing cannot rescue it',
+        stage.textContent.includes('Remuxing copies the codecs'));
+
+    key(window, doc, 'Escape');
+    await tick();
+
+    // --- missing ffmpeg -----------------------------------------------------
+    // A different cause needs a different message: the fix here is "install
+    // FFmpeg", not "your codec is unsupported". Collapsing both into one
+    // catch-all panel is exactly the bug this covers.
+    before = resolvePaths.length;
+    cardByName(doc, 'noffmpeg.mkv').click();
+    await tick();
+
+    check('clicking the no-ffmpeg file resolves it', resolvePaths.length === before + 1);
+    check('a no-ffmpeg file mounts no <video>', stage.querySelector('video') === null);
+    check('the panel blames FFmpeg, not the codec',
+        stage.textContent.includes('FFmpeg is not available'));
+    check('the no-ffmpeg panel says how to fix it',
+        stage.textContent.includes('Install FFmpeg'));
+
+    key(window, doc, 'Escape');
+    await tick();
+
+    // --- unreadable file ----------------------------------------------------
+    before = resolvePaths.length;
+    cardByName(doc, 'broken.mkv').click();
+    await tick();
+
+    check('an unprobeable file mounts no <video>', stage.querySelector('video') === null);
+    check('the panel admits it could not read the file',
+        stage.textContent.includes('Could not read this file'));
 
     key(window, doc, 'Escape');
     await tick();

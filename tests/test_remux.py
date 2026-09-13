@@ -280,6 +280,67 @@ class TestMediaMode(unittest.TestCase):
         vfs.refresh()
         self.assertEqual(vfs._probes, {})
 
+    # --- the reason, which the UI needs in order to explain itself ----------
+
+    def test_reason_native_for_a_playable_container(self):
+        vfs, session = self._vfs("movie.mp4")
+        plan = vfs.playback_plan("/T/movie.mp4")
+        self.assertEqual((plan["mode"], plan["reason"]), ("direct", "native"))
+        self.assertIsNone(plan["info"])
+        self.assertEqual(session.generated, [], "a direct file must never be probed")
+
+    def test_reason_remuxable(self):
+        vfs, _session = self._vfs("movie.mkv")
+        vfs.probe_media = lambda path, force=False: {
+            "video": "h264", "audio": "aac", "duration": 10.0}
+        self.assertEqual(vfs.playback_plan("/T/movie.mkv")["reason"], "remuxable")
+
+    def test_reason_codec_when_the_codec_is_the_problem(self):
+        vfs, _session = self._vfs("movie.mkv")
+        vfs.probe_media = lambda path, force=False: {
+            "video": "hevc", "audio": "dts", "duration": 10.0}
+        self.assertEqual(vfs.playback_plan("/T/movie.mkv")["reason"], "codec")
+
+    def test_reason_no_ffmpeg_without_ffmpeg(self):
+        vfs, _session = self._vfs("movie.mkv")
+        original = remux.available
+        remux.available = lambda: False
+        try:
+            self.assertEqual(vfs.playback_plan("/T/movie.mkv")["reason"], "no-ffmpeg")
+        finally:
+            remux.available = original
+
+    def test_reason_unprobeable_when_the_probe_fails(self):
+        vfs, _session = self._vfs("movie.mkv")
+        vfs.probe_media = lambda path, force=False: None
+        self.assertEqual(vfs.playback_plan("/T/movie.mkv")["reason"], "unprobeable")
+
+    def test_external_verdict_still_reports_the_codec(self):
+        """Regression: the probe ran, so its result must reach the UI.
+
+        The whole point of the codec-aware panel is that a user with an HEVC
+        library learns *why* the file will not play. Dropping the probe result
+        on the 'external' path left them with a generic "this container cannot
+        play" message that named the wrong culprit entirely.
+        """
+        vfs, _session = self._vfs("movie.mkv")
+        vfs.probe_media = lambda path, force=False: {
+            "video": "hevc", "audio": "dts", "duration": 1234.0}
+        info = vfs.playback_info("/T/movie.mkv")
+        self.assertEqual(info["mode"], "external")
+        self.assertEqual(info["reason"], "codec")
+        self.assertEqual(info["video_codec"], "hevc")
+        self.assertEqual(info["audio_codec"], "dts")
+        self.assertEqual(info["duration"], 1234.0)
+
+    def test_direct_file_is_not_probed_by_playback_info(self):
+        """A playable mp4 must not pay for an ffprobe it does not need."""
+        vfs, session = self._vfs("movie.mp4")
+        info = vfs.playback_info("/T/movie.mp4")
+        self.assertEqual(info["mode"], "direct")
+        self.assertIsNone(info["video_codec"])
+        self.assertEqual(session.generated, [], "resolving a link here is wasted work")
+
 
 # ---------------------------------------------------------------------------
 # 3. End to end

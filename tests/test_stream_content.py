@@ -38,6 +38,11 @@ class TestResolveEndpoint(unittest.TestCase):
         self.assertTrue(body["url"].startswith("http"))
         self.assertEqual(body["kind"], "video")
         self.assertFalse(body["playable"])          # mkv is not browser-playable
+        # The UI needs the *cause*, not just the verdict. Which one it is
+        # depends on whether ffmpeg is installed, so only the vocabulary is
+        # pinned here.
+        self.assertIn(body["reason"],
+                      {"native", "remuxable", "codec", "no-ffmpeg", "unprobeable"})
         self.assertIn("expires_at", body)
         self.assertEqual(len(session.generated), 1)
 
@@ -50,6 +55,9 @@ class TestResolveEndpoint(unittest.TestCase):
         body = r.json()
         self.assertTrue(body["playable"])
         self.assertEqual(body["kind"], "video")
+        # An mp4 is never probed, so this one is deterministic.
+        self.assertEqual(body["reason"], "native")
+        self.assertEqual(body["mode"], "direct")
 
     def test_resolve_rejects_traversal(self):
         vfs, _session = make_vfs()
