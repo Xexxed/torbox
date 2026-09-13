@@ -18,8 +18,10 @@ Optional, Windows only: `winfspy` plus the WinFsp driver, needed for the native 
 mount. Without it the app falls back to WebDAV over `net use`.
 
 Optional: **FFmpeg** — both `ffmpeg` and `ffprobe` on `PATH` — enables on-the-fly remuxing
-in the Stream tab, so MKV and friends can play in the browser. Without it those files
-fall back to the external-player panel. Nothing else in the app depends on it.
+and transcoding in the Stream tab, so MKV and HEVC files can play in the browser. Without
+it those files fall back to the external-player panel. A hardware H.264 encoder
+(NVENC / Quick Sync / AMF) is used when one actually works, and `libx264` otherwise.
+Nothing else in the app depends on FFmpeg.
 
 ## Running
 
@@ -66,35 +68,53 @@ reader with an in-RAM chunk cache. That gives the browser working seeking via HT
 | Mode | When it is chosen | What you get |
 |---|---|---|
 | `direct` | A container browsers decode — MP4, WebM, MOV, OGG | A normal `<video>`, proxied with byte ranges, so seeking works. |
-| `remux` | A container browsers cannot read, holding codecs they can — H.264 video with AAC or MP3 audio | Fragmented MP4 produced live by FFmpeg, copied without re-encoding. |
-| `external` | Everything else — HEVC, DTS, TrueHD, … | A panel with **Copy link**, **Open in new tab** and **Download**, to hand to VLC or a download manager. |
+| `remux` | A container browsers cannot read, holding codecs they can — H.264 video with AAC or MP3 audio | Fragmented MP4 produced live by FFmpeg, copied without re-encoding. Free. |
+| `external` | Everything else — HEVC, DTS, TrueHD, … | A panel explaining the real cause, plus a **Transcode & play** button when a re-encode is possible. |
 
-**Remuxing, not transcoding.** The browser's only problem with a typical scene-release MKV
-is the *container*; the H.264 and AAC inside it are already playable. So FFmpeg is asked to
-`-c copy` those streams into fragmented MP4 and write it to stdout, which the server relays
-straight to the client. There is no encode, so the CPU cost is negligible and playback
-starts in well under a second. Files whose codecs are not browser-safe are **not**
-re-encoded — that would burn CPU for a quality loss, and it is a deliberate non-goal.
+**The external panel names the cause.** "This container cannot play" is not always the
+truth — a `.mkv` holding HEVC is refused because of its *codec*, and a `.mkv` on a machine
+without FFmpeg is refused because the server cannot remux it. Those need different fixes,
+so the panel distinguishes them and names the offending codec. The kind chip does the same,
+reading `Video · HEVC` rather than a generic `Video · external`.
 
-**A remuxed stream cannot be seeked.** Because it is a live conversion rather than a file,
-its length is unknown, so the server sends no `Content-Length` and `Accept-Ranges: none`.
-The player shows a notice saying so and reports the source duration separately. The content
+**Remuxing, not transcoding, is the default.** The browser's only problem with a typical
+scene-release MKV is the *container*; the H.264 and AAC inside it are already playable. So
+FFmpeg is asked to `-c copy` those streams into fragmented MP4 and write it to stdout, which
+the server relays straight to the client. There is no encode, so the CPU cost is negligible
+and playback starts in well under a second.
+
+**Transcoding is the last resort, and it is opt-in.** A modern x265 release is HEVC, which
+browsers do not decode reliably — and a remux cannot help, because it copies codecs
+unchanged. For those files the panel offers **Transcode & play**, which re-encodes to H.264
+and AAC live. This is the only operation in the app that costs real CPU or GPU time, so it
+never starts on its own: opening a file is always free, and a click is what starts an
+encode. The encoder is chosen by actually *testing* each candidate with a one-frame encode
+rather than trusting `ffmpeg -encoders`, because a build lists `h264_nvenc` whether or not
+the machine has an NVIDIA card. Output is pinned to 8-bit `yuv420p`, since 10-bit HEVC is
+the common case and 10-bit H.264 would be a correct re-encode no browser would play.
+
+**Neither conversion can be seeked.** Both are live conversions rather than files, so the
+length is unknown: the server sends no `Content-Length` and `Accept-Ranges: none`. The
+player shows a notice saying so, and reports the source duration separately. The content
 endpoint still accepts a `start` offset, so a resume point can be passed in — the player
 just has no scrubber to drive it.
 
 **Nothing is written to disk.** No temp file, no cache directory, no partial copy. Media
-bytes travel from the CDN through the reader to the socket — and the remux path is no
-different: FFmpeg pipes fragmented MP4 to stdout instead of a file.
+bytes travel from the CDN through the reader to the socket — and the conversion paths are
+no different: FFmpeg pipes fragmented MP4 to stdout instead of a file.
 
 ### Behaviour worth knowing
 
 - Closing the player (Escape, the close button, or clicking the backdrop) tears the media
-  element down immediately and the server stops reading. For a remuxed file that also
-  reaps the FFmpeg process.
+  element down immediately and the server stops reading. For a converted file that also
+  reaps the FFmpeg process, so a closed player never leaves an encoder running.
 - FFmpeg reads from the app's own content endpoint rather than the CDN URL, so a CDN link
-  expiring mid-playback is handled by the reader's automatic re-resolve.
+  expiring mid-playback is handled by the reader's automatic re-resolve. A two-hour film
+  keeps streaming past the link's ~30-minute life.
 - If FFmpeg produces nothing for 45 seconds the server kills it, so a stalled CDN read
   cannot leave an orphaned process holding a socket.
+- The encoder is probed once at startup in the background, so the first click on a
+  **Transcode & play** button does not wait for the detection to finish.
 - The image lightbox pages between the images in the current folder with the arrow keys.
   Each page resolves only the image it moves to.
 - If a link has gone stale, one forced re-resolve and retry happens automatically.
@@ -127,11 +147,13 @@ NODE_PATH=<node_modules> node tests/test_stream_player.js
 `tests/test_integration.py` additionally requires Playwright to be importable; the rest of
 the suite runs without it.
 
-`tests/test_remux.py` covers the remux path — codec rules, probe parsing, command
-construction, the mode decision, and a real end-to-end remux. Its end-to-end class needs
-FFmpeg and skips itself without it: it builds an actual H.264/AAC MKV with `lavfi`, serves
-it from a loopback range server, and asserts the output carries an `ftyp` box and probes
-back as MP4.
+`tests/test_remux.py` covers both conversion paths — codec rules, probe parsing, command
+construction, encoder preference and the playback plan, then two real end-to-end runs. Its
+end-to-end classes need FFmpeg and skip without it: they build an actual H.264/AAC MKV and
+an actual 10-bit HEVC/AC3 MKV with `lavfi`, serve them from a loopback range server, and
+assert the outputs carry an `ftyp` box and probe back as H.264 + AAC at 8-bit. One test
+exists purely to check that the endpoint does **not** transcode when it was not asked to,
+since the entire cost model depends on that.
 
 `tests/test_stream_layout.py` reads the stylesheet as text and pins the poster-rail grid
 rules, so the rail cannot silently regress to a single horizontal band.

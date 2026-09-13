@@ -280,6 +280,7 @@
         siblings: null,        // [{ name, path }] for the image lightbox
         index: -1,
         retried: false,
+        transcode: false,      // true when this playback is a re-encode
     };
 
     function apiKey() {
@@ -302,6 +303,9 @@
         const key = apiKey();
         if (key) url += '&api_key=' + encodeURIComponent(key);
         if (opts.download) url += '&download=1';
+        // Re-encoding costs real CPU, so it never happens unless the request
+        // says so -- the flag travels only from the user's click.
+        if (opts.transcode) url += '&transcode=1';
         return url;
     }
 
@@ -335,7 +339,13 @@
             //               as fragmented MP4 (not seekable)
             // 'external' -- neither; offer copy/download/open instead
             mode: data.mode || (data.playable ? 'direct' : 'external'),
+            // Why the mode was chosen, so the panel can name the real cause:
+            // 'native' | 'remuxable' | 'codec' | 'no-ffmpeg' | 'unprobeable'
+            reason: data.reason || null,
             playable: !!data.playable,
+            // A re-encode is the last resort for a file the browser refuses.
+            can_transcode: !!data.can_transcode,
+            transcode_encoder: data.transcode_encoder || null,
             duration: typeof data.duration === 'number' ? data.duration : null,
             video_codec: data.video_codec || null,
             audio_codec: data.audio_codec || null,
@@ -416,7 +426,8 @@
             // the case where the link cached for this path has gone dead.
             resolveLink(path, true)
                 .then(() => {
-                    media.src = contentUrl(path) + '&retry=' + Date.now();
+                    media.src = contentUrl(path, { transcode: player.transcode }) +
+                        '&retry=' + Date.now();
                     if (media.tagName === 'VIDEO') {
                         try { media.play(); } catch (e) { /* autoplay blocked */ }
                     }
@@ -450,6 +461,20 @@
         return parts.join(' ');
     }
 
+    function transcodeNotice(record) {
+        const codec = record.video_codec ? String(record.video_codec).toUpperCase() : '';
+        const parts = [
+            'Re-encoding' + (codec ? ' ' + escapeHtml(codec) : '') +
+            ' to H264 and AAC as it plays' +
+            (record.transcode_encoder ? ' (' + escapeHtml(record.transcode_encoder) + ')' : '') + '.',
+            'This costs real CPU or GPU time, and it stops as soon as you close the player.',
+            'Seeking is unavailable, because a live conversion has no fixed length.',
+        ];
+        const duration = formatDuration(record.duration);
+        if (duration) parts.push('Runs about ' + duration + '.');
+        return parts.join(' ');
+    }
+
     function renderVideo(path, name, record, options) {
         const stage = stageEl();
         if (!stage) return;
@@ -466,7 +491,7 @@
         video.preload = 'metadata';
         video.setAttribute('controlsList', 'nodownload');
         attachRetry(video, path);
-        video.src = contentUrl(path);
+        video.src = contentUrl(path, { transcode: opts.transcode });
         wrap.appendChild(video);
 
         if (opts.notice) {
@@ -527,25 +552,64 @@
             glyph(isVideo ? 'video' : 'other') + '</svg>';
 
         const codec = record.video_codec ? String(record.video_codec).toUpperCase() : '';
+        const audio = record.audio_codec ? String(record.audio_codec).toUpperCase() : '';
+        // The server tells us *why* this file landed on the external panel.
+        // Falling back to "we have a codec" keeps an older server readable.
+        const reason = record.reason || (codec ? 'codec' : null);
+        const container = escapeHtml(ext ? ext.toUpperCase() : 'This format');
+        // A re-encode is the only thing that can rescue a codec the browser
+        // refuses, so offer it whenever the machine can actually manage one.
+        const canTranscode = isVideo && !!record.can_transcode;
         let heading;
         let detail;
 
-        if (isVideo && codec && codec !== 'H264') {
-            // We probed the file, so we can name the real culprit.
-            heading = 'This video\'s codec cannot play in the browser';
-            detail = 'The video track is ' + escapeHtml(codec) + ', which browsers cannot decode. ' +
-                'Converting it would mean re-encoding, which this server deliberately does not do. ' +
-                'Download it and open it in a player like VLC.';
-        } else if (isVideo) {
-            heading = 'This container cannot play in the browser';
-            detail = 'Browsers only decode MP4, WebM, MOV and OGG natively. ' +
-                escapeHtml(ext ? ext.toUpperCase() : 'This format') +
-                ' needs re-encoding, which this server deliberately does not do. ' +
-                'Download it and open it in a player like VLC.';
-        } else {
+        if (!isVideo) {
             heading = 'No inline preview for this file type';
             detail = 'Download it, or open the direct link in an app that handles this format.';
+        } else if (reason === 'codec' && codec) {
+            // The probe ran, so name the real culprit: it is the codec, not the
+            // container. Swapping containers would not help, and saying "MKV
+            // needs re-encoding" would point the user at the wrong thing.
+            const named = codec === 'HEVC' ? 'HEVC (H.265)' : escapeHtml(codec);
+            heading = 'This video\'s codec cannot play in the browser';
+            detail = 'The video track is ' + escapeHtml(codec) +
+                (audio ? ' with ' + escapeHtml(audio) + ' audio' : '') +
+                ', and browsers cannot decode ' + named + '. Remuxing copies the codecs ' +
+                'unchanged, so it cannot rescue this file' +
+                (canTranscode
+                    ? ' — but it can be re-encoded on the fly instead.'
+                    : ', and no usable H.264 encoder was found on this machine.');
+        } else if (reason === 'no-ffmpeg') {
+            heading = 'FFmpeg is not available';
+            detail = container + ' files have to be remuxed before a browser will take them, ' +
+                'and the server could not find <code>ffmpeg</code> and <code>ffprobe</code> on ' +
+                'its PATH. Install FFmpeg and restart the app, or download the file and open ' +
+                'it in a player like VLC.';
+        } else if (reason === 'unprobeable') {
+            heading = 'Could not read this file';
+            detail = 'The server could not inspect ' + container + '\'s streams, so it cannot ' +
+                'tell whether they are browser-safe. That usually means a stale link or an ' +
+                'unusual container. Download it and open it in a player like VLC.';
+        } else if (reason === 'codec') {
+            heading = 'This video\'s codec cannot play in the browser';
+            detail = container + ' holds a codec browsers cannot decode, and a remux cannot ' +
+                'change that.';
+        } else {
+            heading = 'This container cannot play in the browser';
+            detail = 'Browsers only decode MP4, WebM, MOV and OGG natively. ' + container +
+                ' would have to be re-encoded first.';
         }
+
+        // Every verdict above shares the same last resort, so say so -- except
+        // the branch that already made the offer.
+        if (canTranscode && !(reason === 'codec' && codec)) {
+            detail += ' It can be re-encoded on the fly instead.';
+        }
+
+        const transcodeBtn = canTranscode
+            ? '<button class="btn btn-primary btn-sm" data-action="player-transcode">' +
+              'Transcode &amp; play</button>'
+            : '';
 
         stage.innerHTML =
             '<div class="stream-player-note">' +
@@ -553,16 +617,34 @@
             '<h4>' + escapeHtml(heading) + '</h4>' +
             '<p>' + detail + '</p>' +
             '<div class="stream-player-note-actions">' +
+            transcodeBtn +
             '<button class="btn btn-secondary btn-sm" data-action="player-copy">Copy link</button>' +
             '<a class="btn btn-secondary btn-sm" data-action="player-open" target="_blank" rel="noopener noreferrer">Open in new tab</a>' +
-            '<a class="btn btn-primary btn-sm" data-action="player-download">Download</a>' +
+            '<a class="btn ' + (canTranscode ? 'btn-secondary' : 'btn-primary') +
+            ' btn-sm" data-action="player-download">Download</a>' +
             '</div>' +
             '</div>';
 
         const openEl = stage.querySelector('[data-action="player-open"]');
         const downloadEl = stage.querySelector('[data-action="player-download"]');
+        const transcodeEl = stage.querySelector('[data-action="player-transcode"]');
         if (openEl) openEl.href = record.url;
         if (downloadEl) downloadEl.href = contentUrl(path, { download: true });
+        if (transcodeEl) {
+            transcodeEl.addEventListener('click', () => startTranscode(path, name, record));
+        }
+    }
+
+    function startTranscode(path, name, record) {
+        // Only ever reached from a click on the panel. Re-encoding is the one
+        // operation in this page that costs real CPU or GPU, so it must never
+        // be something that happens merely because a file was opened.
+        player.transcode = true;
+        player.retried = false;
+        renderVideo(path, name, record, {
+            transcode: true,
+            notice: transcodeNotice(record),
+        });
     }
 
     function renderMedia(path, name, record) {
@@ -570,11 +652,16 @@
         const kindEl = $('stream-player-kind');
         if (title) title.textContent = name;
         if (kindEl) {
+            // When a file cannot play inline, naming the codec is far more
+            // useful than a generic "external" badge.
             kindEl.textContent = record.kind === 'image'
                 ? 'Image'
                 : record.kind === 'video'
                     ? (record.mode === 'direct' ? 'Video'
-                        : record.mode === 'remux' ? 'Video · remuxed' : 'Video · external')
+                        : record.mode === 'remux' ? 'Video · remuxed'
+                            : record.video_codec
+                                ? 'Video · ' + String(record.video_codec).toUpperCase()
+                                : 'Video · external')
                     : 'File';
         }
 
@@ -611,6 +698,7 @@
         player.siblings = opts.siblings || null;
         player.index = typeof opts.index === 'number' ? opts.index : -1;
         player.retried = false;
+        player.transcode = false;      // each file starts un-re-encoded
 
         showOverlay(name, 'Resolving link…');
         try {
