@@ -137,11 +137,11 @@ class DriveMountManager:
         try:
             if not getattr(app_state, "token", None):
                 raise RuntimeError("Save a session token before mounting the drive.")
-            session = app_state.get_or_create_session()
 
-            from torbox_downloader.mount.vfs import TorboxVfs
-
-            vfs = TorboxVfs(session)
+            # Borrow the shared VFS (owned by AppState) so the drive and the
+            # Stream page reuse one tree and one CDN-link cache. Unmounting
+            # clears only this manager's reference, never the shared instance.
+            vfs = app_state.get_vfs()
             torrents = vfs.scan() or []
             try:
                 app_state.update_queue(torrents)

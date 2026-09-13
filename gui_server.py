@@ -108,6 +108,11 @@ class AppState:
         self.session = None
         self.session_lock = threading.Lock()
         self.api_key = str(uuid.uuid4())
+        # Shared virtual filesystem (TorboxVfs). Owned here so the drive mount
+        # and the Stream page reuse one tree and one CDN-link cache instead of
+        # each building their own. Lazily created by get_vfs().
+        self._vfs = None
+        self._vfs_lock = threading.RLock()
         # O(1) name → queue-index mapping; rebuilt whenever update_queue() runs.
         self._queue_index: dict = {}
         # TTL cache for shutil.disk_usage() to avoid a filesystem syscall on
@@ -190,6 +195,7 @@ class AppState:
             self.error_message = "Your Torbox session token has expired or is invalid."
         
         self.stop_session()
+        self.drop_vfs()
 
         if os.path.exists("token.txt"):
             try:
@@ -218,6 +224,32 @@ class AppState:
                 except Exception:
                     pass
                 self.session = None
+
+    def get_vfs(self):
+        """Return the shared TorboxVfs for the current session, creating it on
+        first use.
+
+        A single instance is shared by the drive mount and the Stream page so
+        both reuse the same tree and the same CDN-link cache. It is rebuilt
+        automatically when the underlying browser session was replaced (token
+        change / re-login), which keeps a stale tree from outliving its session.
+        """
+        with self._vfs_lock:
+            session = self.get_or_create_session()
+            if session is None:
+                raise RuntimeError("No valid session token provided.")
+            current = self._vfs
+            if current is None or getattr(current, "_session", None) is not session:
+                from torbox_downloader.mount.vfs import TorboxVfs
+                current = TorboxVfs(session)
+                self._vfs = current
+            return current
+
+    def drop_vfs(self):
+        """Forget the shared VFS. Called when the session ends (logout/token
+        expiry) so a stale tree cannot be served to a new session."""
+        with self._vfs_lock:
+            self._vfs = None
 
     def clear_logs(self):
         with self.lock:
@@ -969,6 +1001,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 pass
 
             app_state.stop_session()
+            app_state.drop_vfs()
 
             if os.path.exists("token.txt"):
                 try:
