@@ -482,18 +482,20 @@ class TorboxVfs:
 
             reader = self.open_reader(path, chunk_size=chunk_size, cache_budget=cache_budget)
             self._readers[key] = {"reader": reader, "last_used": now}
+            logger.debug("Opened stream reader for %s (%d cached).", key, len(self._readers))
 
             # Bound the cache by least-recently-used eviction.
             while len(self._readers) > self._reader_cache_max:
                 oldest = min(self._readers, key=lambda k: self._readers[k]["last_used"])
                 if oldest == key:
                     break
-                self._close_reader_locked(oldest)
+                self._close_reader_locked(oldest, reason="lru")
             return reader
 
-    def _close_reader_locked(self, key):
+    def _close_reader_locked(self, key, reason="closed"):
         entry = self._readers.pop(key, None)
         if entry is not None:
+            logger.debug("Released stream reader for %s (%s).", key, reason)
             try:
                 entry["reader"].close()
             except Exception:
@@ -505,7 +507,7 @@ class TorboxVfs:
         stale = [k for k, e in self._readers.items()
                  if now - e["last_used"] > self._reader_idle_ttl]
         for key in stale:
-            self._close_reader_locked(key)
+            self._close_reader_locked(key, reason="idle")
 
     def close_reader(self, path):
         with self._reader_lock:
@@ -513,5 +515,8 @@ class TorboxVfs:
 
     def close_all_readers(self):
         with self._reader_lock:
+            count = len(self._readers)
             for key in list(self._readers.keys()):
-                self._close_reader_locked(key)
+                self._close_reader_locked(key, reason="session reset")
+            if count:
+                logger.debug("Closed %d stream reader(s).", count)

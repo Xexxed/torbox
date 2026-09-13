@@ -46,8 +46,14 @@ def _clean_vfs_path(raw):
 
 
 # In-memory cache for static GUI files. Files never change at runtime so we
-# read each one once and serve from RAM on every subsequent request.
+# read each one once and serve from RAM on every subsequent request. Set
+# TORBOX_GUI_NOCACHE=1 during frontend work to bypass the cache entirely, so
+# edits to gui/*.js and gui/*.css show up on reload without a restart.
 _static_cache: dict = {}
+
+
+def _static_cache_enabled() -> bool:
+    return not os.environ.get("TORBOX_GUI_NOCACHE")
 
 
 def extract_email_from_token(token):
@@ -275,12 +281,17 @@ class AppState:
             current = self._vfs
             if current is None or getattr(current, "_session", None) is not session:
                 from torbox_downloader.mount.vfs import TorboxVfs
+                rebuilt = current is not None
                 current = TorboxVfs(
                     session,
                     browser_lock=self.browser_op_lock,
                     browser_op_timeout=self.browser_op_lock_timeout_s,
                 )
                 self._vfs = current
+                logger.info(
+                    "Shared VFS %s for the Stream page and drive mount.",
+                    "rebuilt (session changed)" if rebuilt else "created",
+                )
             return current
 
     def drop_vfs(self):
@@ -290,6 +301,7 @@ class AppState:
             vfs = self._vfs
             self._vfs = None
         if vfs is not None:
+            logger.info("Shared VFS dropped (session ended).")
             try:
                 vfs.close_all_readers()
             except Exception:
@@ -790,10 +802,14 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         file_path = os.path.join(os.path.dirname(__file__), "gui", sanitized_path)
 
         if os.path.exists(file_path) and os.path.isfile(file_path):
-            if file_path not in _static_cache:
+            if _static_cache_enabled():
+                if file_path not in _static_cache:
+                    with open(file_path, "rb") as f:
+                        _static_cache[file_path] = f.read()
+                content = _static_cache[file_path]
+            else:
                 with open(file_path, "rb") as f:
-                    _static_cache[file_path] = f.read()
-            content = _static_cache[file_path]
+                    content = f.read()
             self.send_response(200)
             if file_path.endswith(".html"):
                 self.send_header("Content-Type", "text/html; charset=utf-8")

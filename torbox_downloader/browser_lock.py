@@ -14,11 +14,15 @@ transfer.
 """
 
 import logging
+import time
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BROWSER_OP_TIMEOUT_S = 60.0
+
+# Only log lock waits/holds that are long enough to be worth explaining.
+_LOCK_LOG_THRESHOLD_S = 1.0
 
 
 class BrowserBusyError(RuntimeError):
@@ -36,15 +40,28 @@ def browser_op(lock, timeout=DEFAULT_BROWSER_OP_TIMEOUT_S, what="use the browser
         yield
         return
 
+    started = time.monotonic()
     if timeout and timeout > 0:
         acquired = lock.acquire(timeout=timeout)
     else:
         acquired = lock.acquire()
+    waited = time.monotonic() - started
+
     if not acquired:
+        logger.warning(
+            "Browser lock wait timed out after %.1fs (wanted to %s).", waited, what
+        )
         raise BrowserBusyError(
             f"Browser is busy: timed out after {timeout:g}s waiting to {what}."
         )
+
+    if waited >= _LOCK_LOG_THRESHOLD_S:
+        logger.info("Waited %.1fs for the browser lock to %s.", waited, what)
+
     try:
         yield
     finally:
         lock.release()
+        held = time.monotonic() - started - waited
+        if held >= _LOCK_LOG_THRESHOLD_S:
+            logger.debug("Held the browser lock %.1fs to %s.", held, what)
