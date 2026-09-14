@@ -11,7 +11,7 @@ import mimetypes
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from torbox_downloader import remux
+from torbox_downloader import remux, vlc
 
 logger = logging.getLogger(__name__)
 
@@ -970,14 +970,22 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0) or 0)
+
         if self.path.startswith("/api/"):
             if not self.verify_api_key():
-                self.send_response(401)
-                self.end_headers()
-                self.wfile.write(b"Unauthorized API request.")
+                # Drain the request body before answering. Replying while the
+                # client is still writing resets the connection, and a reset
+                # mid-response is indistinguishable from a crashed server --
+                # strict intermediaries reject it outright.
+                if content_length:
+                    try:
+                        self.rfile.read(content_length)
+                    except Exception:
+                        pass
+                self._send_text(401, "Unauthorized API request.")
                 return
 
-        content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length).decode("utf-8")
         
         try:
@@ -1124,12 +1132,38 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     "audio_codec": info["audio_codec"],
                     "can_transcode": info["can_transcode"],
                     "transcode_encoder": info["transcode_encoder"],
+                    # Whether a desktop player can be offered. A machine-level
+                    # fact rather than a per-file one, but this is the payload
+                    # the player already has in hand when it draws the buttons.
+                    "vlc_available": vlc.available(),
                     "expires_at": time.time() + CDN_LINK_TTL_S,
                 }
             except Exception as e:
                 self._send_json(self._stream_error(e))
                 return
             self._send_json(payload)
+            return
+
+        elif self.path.startswith("/api/stream/vlc"):
+            try:
+                path = _clean_vfs_path(params.get("path", ""))
+            except ValueError as e:
+                self._send_json({"success": False, "error": str(e)}, status=400)
+                return
+            try:
+                # The link is resolved here, from the path, and never taken
+                # from the request body. Accepting a URL would turn this into
+                # an endpoint that opens the user's media player on any address
+                # a caller cared to name.
+                url = app_state.get_vfs().resolve_link(path)
+                vlc.open_url(url)
+            except vlc.VlcError as e:
+                self._send_json({"success": False, "error": str(e)}, status=503)
+                return
+            except Exception as e:
+                self._send_json(self._stream_error(e))
+                return
+            self._send_json({"success": True, "player": "vlc"})
             return
 
         elif self.path.startswith("/api/stream/refresh"):
