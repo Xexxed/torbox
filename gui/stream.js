@@ -18,6 +18,7 @@
         activated: false,
         cache: new Map(),        // path -> entries
         pending: new Set(),      // paths with a resolve in flight
+        vlcPending: false,       // a launch request is in flight
     };
 
     const GLYPHS = {
@@ -346,6 +347,8 @@
             // A re-encode is the last resort for a file the browser refuses.
             can_transcode: !!data.can_transcode,
             transcode_encoder: data.transcode_encoder || null,
+            // Whether the server can hand this file to a desktop player.
+            vlc_available: !!data.vlc_available,
             duration: typeof data.duration === 'number' ? data.duration : null,
             video_codec: data.video_codec || null,
             audio_codec: data.audio_codec || null,
@@ -358,11 +361,16 @@
     function playerEl() { return $('stream-player'); }
     function stageEl() { return $('stream-player-stage'); }
 
-    function setActions(show) {
+    function setActions(show, options) {
+        const opts = options || {};
         ['stream-player-copy', 'stream-player-open', 'stream-player-download'].forEach((id) => {
             const el = $(id);
             if (el) el.hidden = !show;
         });
+        // VLC is offered only for video, and only when the server actually
+        // found a player to launch -- a button that fails is worse than none.
+        const vlcEl = $('stream-player-vlc');
+        if (vlcEl) vlcEl.hidden = !(show && opts.vlc);
     }
 
     function openOverlay() {
@@ -606,23 +614,39 @@
             detail += ' It can be re-encoded on the fly instead.';
         }
 
-        const transcodeBtn = canTranscode
-            ? '<button class="btn btn-primary btn-sm" data-action="player-transcode">' +
-              'Transcode &amp; play</button>'
-            : '';
+        // Exactly one primary action, chosen by what actually gets the file
+        // playing: a re-encode keeps it in the browser, VLC is the next best
+        // thing because it plays the original untouched, and downloading is
+        // the fallback.
+        const canVlc = isVideo && record.vlc_available;
+        let primary = 'download';
+        if (canTranscode) primary = 'transcode';
+        else if (canVlc) primary = 'vlc';
+        const cls = (name) => 'btn btn-sm ' +
+            (primary === name ? 'btn-primary' : 'btn-secondary');
+
+        const actions = [];
+        if (canTranscode) {
+            actions.push('<button class="' + cls('transcode') +
+                '" data-action="player-transcode">Transcode &amp; play</button>');
+        }
+        actions.push('<button class="' + cls('copy') +
+            '" data-action="player-copy">Copy link</button>');
+        actions.push('<a class="' + cls('open') + '" data-action="player-open"' +
+            ' target="_blank" rel="noopener noreferrer">Open in new tab</a>');
+        if (canVlc) {
+            actions.push('<button class="' + cls('vlc') +
+                '" data-action="player-vlc">Open in VLC</button>');
+        }
+        actions.push('<a class="' + cls('download') +
+            '" data-action="player-download">Download</a>');
 
         stage.innerHTML =
             '<div class="stream-player-note">' +
             '<div class="stream-player-note-icon">' + icon + '</div>' +
             '<h4>' + escapeHtml(heading) + '</h4>' +
             '<p>' + detail + '</p>' +
-            '<div class="stream-player-note-actions">' +
-            transcodeBtn +
-            '<button class="btn btn-secondary btn-sm" data-action="player-copy">Copy link</button>' +
-            '<a class="btn btn-secondary btn-sm" data-action="player-open" target="_blank" rel="noopener noreferrer">Open in new tab</a>' +
-            '<a class="btn ' + (canTranscode ? 'btn-secondary' : 'btn-primary') +
-            ' btn-sm" data-action="player-download">Download</a>' +
-            '</div>' +
+            '<div class="stream-player-note-actions">' + actions.join('') + '</div>' +
             '</div>';
 
         const openEl = stage.querySelector('[data-action="player-open"]');
@@ -632,6 +656,44 @@
         if (downloadEl) downloadEl.href = contentUrl(path, { download: true });
         if (transcodeEl) {
             transcodeEl.addEventListener('click', () => startTranscode(path, name, record));
+        }
+    }
+
+    async function openInVlc(path, trigger) {
+        // The server resolves the link from the path -- the page never hands it
+        // a URL to launch. Keep the button busy until it answers, because a
+        // player takes a moment to appear and a silent button reads as broken.
+        if (state.vlcPending) return;
+        state.vlcPending = true;
+        const label = trigger ? trigger.textContent : '';
+        if (trigger) {
+            trigger.disabled = true;
+            trigger.textContent = 'Opening…';
+        }
+        try {
+            const res = await fetch('/api/stream/vlc', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path }),
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data || !data.success) {
+                throw new Error((data && data.error) || 'Could not open VLC.');
+            }
+            if (typeof showToast === 'function') {
+                showToast('success', 'Opened in VLC', 'VLC is starting on your desktop.');
+            }
+        } catch (err) {
+            if (typeof showToast === 'function') {
+                showToast('error', 'Could not open VLC',
+                    (err && err.message) || 'The server could not launch VLC.');
+            }
+        } finally {
+            state.vlcPending = false;
+            if (trigger) {
+                trigger.disabled = false;
+                trigger.textContent = label;
+            }
         }
     }
 
@@ -671,7 +733,7 @@
         if (openEl) openEl.href = record.url;
         if (downloadEl) downloadEl.href = contentUrl(path, { download: true });
         if (copyEl) copyEl.setAttribute('data-link', record.url);
-        setActions(true);
+        setActions(true, { vlc: record.kind === 'video' && record.vlc_available });
 
         if (record.kind === 'image') {
             renderImage(path, name, record);
@@ -785,6 +847,9 @@
             const action = actionEl.getAttribute('data-action');
             if (action === 'player-copy') {
                 copyLink();
+                event.preventDefault();
+            } else if (action === 'player-vlc') {
+                if (player.path) openInVlc(player.path, actionEl);
                 event.preventDefault();
             } else if (action === 'player-retry') {
                 if (player.path) {

@@ -9,6 +9,7 @@ import unittest
 
 import requests
 
+from torbox_downloader import vlc
 from torbox_downloader.mount.vfs import TorboxVfs
 from tests.test_mount import FakeSession, RangeServerFixture, make_streaming_vfs, make_vfs
 from tests.test_stream_api import _FakeState, _ServerFixture
@@ -43,6 +44,9 @@ class TestResolveEndpoint(unittest.TestCase):
         # pinned here.
         self.assertIn(body["reason"],
                       {"native", "remuxable", "codec", "no-ffmpeg", "unprobeable"})
+        # The player decides whether to offer VLC from this flag, so it has to
+        # reflect what the server can actually do.
+        self.assertEqual(body["vlc_available"], vlc.available())
         self.assertIn("expires_at", body)
         self.assertEqual(len(session.generated), 1)
 

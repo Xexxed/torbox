@@ -17,6 +17,10 @@ const { JSDOM, VirtualConsole } = require('jsdom');
 
 const GUI_DIR = path.resolve(__dirname, '..', 'gui');
 
+// Whether the fake server claims to have found a desktop player. Machine-level
+// rather than per-file, exactly as the real resolve response reports it.
+let VLC_AVAILABLE = true;
+
 let failures = 0;
 function check(label, condition) {
     if (condition) {
@@ -117,6 +121,7 @@ function buildDom() {
 
     const calls = [];
     const resolvePaths = [];
+    const vlcPaths = [];
 
     window.fetch = function (url, options) {
         const target = String(url);
@@ -143,8 +148,12 @@ function buildDom() {
                 audio_codec: cls.audio_codec || null,
                 can_transcode: !!cls.can_transcode,
                 transcode_encoder: cls.transcode_encoder || null,
+                vlc_available: VLC_AVAILABLE,
                 expires_at: Math.floor(Date.now() / 1000) + 1800,
             };
+        } else if (target.includes('/api/stream/vlc')) {
+            vlcPaths.push(body.path);
+            payload = { success: true, player: 'vlc' };
         } else if (target.includes('/api/status')) {
             payload = { status: 'idle', logs: [], queue: [], active_downloads: {} };
         }
@@ -159,7 +168,7 @@ function buildDom() {
 
     window.eval(fs.readFileSync(path.join(GUI_DIR, 'app.js'), 'utf8'));
     window.eval(fs.readFileSync(path.join(GUI_DIR, 'stream.js'), 'utf8'));
-    return { window, calls, resolvePaths };
+    return { window, calls, resolvePaths, vlcPaths };
 }
 
 const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms || 40));
@@ -174,7 +183,7 @@ function key(window, doc, keyName) {
 }
 
 (async function main() {
-    const { window, resolvePaths } = buildDom();
+    const { window, calls, resolvePaths, vlcPaths } = buildDom();
     const doc = window.document;
     const overlay = doc.getElementById('stream-player');
     const stage = doc.getElementById('stream-player-stage');
@@ -226,6 +235,27 @@ function key(window, doc, keyName) {
     const dlHref = doc.getElementById('stream-player-download').getAttribute('href');
     check('Download goes through the proxy with download=1',
         dlHref.includes('/api/stream/content') && dlHref.includes('download=1'));
+
+    // --- open in VLC --------------------------------------------------------
+    // The player must never be handed a URL to launch: it takes the vfs path
+    // and resolves the link itself.
+    const vlcBtn = doc.getElementById('stream-player-vlc');
+    check('a video offers Open in VLC when the server has one',
+        !!vlcBtn && !vlcBtn.hidden);
+
+    before = vlcPaths.length;
+    vlcBtn.click();
+    await tick();
+
+    check('clicking Open in VLC posts exactly one request',
+        vlcPaths.length === before + 1);
+    check('the request names the file by path, not by URL',
+        vlcPaths[vlcPaths.length - 1] === '/Torrent One/movie.mp4');
+    check('no CDN url is ever sent to the launcher',
+        !calls.some((c) => c.url.includes('/api/stream/vlc') &&
+            JSON.stringify(c.options.body || '').includes('cdn.test')));
+    check('the button is usable again after the request',
+        vlcBtn.disabled === false && vlcBtn.textContent === 'Open in VLC');
 
     // --- close tears the stream down ---------------------------------------
     key(window, doc, 'Escape');
@@ -299,6 +329,11 @@ function key(window, doc, keyName) {
         !!stage.querySelector('[data-action="player-copy"]') &&
         !!stage.querySelector('[data-action="player-open"]') &&
         !!stage.querySelector('[data-action="player-download"]'));
+    check('the panel offers VLC for an unplayable video',
+        !!stage.querySelector('[data-action="player-vlc"]'));
+    check('a transcode still outranks VLC as the primary action',
+        stage.querySelector('[data-action="player-transcode"]')
+            .className.includes('btn-primary'));
     check('the panel download link uses the proxy with download=1',
         stage.querySelector('[data-action="player-download"]')
             .getAttribute('href').includes('download=1'));
@@ -351,8 +386,13 @@ function key(window, doc, keyName) {
         stage.querySelector('[data-action="player-transcode"]') === null);
     check('the panel explains no encoder was found',
         stage.textContent.includes('no usable H.264 encoder'));
-    check('download stays the primary action without an encoder',
-        stage.querySelector('[data-action="player-download"]')
+    // With no way to play it in the browser, handing the original to VLC is
+    // the best remaining option, so it takes over as the primary action.
+    check('VLC becomes the primary action without a transcode',
+        stage.querySelector('[data-action="player-vlc"]')
+            .className.includes('btn-primary'));
+    check('download steps back to secondary when VLC is offered',
+        !stage.querySelector('[data-action="player-download"]')
             .className.includes('btn-primary'));
 
     key(window, doc, 'Escape');
@@ -432,6 +472,8 @@ function key(window, doc, keyName) {
     check('arrow key wraps backwards to the last image',
         stage.querySelector('.stream-lightbox-counter').textContent === '3 / 3');
     check('an image never mounts a <video>', stage.querySelector('video') === null);
+    check('an image is never offered to VLC',
+        doc.getElementById('stream-player-vlc').hidden);
 
     key(window, doc, 'Escape');
     await tick();
@@ -488,6 +530,31 @@ function key(window, doc, keyName) {
     overlay.click();
     await tick();
     check('clicking the backdrop closes the overlay', overlay.style.display === 'none');
+
+    // --- a server with no desktop player ------------------------------------
+    // A button that cannot work is worse than no button, so with no player
+    // found the offer must disappear entirely rather than fail on click.
+    VLC_AVAILABLE = false;
+    const second = buildDom();
+    const doc2 = second.window.document;
+    const stage2 = doc2.getElementById('stream-player-stage');
+
+    second.window.StreamPage.activate();
+    await tick();
+    doc2.querySelector('#stream-body .stream-card').click();
+    await tick();
+    cardByName(doc2, 'noencoder.mkv').click();
+    await tick();
+
+    check('the panel still renders with no desktop player',
+        !!stage2.querySelector('.stream-player-note'));
+    check('no VLC button on the panel when no player was found',
+        stage2.querySelector('[data-action="player-vlc"]') === null);
+    check('the header VLC button stays hidden with no player',
+        doc2.getElementById('stream-player-vlc').hidden);
+    check('download is the primary action again with no player',
+        stage2.querySelector('[data-action="player-download"]')
+            .className.includes('btn-primary'));
 
     console.log(failures === 0 ? '\nALL PLAYER TESTS PASSED' : '\n' + failures + ' PLAYER TEST(S) FAILED');
     process.exit(failures === 0 ? 0 : 1);

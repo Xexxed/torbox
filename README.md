@@ -23,6 +23,9 @@ it those files fall back to the external-player panel. A hardware H.264 encoder
 (NVENC / Quick Sync / AMF) is used when one actually works, and `libx264` otherwise.
 Nothing else in the app depends on FFmpeg.
 
+Optional: **VLC**, for the Stream tab's **Open in VLC** button. Found automatically; set
+`TORBOX_VLC_PATH` if it lives somewhere unusual. Without it the button is simply absent.
+
 ## Running
 
 ```bash
@@ -103,6 +106,23 @@ just has no scrubber to drive it.
 bytes travel from the CDN through the reader to the socket — and the conversion paths are
 no different: FFmpeg pipes fragmented MP4 to stdout instead of a file.
 
+**Open in VLC.** Every video also offers **Open in VLC**, which hands the *original* file's
+CDN link to the desktop player: no conversion, so subtitles, every audio track and full
+seeking all survive, and no Python process sits in the middle of the stream. A web page
+cannot launch a local program, so the server does it on the page's behalf — the page sends
+a *path*, and the server resolves the link itself. It never accepts a URL to open, which
+would otherwise make the endpoint a way to set your own media player on any address a
+caller cared to name.
+
+VLC is located through `TORBOX_VLC_PATH`, then `PATH`, then the usual install locations —
+on Windows that means the registry entry the installer writes, which matters because the
+installer does *not* add VLC to `PATH`, so a stock install would otherwise go undetected.
+When no player is found the button is not rendered at all, rather than failing on click.
+
+One caveat, since VLC gets the CDN link rather than the proxy: that link lives about 30
+minutes, so a film much longer than that can outlive it. The proxy path exists for the
+cases where that matters.
+
 ### Behaviour worth knowing
 
 - Closing the player (Escape, the close button, or clicking the backdrop) tears the media
@@ -154,6 +174,12 @@ an actual 10-bit HEVC/AC3 MKV with `lavfi`, serve them from a loopback range ser
 assert the outputs carry an `ftyp` box and probe back as H.264 + AAC at 8-bit. One test
 exists purely to check that the endpoint does **not** transcode when it was not asked to,
 since the entire cost model depends on that.
+
+`tests/test_vlc.py` covers the desktop-player hand-off: detection order (override, `PATH`,
+install locations), that a broken override is not silently ignored, that a non-HTTP URL or
+a flag-shaped argument is refused before it reaches the player, that the auth token never
+reaches the log, and that the endpoint resolves the link from the path rather than
+accepting one from the request.
 
 `tests/test_stream_layout.py` reads the stylesheet as text and pins the poster-rail grid
 rules, so the rail cannot silently regress to a single horizontal band.
