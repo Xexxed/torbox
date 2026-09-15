@@ -1038,7 +1038,7 @@ function fetchStatus() {
             document.getElementById('queue-count').textContent = `${state.queue.length} total`;
 
             // 2. Render Torrent Queue
-            renderQueue(state.queue);
+            renderQueue(state.queue, state.token_set);
 
             // 3. Render Logs Console
             renderLogs(state.logs, state.active_downloads);
@@ -1149,6 +1149,20 @@ function renderDriveState(mount, preferred) {
 // The backend is polled every 800ms, so the list updates in place when the
 // composition is unchanged — progress bars transition instead of resetting,
 // and entrance stagger only plays when the queue actually changes.
+// Empty-state copy for when the user has a saved session but the queue
+// hasn't been populated yet (e.g. before the first scan completes).
+const QUEUE_EMPTY_SIGNED_IN_HTML = `
+    <div class="empty-state">
+        <div class="empty-icon-tile">
+            <svg viewBox="0 0 24 24" width="26" height="26" class="empty-icon"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        </div>
+        <p>Queue is empty</p>
+        <div class="empty-steps">
+            <div class="empty-step"><span class="empty-step-key">01</span><span>Click the refresh button or Start download to scan your Torbox library.</span></div>
+            <div class="empty-step"><span class="empty-step-key">02</span><span>Select a torrent here, pick its files, and start.</span></div>
+        </div>
+    </div>`;
+
 const QUEUE_EMPTY_HTML = `
     <div class="empty-state">
         <div class="empty-icon-tile">
@@ -1225,13 +1239,14 @@ function updateQueueItem(el, item) {
     }
 }
 
-function renderQueue(queue) {
+function renderQueue(queue, signedIn) {
     const container = document.getElementById('queue-container');
     if (!container) return;
 
     if (!queue || queue.length === 0) {
+        const want = signedIn ? QUEUE_EMPTY_SIGNED_IN_HTML : QUEUE_EMPTY_HTML;
         if (!container.querySelector('.empty-state')) {
-            container.innerHTML = QUEUE_EMPTY_HTML;
+            container.innerHTML = want;
         }
         return;
     }

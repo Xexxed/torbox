@@ -662,13 +662,15 @@ def scan_torrents_background():
         if not session:
             return
             
-        from torbox_downloader.browser_session import is_token_expired
-        if is_token_expired(app_state.token):
-            app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token is expired.")
-            app_state.set_status("error", "Your Torbox session token has expired.")
-            send_os_notification("Torbox Session Warning", "Your Torbox session token has expired.")
-            return
-            
+        # NOTE: no offline `is_token_expired()` check here. `app_state.token` is a
+        # snapshot of the access_token from the saved session at startup; the
+        # browser silently refreshes that token behind the scenes (Supabase's
+        # GoTrue client exchanges the refresh_token for a new pair). Our copy
+        # therefore goes stale within an hour and the offline check would refuse
+        # a session that is actually still valid. The session itself is the
+        # source of truth: if it is truly dead, `session.scan_torrents()` raises
+        # and the except path below runs `handle_token_expired()`.
+
         torrents = session.scan_torrents()
         if torrents:
             app_state.update_queue(torrents)
