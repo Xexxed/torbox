@@ -24,12 +24,20 @@ token.txt
 settings.json
 *.token
 
+# Account profiles: each holds a live saved session (access + refresh token)
+profiles/
+profiles.json
+
+# Chrome profile used for the debug-mode sign-in browser
+.chrome-debug/
+
 # Local downloads target directory (Default)
 downloads/
 
 # IDE & Editor configurations
 .idea/
 .vscode/
+.workbuddy/
 .kilo/
 .agents/
 .workbuddy-ai/
@@ -57,3 +65,7 @@ scratch/
 torbox_debug*.html
 debug_*.html
 *.html.dump
+
+# Chrome CDP debug profile (throwaway, contains live session cookies)
+.chrome-debug/
+

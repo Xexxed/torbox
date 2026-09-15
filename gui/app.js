@@ -720,6 +720,234 @@ function triggerLogout() {
 }
 
 // Fetch general AppState status from backend APIs
+// --- Account profiles (named Torbox accounts) ------------------------------
+
+let profilePollTimer = null;
+
+/** POST a JSON body and resolve with the parsed response. */
+function postForm(url, body) {
+    return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    }).then(res => res.json());
+}
+
+/**
+ * Keep the account picker in step with the server.
+ *
+ * The dropdown is only rebuilt when the set of accounts actually changes,
+ * so an open picker is not yanked away by the 500 ms status poll.
+ */
+function syncProfiles(state) {
+    const select = document.getElementById('profile-select');
+    if (!select) return;
+    const profiles = state.profiles || [];
+    const active = state.active || '';
+
+    const signature = profiles
+        .map(p => `${p.name}:${p.email || ''}:${p.has_login ? 1 : 0}`)
+        .join('|');
+    if (select.dataset.signature !== signature) {
+        select.dataset.signature = signature;
+        select.innerHTML = profiles.map(p => {
+            const label = p.email
+                ? `${p.name} — ${p.email}`
+                : `${p.name}${p.has_login ? '' : ' (not signed in)'}`;
+            return `<option value="${escapeAttr(p.name)}"${p.name === active ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+        }).join('');
+    }
+    if (document.activeElement !== select) {
+        select.value = active;
+    }
+
+    const hint = document.querySelector('.account-hint');
+    if (hint) {
+        const current = profiles.find(p => p.name === active);
+        hint.textContent = current && current.email ? current.email : 'Not signed in';
+    }
+
+    // The header Remove button only makes sense when an account is selected.
+    const removeBtn = document.getElementById('remove-profile-btn-header');
+    if (removeBtn) {
+        const visible = !!active;
+        removeBtn.hidden = !visible;
+    }
+
+    if (state.login) {
+        updateAddProfileProgress(state.login);
+    }
+}
+
+function onProfileChange(name) {
+    if (!name) return;
+    postForm('/api/profiles/select', { name })
+        .then(data => {
+            if (!data.success) {
+                showToast('error', 'Could not switch account', data.error || 'Unknown error');
+            } else {
+                showToast('success', 'Account switched', 'Now using “' + name + '”.');
+            }
+            fetchStatus();
+        })
+        .catch(err => showToast('error', 'Could not switch account', String(err)));
+}
+
+/**
+ * Manual rescan of the Torbox torrent list. Triggered by the dashboard
+ * refresh button. The actual scan keeps running on the server after the
+ * request returns; the spinner just covers the request, then the status
+ * poll will show the queue repopulating.
+ */
+function refreshTorrents() {
+    const btn = document.getElementById('queue-refresh-btn');
+    if (!btn || btn.disabled) return;
+    btn.classList.add('is-spinning');
+    btn.disabled = true;
+    const start = Date.now();
+    postForm('/api/refresh_torrents', {})
+        .then(data => {
+            if (!data || !data.success) {
+                showToast('error', 'Could not refresh', (data && data.error) || 'Unknown error');
+            }
+        })
+        .catch(err => showToast('error', 'Could not refresh', String(err)))
+        .finally(() => {
+            // Hold the spinner briefly so a fast response still feels intentional.
+            const wait = Math.max(0, 600 - (Date.now() - start));
+            setTimeout(() => {
+                btn.classList.remove('is-spinning');
+                btn.disabled = false;
+            }, wait);
+        });
+}
+
+function openAddProfileModal() {
+    const modal = document.getElementById('add-profile-modal');
+    if (!modal) return;
+    document.getElementById('add-profile-setup').style.display = '';
+    document.getElementById('add-progress-container').style.display = 'none';
+    resetAddProfileProgress();
+    const input = document.getElementById('profile-name-input');
+    if (input) input.value = '';
+    // The overlay is hidden via opacity + pointer-events until `.active`
+    // is added (same pattern as the other modals). It also starts with
+    // an inline `display: none` in the markup, so that has to be cleared
+    // first or the .active class has nothing to make visible.
+    modal.style.display = 'flex';
+    setTimeout(() => modal.classList.add('active'), 10);
+    if (input) input.focus();
+}
+
+/** Clear any previous failure state before a fresh attempt. */
+function resetAddProfileProgress() {
+    const status = document.getElementById('add-profile-status');
+    if (status) {
+        status.classList.remove('login-failed');
+        status.textContent = 'Waiting for sign-in…';
+    }
+    const bar = document.getElementById('add-profile-progress-bar');
+    if (bar) bar.classList.add('indeterminate');
+    const retry = document.getElementById('add-profile-retry-btn');
+    if (retry) retry.style.display = 'none';
+}
+
+function closeAddProfileModal() {
+    const modal = document.getElementById('add-profile-modal');
+    if (modal) {
+        modal.classList.remove('active');
+        setTimeout(() => { modal.style.display = 'none'; }, 300);
+    }
+    if (profilePollTimer) { clearInterval(profilePollTimer); profilePollTimer = null; }
+}
+
+function startAddProfile() {
+    const input = document.getElementById('profile-name-input');
+    const name = ((input && input.value) || '').trim();
+    if (!name) {
+        showToast('error', 'Name required', 'Give the account a short name before signing in.');
+        return;
+    }
+    postForm('/api/profiles/add', { name })
+        .then(data => {
+            if (!data.success) {
+                showToast('error', 'Could not start sign-in', data.error || 'Unknown error');
+                return;
+            }
+            document.getElementById('add-profile-setup').style.display = 'none';
+            document.getElementById('add-progress-container').style.display = 'block';
+            resetAddProfileProgress();
+            document.getElementById('add-profile-status').textContent = 'Opening a browser window…';
+            if (profilePollTimer) clearInterval(profilePollTimer);
+            profilePollTimer = setInterval(pollAddProfile, 1000);
+        })
+        .catch(err => showToast('error', 'Could not start sign-in', String(err)));
+}
+
+function pollAddProfile() {
+    fetch('/api/profiles')
+        .then(res => res.json())
+        .then(data => {
+            if (data.login) updateAddProfileProgress(data.login);
+            if (data.login && !data.login.active) {
+                if (profilePollTimer) { clearInterval(profilePollTimer); profilePollTimer = null; }
+                if (data.login.ok) {
+                    showToast('success', 'Account added', data.login.message || '');
+                    closeAddProfileModal();
+                    fetchStatus();
+                } else {
+                    // Leave the modal open so the failure is readable and the
+                    // account can be retried without re-typing its name.
+                    showAddProfileFailure(data.login.message || 'Sign-in did not finish.');
+                    fetchStatus();
+                }
+            }
+        })
+        .catch(() => {});
+}
+
+function showAddProfileFailure(message) {
+    const status = document.getElementById('add-profile-status');
+    if (status) {
+        status.textContent = message;
+        status.classList.add('login-failed');
+    }
+    const bar = document.getElementById('add-profile-progress-bar');
+    if (bar) bar.classList.remove('indeterminate');
+    const retry = document.getElementById('add-profile-retry-btn');
+    if (retry) retry.style.display = '';
+}
+
+function updateAddProfileProgress(login) {
+    const status = document.getElementById('add-profile-status');
+    if (status && login.message) status.textContent = login.message;
+}
+
+function cancelAddProfile() {
+    postForm('/api/profiles/cancel_login', {}).then(() => fetchStatus());
+}
+
+function removeActiveProfile() {
+    const select = document.getElementById('profile-select');
+    const name = select && select.value;
+    if (!name) {
+        showToast('error', 'No account selected', 'Pick an account first or use the Remove button inside the Add dialog.');
+        return;
+    }
+    if (!confirm('Remove the account “' + name + '”? Its saved session is deleted. You can add it again later.')) return;
+    postForm('/api/profiles/remove', { name })
+        .then(data => {
+            if (!data.success) {
+                showToast('error', 'Could not remove account', data.error || 'Unknown error');
+            } else {
+                showToast('success', 'Account removed', '“' + name + '” is gone.');
+                closeAddProfileModal();
+            }
+            fetchStatus();
+        })
+        .catch(err => showToast('error', 'Could not remove account', String(err)));
+}
+
 function fetchStatus() {
     fetch('/api/status')
         .then(res => res.json())
@@ -739,6 +967,11 @@ function fetchStatus() {
             
             // Check if the token has expired
             checkTokenExpiry(state);
+
+            // Account profiles (named Torbox accounts)
+            if (state.profiles) {
+                syncProfiles(state);
+            }
 
             const pathInput = document.getElementById('download-path-input');
             if (document.activeElement !== pathInput && state.dest_dir) {

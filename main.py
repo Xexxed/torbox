@@ -292,7 +292,27 @@ def get_torrent_files_structure(token, url, target_torrent_name, browser_type='c
         session.stop()
 
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S):
+def _profile_session_kwargs(profile):
+    """Turn a profile name into TorboxBrowserSession kwargs.
+
+    A profile's saved storage state carries a refresh token, so it is preferred
+    over any pasted token: the browser keeps itself signed in from then on.
+    """
+    if not profile:
+        return {}
+    from torbox_downloader.profiles import ProfileStore
+    store = ProfileStore()
+    if not store.exists(profile):
+        print(f"[!] Unknown profile '{profile}'. Known: {', '.join(store.names()) or 'none'}")
+        return {}
+    state = store.load_state(profile)
+    if not state:
+        print(f"[!] Profile '{profile}' has no saved session. Run: python main.py --login {profile}")
+        return {}
+    return {"storage_state": state, "state_path": store.storage_path(profile)}
+
+
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S, profile=None):
     """
     Runs the full automation workflow:
     1. Launches/uses TorboxBrowserSession.
@@ -304,7 +324,8 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
     if session is None:
         from torbox_downloader.browser_session import TorboxBrowserSession
         print(f"Launching clean {browser_type} context...")
-        local_session = TorboxBrowserSession(token, browser_type, headless, download_url=url)
+        local_session = TorboxBrowserSession(token, browser_type, headless, download_url=url,
+                                             **_profile_session_kwargs(profile))
         local_session.start()
         session = local_session
 
@@ -454,6 +475,108 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             except:
                 pass
 
+def _ask(prompt, default=None):
+    """Read a line from the terminal. Returns None when the user backs out."""
+    try:
+        answer = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not answer and default is not None:
+        return default
+    return answer
+
+
+def run_login_wizard(name_hint="", browser="chromium", timeout_s=300.0):
+    """Interactively sign in to a Torbox account and save it as a profile.
+
+    This is the one time a human has to log in: the saved session carries a
+    refresh token, so every later run signs itself in.
+
+    Returns a process exit code.
+    """
+    from torbox_downloader.browser_session import interactive_login
+    from torbox_downloader.profiles import ProfileStore, extract_email, valid_name
+
+    store = ProfileStore()
+    existing = store.names()
+
+    print("")
+    print("Torbox accounts")
+    if existing:
+        for n in existing:
+            entry = store.get(n) or {}
+            who = " (%s)" % entry["email"] if entry.get("email") else ""
+            state = "signed in" if store.has_state(n) else "not signed in"
+            print("  - %s%s - %s" % (n, who, state))
+    else:
+        print("  (none yet)")
+
+    name = (name_hint or "").strip()
+    while True:
+        if not name:
+            name = _ask("\nProfile name [default]: ", default="default")
+            if name is None:
+                print("Cancelled.")
+                return 1
+        if not valid_name(name):
+            print("  Names may only contain letters, digits, '.', '_' and '-'.")
+            name = ""
+            continue
+        break
+
+    if store.exists(name) and store.has_state(name):
+        answer = _ask("'%s' already has a saved session. Replace it? [y/N]: " % name, default="n")
+        if not answer or answer.lower() not in ("y", "yes"):
+            print("Kept the existing session.")
+            return 0
+
+    store.add(name)
+    print("")
+    print("Signing in as '%s'. A browser window will open now." % name)
+    print("Log in there - this finishes on its own. Ctrl+C to cancel.")
+    print("")
+    print("If Cloudflare Turnstile refuses the login, start your normal Chrome")
+    print("with --remote-debugging-port=9222 (a separate command), then re-run")
+    print("this. The app will attach to that browser instead of launching one.")
+    print("")
+
+    last = {"text": None}
+
+    def on_status(text):
+        # Print only when the message changes, so the periodic countdown
+        # updates do not flood the terminal.
+        if text != last["text"]:
+            last["text"] = text
+            print("  " + text)
+
+    try:
+        ok, msg = interactive_login(
+            store.storage_path(name),
+            browser_type=browser,
+            timeout_s=timeout_s,
+            on_status=on_status,
+        )
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+
+    if ok:
+        email = extract_email(store.load_state(name)) or ""
+        print("")
+        print("Saved profile '%s'%s. It refreshes itself from here on."
+              % (name, " (%s)" % email if email else ""))
+        print("Use it with:  python main.py --profile %s" % name)
+        return 0
+
+    print("")
+    print("Sign-in failed: %s" % msg)
+    retry = _ask("Try again? [Y/n]: ", default="y")
+    if retry and retry.lower() in ("y", "yes"):
+        return run_login_wizard(name_hint=name, browser=browser, timeout_s=timeout_s)
+    return 1
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Torbox Folder-Structure Downloader GUI")
     parser.add_argument('--url', type=str, default="https://torbox.app/download", help="URL of the Torbox download page (default: https://torbox.app/download)")
@@ -466,9 +589,17 @@ if __name__ == '__main__':
     parser.add_argument('--parallel-files', type=int, default=1, help="Max number of parallel file downloads")
     parser.add_argument('--disk-profile', type=str, default='auto', choices=['auto', 'hdd', 'ssd'], help="Disk I/O strategy. 'hdd' forces one sequential write stream with large buffers (lowest disk utilisation); 'auto' detects the drive type (default: auto)")
     parser.add_argument('--write-buffer-mb', type=float, default=None, help="Size of the in-memory write buffer per download stream, in MB (default: 8 on SSD, 32 on HDD)")
+    parser.add_argument('--profile', '-p', type=str, default=None, help="Account profile to use (profiles live in profiles/). Defaults to the last active one.")
+    parser.add_argument('--login', type=str, nargs='?', const='', default=None, metavar="NAME", help="Sign in to a Torbox account and save it as NAME. Omit NAME to pick or create one interactively.")
     
     args = parser.parse_args()
-    
+
+    # One-off interactive sign-in for a profile. This is the only time a human
+    # has to log in: the saved session carries a refresh token afterwards.
+    if args.login is not None:
+        # `--login` with no NAME starts the interactive chooser.
+        sys.exit(run_login_wizard(args.login, browser=args.browser))
+
     # Check for token file
     token_val = args.token
     default_token_file = 'token.txt'
@@ -487,7 +618,7 @@ if __name__ == '__main__':
     # Launch GUI by default unless --no-gui is specified
     if args.gui:
         from gui_server import start_gui_server
-        start_gui_server(token=token_val, dest_dir=args.dir, delay=args.delay, browser_type=args.browser, headless=args.headless)
+        start_gui_server(token=token_val, dest_dir=args.dir, delay=args.delay, browser_type=args.browser, headless=args.headless, profile=args.profile)
     else:
         run_downloader(
             url=args.url,
@@ -498,5 +629,6 @@ if __name__ == '__main__':
             delay=args.delay,
             max_parallel_files=args.parallel_files,
             disk_profile=args.disk_profile,
-            buffer_mb=args.write_buffer_mb
+            buffer_mb=args.write_buffer_mb,
+            profile=args.profile
         )

@@ -362,6 +362,102 @@ body {
     box-shadow: var(--ring);
 }
 
+/* Account picker: a native select styled to sit beside the session field. */
+.input-wrapper select.profile-select {
+    background-color: var(--bg-inset);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 7px 10px;
+    font-size: 12.5px;
+    font-family: inherit;
+    flex-grow: 1;
+    min-width: 0;
+    max-width: 190px;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out;
+}
+
+.input-wrapper select.profile-select:focus {
+    border-color: rgba(4, 191, 138, 0.55);
+    box-shadow: var(--ring);
+}
+
+.profile-name-input {
+    width: 100%;
+    background-color: var(--bg-inset);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: var(--font-mono);
+    outline: none;
+    transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out;
+}
+
+.profile-name-input:focus {
+    border-color: rgba(4, 191, 138, 0.55);
+    box-shadow: var(--ring);
+}
+
+/* Sign-in progress: an indeterminate bar, since the wait is on a human. */
+#add-profile-progress-bar {
+    background: linear-gradient(90deg, #069970, var(--accent-emerald-bright));
+    border-radius: 999px;
+    height: 100%;
+    width: 0%;
+}
+
+#add-profile-progress-bar.indeterminate {
+    width: 35%;
+    animation: profile-progress-slide 1.5s ease-in-out infinite;
+}
+
+@keyframes profile-progress-slide {
+    0% { margin-left: 0%; }
+    50% { margin-left: 65%; }
+    100% { margin-left: 0%; }
+}
+
+#add-profile-status.login-failed {
+    color: var(--accent-red);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #add-profile-progress-bar.indeterminate {
+        animation: none;
+        width: 100%;
+    }
+}
+
+/* Dashboard torrent-queue refresh button: compact round icon that spins
+   while the scan request is in flight. */
+.queue-refresh-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+}
+
+.queue-refresh-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.queue-refresh-btn.is-spinning svg {
+    animation: queue-refresh-spin 0.9s linear infinite;
+    transform-origin: 50% 50%;
+}
+
+@keyframes queue-refresh-spin {
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .queue-refresh-btn.is-spinning svg { animation: none; }
+}
+
 .header-right {
     display: flex;
     gap: 8px;

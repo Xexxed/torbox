@@ -6,6 +6,7 @@ import logging
 import base64
 import re
 import queue
+import subprocess
 import threading
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,136 @@ logger = logging.getLogger(__name__)
 SCAN_MAX_ROUNDS = 60        # hard cap on scroll rounds (safety net)
 SCAN_STALE_ROUNDS = 3       # stop after this many consecutive rounds with no new cards
 SCAN_SCROLL_WAIT_MS = 400   # wait between scroll rounds so the SPA can render
+
+# How often the refreshed session is flushed back to the profile's storage
+# state. The SPA rotates its tokens in the background, so persisting on a
+# coarse interval is enough to never start from a stale token.
+STATE_SAVE_INTERVAL_S = 60.0
+
+# Real Chrome/Edge are detected as ordinary browsers by Cloudflare Turnstile,
+# whereas the bundled Chromium that Playwright ships carries automation markers
+# (navigator.webdriver, the Blink AutomationControlled flag) and gets refused.
+# Use the installed system browser whenever possible; fall back to bundled
+# Chromium only when neither is available.
+LOGIN_BROWSER_PREFERENCE = ("chrome", "msedge", "chromium")
+
+
+def _launch_engine(pw, name, headless=True, args=None):
+    """Launch a Playwright browser by name, mapping to real channels.
+
+    ``name`` accepts ``chromium``, ``firefox``, ``webkit`` (the bundled
+    engines) plus ``chrome`` and ``msedge`` (the installed system browsers
+    via Playwright's channel mechanism).
+    """
+    args = list(args or [])
+    if name == "chrome":
+        return pw.chromium.launch(channel="chrome", headless=headless, args=args)
+    if name == "msedge":
+        return pw.chromium.launch(channel="msedge", headless=headless, args=args)
+    engine = getattr(pw, name, None) or pw.chromium
+    return engine.launch(headless=headless, args=args)
+
+
+def _cdp_alive(url, timeout=1.0):
+    """True when a browser is already serving the DevTools endpoint."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/json/version", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _find_real_browser():
+    """Locate an installed Chrome or Edge, or None."""
+    candidates = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for path in (
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+                ):
+                    try:
+                        with winreg.OpenKey(root, path) as key:
+                            value, _ = winreg.QueryValueEx(key, "")
+                            if value:
+                                candidates.append(value)
+                    except OSError:
+                        continue
+        except Exception:
+            pass
+        candidates += [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+    else:
+        from shutil import which
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "microsoft-edge"):
+            found = which(name)
+            if found:
+                candidates.append(found)
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def spawn_debug_browser(url, user_data_dir=None, wait_s=30.0):
+    """Start a real Chrome/Edge with a debugging port so we can attach to it.
+
+    Cloudflare Turnstile rejects any browser Playwright launched, but the very
+    same browser started by us as a plain subprocess and then *attached to*
+    passes, because Playwright never owns its launch. Returns True when a
+    browser was started, False when nothing could be started.
+    """
+    from urllib.parse import urlparse
+
+    if _cdp_alive(url):
+        return False  # something is already listening; reuse it
+
+    exe = _find_real_browser()
+    if not exe:
+        logger.info("No installed Chrome or Edge found to start in debug mode.")
+        return False
+
+    port = urlparse(url).port or 9222
+    if not user_data_dir:
+        user_data_dir = os.path.join(os.getcwd(), ".chrome-debug")
+    try:
+        os.makedirs(user_data_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    # Mirrors the invocation that is known to work:
+    #   chrome.exe --remote-debugging-port=9222 \
+    #       --user-data-dir=<dir> --no-first-run --no-default-browser-check
+    cmd = [
+        exe,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logger.warning("Could not start %s: %s", exe, e)
+        return False
+
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if _cdp_alive(url, timeout=0.5):
+            return True
+        time.sleep(0.5)
+    logger.warning("Started %s but the debug port never opened.", exe)
+    return False
 
 def is_token_expired(token):
     """
@@ -67,12 +198,18 @@ class TorboxBrowserSession:
     Initializes and controls Playwright on a dedicated worker thread
     to comply with Playwright's thread-affinity constraints.
     """
-    def __init__(self, token, browser_type="chromium", headless=True, download_url="https://torbox.app/download"):
+    def __init__(self, token=None, browser_type="chromium", headless=True, download_url="https://torbox.app/download",
+                 storage_state=None, state_path=None):
         self.token = token
         self.browser_type = browser_type
         self.headless = headless
         self.download_url = download_url
-        
+        # `storage_state` is a Playwright storage state (dict or path) holding
+        # the Supabase session; `state_path` is where the *refreshed* session is
+        # written back so the next run starts from a live token.
+        self.storage_state = storage_state
+        self.state_path = state_path
+
         self.command_queue = queue.Queue()
         self.worker_thread = None
         self._running = False
@@ -84,6 +221,7 @@ class TorboxBrowserSession:
         
         self._intercepted_download_url = None
         self._recovery_count = 0
+        self._last_state_save = 0.0
 
     def start(self):
         """Spawns the background worker thread."""
@@ -173,6 +311,11 @@ class TorboxBrowserSession:
                 try:
                     res = self._execute_action(cmd.action, *cmd.args, **cmd.kwargs)
                     cmd.result_queue.put((True, res))
+                    try:
+                        # Rate-limited inside -- cheap enough to call every op.
+                        self.save_state()
+                    except Exception:
+                        pass
                 except Exception as ex:
                     logger.exception(f"Error executing command {cmd.action}: {ex}")
                     cmd.result_queue.put((False, ex))
@@ -183,23 +326,33 @@ class TorboxBrowserSession:
             self._running = False
 
     def _init_browser(self):
-        engine = getattr(self.playwright, self.browser_type)
         browser_args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-blink-features=AutomationControlled"
         ]
-        launch_args = browser_args if self.browser_type == 'chromium' else []
-        
         try:
-            self.browser = engine.launch(headless=self.headless, args=launch_args)
+            self.browser = _launch_engine(self.playwright, self.browser_type,
+                                          headless=self.headless, args=browser_args)
         except Exception:
-            self.browser = engine.launch(headless=self.headless)
+            # Retry without the flags in case the installed browser rejects them.
+            self.browser = _launch_engine(self.playwright, self.browser_type,
+                                          headless=self.headless, args=[])
             
-        self.context = self.browser.new_context(
-            viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        context_kwargs = {
+            'viewport': {'width': 1280, 'height': 800},
+            'user_agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        # Restoring the profile's storage state is what keeps us signed in: it
+        # carries the Supabase session, refresh token included.
+        if self.storage_state:
+            context_kwargs['storage_state'] = self.storage_state
+        try:
+            self.context = self.browser.new_context(**context_kwargs)
+        except Exception as e:
+            logger.warning("Could not restore storage state (%s); starting clean.", e)
+            context_kwargs.pop('storage_state', None)
+            self.context = self.browser.new_context(**context_kwargs)
         
         self.page = self.context.new_page()
         
@@ -253,8 +406,12 @@ class TorboxBrowserSession:
         # Authenticate and go to destination
         self._authenticate()
 
-    def _authenticate(self):
-        if self.token:
+    def _authenticate(self, force_inject=False):
+        # With a profile the session already lives in the context's storage
+        # state. Injecting a pasted token there would overwrite the freshly
+        # refreshed one, so only inject when there is no stored state -- unless
+        # the caller is deliberately supplying a new token.
+        if self.token and (force_inject or not self.storage_state):
             try:
                 self.page.goto("https://torbox.app/login", wait_until="commit", timeout=15000)
                 self.page.evaluate(f"localStorage.setItem('sb-db-auth-token', {json.dumps(self.token)})")
@@ -280,7 +437,37 @@ class TorboxBrowserSession:
         except Exception:
             pass
 
+        # The SPA may have refreshed the session while loading; capture it.
+        self.save_state(force=True)
+
+    def save_state(self, force=False):
+        """Write the context's current storage state back to the profile.
+
+        The page rotates its Supabase tokens on its own, so this is what keeps
+        the on-disk profile alive across restarts. Must run on the worker
+        thread -- Playwright objects are thread-affine.
+        """
+        if not self.state_path or self.context is None:
+            return False
+        now = time.time()
+        if not force and (now - self._last_state_save) < STATE_SAVE_INTERVAL_S:
+            return False
+        try:
+            self.context.storage_state(path=self.state_path)
+            self._last_state_save = now
+            logger.info("Saved refreshed session to %s", os.path.basename(str(self.state_path)))
+            return True
+        except Exception as e:
+            logger.warning(f"Could not save storage state: {e}")
+            return False
+
     def _close_browser(self):
+        # Flush before the context goes away, or a refresh that happened during
+        # this run would be lost.
+        try:
+            self.save_state(force=True)
+        except Exception:
+            pass
         if self.context:
             try:
                 self.context.close()
@@ -713,7 +900,8 @@ class TorboxBrowserSession:
         elif action == "update_token":
             new_token = args[0]
             self.token = new_token
-            self._authenticate()
+            # A pasted token replaces whatever the profile held.
+            self._authenticate(force_inject=True)
             return True
             
         elif action == "get_page_content":
@@ -721,3 +909,155 @@ class TorboxBrowserSession:
             
         else:
             raise ValueError(f"Unknown action: {action}")
+
+
+def interactive_login(state_path, browser_type="chromium", timeout_s=300.0,
+                      is_cancelled=None, on_status=None):
+    """Open a visible browser, wait for a human to sign in, then save the profile.
+
+    This is the one-time cost of adding an account: the resulting storage state
+    carries the refresh token, so every later run signs itself in.
+
+    Runs its own Playwright instance and must therefore be called from a thread
+    that owns it start-to-finish. Returns ``(ok, message)``.
+    """
+    from playwright.sync_api import sync_playwright
+
+    def status(text):
+        logger.info("interactive login: %s", text)
+        if on_status:
+            try:
+                on_status(text)
+            except Exception:
+                pass
+
+    pw = None
+    browser = None
+    chosen = browser_type
+    # `owns_browser` distinguishes "we launched this; safe to close" from
+    # "we connected to the user's running Chrome via CDP; must NOT close".
+    owns_browser = False
+    try:
+        pw = sync_playwright().start()
+        # Cloudflare Turnstile refuses any browser that Playwright launched
+        # itself (it can tell from the CDP plumbing). The only way to pass it
+        # reliably is to attach to a Chrome the user already started with
+        # `--remote-debugging-port=9222`. If nothing is listening there we fall
+        # back to launching a real channel browser, which usually works.
+        cdp_url = os.environ.get("TORBOX_CDP_URL", "http://localhost:9222").strip()
+        if browser_type in ("auto", "chromium"):
+            try:
+                browser = pw.chromium.connect_over_cdp(cdp_url)
+                owns_browser = False
+                chosen = "your Chrome (via CDP)"
+                status(f"Connected to your Chrome at {cdp_url}.")
+            except Exception:
+                browser = None
+                # Nothing listening yet: start a real Chrome/Edge ourselves and
+                # attach to it. Playwright never owns the launch, so Turnstile
+                # treats it as an ordinary browser.
+                status("Starting Chrome in debug mode so Turnstile will accept it...")
+                if spawn_debug_browser(cdp_url):
+                    try:
+                        browser = pw.chromium.connect_over_cdp(cdp_url)
+                        owns_browser = False
+                        chosen = "Chrome (debug mode, via CDP)"
+                        status(f"Connected to Chrome on {cdp_url}.")
+                    except Exception as e:
+                        logger.warning("Could not attach to the debug browser: %s", e)
+                        browser = None
+
+        if browser is None:
+            for cand in LOGIN_BROWSER_PREFERENCE:
+                try:
+                    browser = _launch_engine(pw, cand, headless=False)
+                    owns_browser = True
+                    chosen = cand
+                    break
+                except Exception as e:
+                    logger.info("Real browser '%s' unavailable: %s", cand, e)
+                    continue
+        if browser is None:
+            try:
+                browser = _launch_engine(pw, browser_type, headless=False)
+                owns_browser = True
+                chosen = browser_type
+            except Exception as e:
+                return False, (
+                    "Could not start the login browser: %s. If Cloudflare is blocking "
+                    "Turnstile, run Chrome yourself with --remote-debugging-port=9222 "
+                    "and the app will attach to it." % e
+                )
+
+        if chosen not in ("chromium",):
+            status(f"Opening {chosen} - sign in to Torbox there.")
+        else:
+            status("Opening a browser window - sign in to Torbox there.")
+
+        # A new context gives us a clean slate so we never write into the user's
+        # actual profile (cookies, history, extensions).
+        context = browser.new_context(viewport={'width': 1280, 'height': 900})
+        page = context.new_page()
+        try:
+            page.goto("https://torbox.app/login", wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            logger.warning("Login page navigation failed: %s", e)
+        status("Sign in to Torbox in the browser window - this finishes on its own.")
+
+        started = time.time()
+        deadline = started + timeout_s
+        session = None
+        last_report = 0.0
+        while time.time() < deadline:
+            if is_cancelled and is_cancelled():
+                return False, "Cancelled."
+            try:
+                if page.is_closed():
+                    return False, "The browser window was closed before sign-in finished."
+                session = page.evaluate("() => localStorage.getItem('sb-db-auth-token')")
+            except Exception:
+                session = None
+            if session:
+                break
+            now = time.time()
+            if now - last_report >= 5.0:
+                last_report = now
+                status(
+                    f"Waiting for sign-in... {int(now - started)}s elapsed, "
+                    f"{max(0, int(deadline - now))}s left."
+                )
+            time.sleep(1.0)
+
+        if not session:
+            return False, (
+                "Timed out waiting for sign-in. If Turnstile blocked it, start "
+                "Chrome yourself with --remote-debugging-port=9222 and try again."
+            )
+
+        time.sleep(2.0)
+        try:
+            context.storage_state(path=str(state_path))
+        except Exception as e:
+            return False, f"Signed in but could not save the profile: {e}"
+        # An incognito-like context from CDP is throwaway; close it but keep
+        # the user's browser window open.
+        try:
+            context.close()
+        except Exception:
+            pass
+        status("Signed in and saved.")
+        return True, "Signed in and saved."
+    except Exception as e:
+        logger.exception("Interactive login failed: %s", e)
+        return False, f"Could not start the login browser: {e}"
+    finally:
+        if owns_browser and browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:
+                pass

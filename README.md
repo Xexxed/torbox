@@ -43,6 +43,87 @@ with a one-time `api_key`, and runs the download pipeline in the background. Use
 | `--parallel-files` | How many files to download at once |
 | `--disk-profile` | `auto` / `hdd` / `ssd` — disk I/O strategy |
 | `--no-gui` | Run the CLI pipeline without the dashboard |
+| `--profile`, `-p` | Which account profile to use (default: the last active one) |
+| `--login NAME` | Open a browser, sign in once, and save that account as `NAME`, then exit |
+
+## Accounts (profiles)
+
+The app can hold several TorBox accounts and switch between them. One account is
+active at a time and downloads never span accounts concurrently, so a single
+browser session and the existing browser-op lock are shared by all of them.
+
+**A profile is not a token.** It is the browser's whole saved session, exported by
+Playwright as *storage state* — cookies plus `localStorage`. That distinction is
+the whole point: TorBox signs in with Supabase, whose page keeps a
+`refresh_token` and silently exchanges it for a new `access_token` about every
+hour. Paste a token by hand and it expires; let the browser own the session and it
+renews itself indefinitely.
+
+| Path | What it holds |
+|---|---|
+| `profiles.json` | The registry — which accounts exist and which is active |
+| `profiles/<name>.json` | That account's saved session |
+
+Both hold live credentials and both are gitignored.
+
+Add an account from the dashboard (**Account → Add…**) or from a shell:
+
+```bash
+python main.py --login             # interactive: lists accounts, asks for a name
+python main.py --login backup      # or name it up front
+python main.py --profile backup    # use it from then on
+```
+
+Sign-in is a guided exchange rather than a silent wait. The shell lists the
+accounts you already have, asks for a name, confirms before replacing a session
+that still works, then reports progress with a running countdown while you log in
+in the browser. If it times out — or you close the window — it says why and
+offers to try again; `Ctrl+C` cancels cleanly. The dashboard does the same: the
+modal shows an indeterminate bar and the live status, and on failure it stays
+open with a **Try again** button instead of losing the name you typed.
+
+**Cloudflare Turnstile note.** Playwright-launched browsers carry subtle CDP
+fingerprints that Cloudflare's managed challenge picks up, and refuse the login
+with "Verification failed" — even with real Chrome launched via
+`channel="chrome"`. What works is a Chrome that Playwright never *launched*:
+it only **attaches** to it over the DevTools port.
+
+So `--login` does this automatically. It looks for an installed Chrome or Edge,
+starts it as a plain subprocess with its own throwaway profile, and connects to
+it over CDP:
+
+```
+chrome.exe --remote-debugging-port=9222 \
+    --user-data-dir=<project>/.chrome-debug \
+    --no-first-run --no-default-browser-check
+```
+
+That browser is left open afterwards so you can carry on using it; close it
+when you're done. If something is already listening on 9222 the app just
+attaches to that instead, so you can also start Chrome yourself:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="D:\Projects\torbox\.chrome-debug" `
+  --no-first-run --no-default-browser-check
+```
+
+Only if no real browser can be found does it fall back to launching its own
+Chrome / Edge / Chromium, which is the path Turnstile tends to block.
+`TORBOX_CDP_URL` overrides the attach target; `.chrome-debug/` is gitignored.
+
+The refreshed session is written back while the app runs, so accounts stay signed
+in across restarts. A pre-existing `token.txt` is imported into the `default`
+profile on first run, so pasting a token still works exactly as before.
+
+Two behaviours worth knowing:
+
+- **Switching accounts stops the browser session, unmounts any virtual drive and
+  clears the queue.** A mounted drive and a queued batch belong to one account,
+  so they are torn down rather than silently re-pointed at another.
+- **Each account can have its own download directory.** Accounts without one fall
+  back to the global path, and never inherit the previous account's.
 
 ## Tabs
 
@@ -183,6 +264,10 @@ accepting one from the request.
 
 `tests/test_stream_layout.py` reads the stylesheet as text and pins the poster-rail grid
 rules, so the rail cannot silently regress to a single horizontal band.
+
+`tests/test_profiles.py` covers the account store: name validation (a profile name
+becomes a filename, so path traversal is rejected), wrapping a Supabase session as
+storage state, the save/load round trip, and migration of a legacy `token.txt`.
 
 ## More detail
 

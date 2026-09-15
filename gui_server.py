@@ -12,6 +12,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from torbox_downloader import remux, vlc
+from torbox_downloader.profiles import ProfileStore, extract_email, extract_session, valid_name
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,10 @@ class AppState:
         self.browser_op_lock_timeout_s = 60.0
         self.token = ""
         self.email = ""
+        # `dest_dir` is the *effective* path (what the UI shows and uses);
+        # `global_dest_dir` is the fallback for accounts that do not define one.
         self.dest_dir = "downloads"
+        self.global_dest_dir = "downloads"
         self.delay = 5
         self.browser_type = "chromium"
         self.headless = True
@@ -154,13 +158,25 @@ class AppState:
         # TTL cache for shutil.disk_usage() to avoid a filesystem syscall on
         # every /api/status poll (which fires every ~500 ms from the frontend).
         self._disk_cache: dict = {"free_space": "Unknown", "expires": 0.0}
+        # Dedupes concurrent requests to rescan the torrent list (from the
+        # dashboard refresh button or an automatic scan after profile switch).
+        self._scan_in_flight = False
 
         # Virtual drive (RaiDrive-style mount); "" = auto-pick a free letter.
         from torbox_downloader.mount.manager import DriveMountManager
         self.mount_manager = DriveMountManager()
         self.mount_drive_letter = ""
 
-        # Load default token if present
+        # Named accounts ("profiles"). Each owns a saved browser session, so
+        # switching accounts never shares -- and therefore never invalidates --
+        # another account's refresh token.
+        self.profiles = ProfileStore()
+        self.active_profile = None
+        # Progress of an interactive "add profile" sign-in, polled by the UI.
+        self._login_flow = {"active": False, "message": "", "profile": None,
+                            "ok": None, "cancel": False}
+
+        # Load default token if present (legacy; kept as a fallback)
         if os.path.exists("token.txt"):
             try:
                 with open("token.txt", "r", encoding="utf-8") as f:
@@ -168,12 +184,26 @@ class AppState:
                 self.email = extract_email_from_token(self.token)
             except Exception:
                 pass
-                
+
         # Load or create persistent settings
         if not os.path.exists("settings.json"):
             self.save_settings()
         else:
             self.load_settings()
+
+        # Import a legacy token.txt into the default profile, then settle on one.
+        try:
+            self.profiles.ensure_default()
+        except Exception:
+            pass
+        if not self.active_profile or not self.profiles.exists(self.active_profile):
+            names = self.profiles.names()
+            self.active_profile = self.profiles.active() or (names[0] if names else None)
+        self._sync_profile_identity()
+        # An account may override the download path; apply it on startup too.
+        entry = self.profiles.get(self.active_profile) if self.active_profile else None
+        if entry and entry.get("dest_dir"):
+            self.dest_dir = entry["dest_dir"]
         self.mount_manager.set_preferred_letter(self.mount_drive_letter)
 
     def load_settings(self):
@@ -183,6 +213,7 @@ class AppState:
                     data = json.load(f)
                     if "dest_dir" in data:
                         self.dest_dir = data["dest_dir"]
+                        self.global_dest_dir = data["dest_dir"]
                     if "delay" in data:
                         self.delay = data["delay"]
                     if "max_parallel_files" in data:
@@ -205,6 +236,8 @@ class AppState:
                             self.browser_op_lock_timeout_s = max(1.0, float(data["browser_op_lock_timeout_s"]))
                         except (TypeError, ValueError):
                             pass
+                    if "active_profile" in data:
+                        self.active_profile = str(data["active_profile"]).strip() or None
             except Exception:
                 pass
 
@@ -212,7 +245,7 @@ class AppState:
         try:
             with open("settings.json", "w", encoding="utf-8") as f:
                 json.dump({
-                    "dest_dir": self.dest_dir,
+                    "dest_dir": self.global_dest_dir,
                     "delay": self.delay,
                     "max_parallel_files": self.max_parallel_files,
                     "parallel_connections": self.parallel_connections,
@@ -221,7 +254,8 @@ class AppState:
                     "watch_mode": self.watch_mode,
                     "watch_interval": self.watch_interval,
                     "mount_drive_letter": self.mount_drive_letter,
-                    "browser_op_lock_timeout_s": self.browser_op_lock_timeout_s
+                    "browser_op_lock_timeout_s": self.browser_op_lock_timeout_s,
+                    "active_profile": self.active_profile
                 }, f)
         except Exception:
             pass
@@ -239,6 +273,14 @@ class AppState:
         self.stop_session()
         self.drop_vfs()
 
+        # The saved session is dead as well, so drop it -- otherwise the next
+        # run would sign straight back in with the same expired credentials.
+        try:
+            if self.active_profile and self.profiles.has_state(self.active_profile):
+                os.remove(self.profiles.storage_path(self.active_profile))
+        except Exception:
+            pass
+
         if os.path.exists("token.txt"):
             try:
                 os.remove("token.txt")
@@ -249,13 +291,22 @@ class AppState:
     def get_or_create_session(self, token=None, browser_type=None, headless=None):
         with self.session_lock:
             if not self.session:
+                from torbox_downloader.browser_session import TorboxBrowserSession
+                name = self.active_profile
+                # A saved session is preferred over any pasted token: it carries
+                # a refresh token, so it survives restarts on its own.
+                state = self.profiles.load_state(name) if name else None
+                state_path = self.profile_state_path(name)
                 tok = token or self.token
-                if tok:
-                    from torbox_downloader.browser_session import TorboxBrowserSession
-                    b_type = browser_type or self.browser_type
-                    h_less = headless if headless is not None else self.headless
-                    self.session = TorboxBrowserSession(tok, b_type, h_less)
-                    self.session.start()
+                if not state and not tok:
+                    return None
+                b_type = browser_type or self.browser_type
+                h_less = headless if headless is not None else self.headless
+                self.session = TorboxBrowserSession(
+                    None if state else tok, b_type, h_less,
+                    storage_state=state, state_path=state_path,
+                )
+                self.session.start()
             return self.session
 
     def stop_session(self):
@@ -308,6 +359,145 @@ class AppState:
                 vfs.close_all_readers()
             except Exception:
                 pass
+
+    # --- profiles (named Torbox accounts) ---------------------------------
+
+    def _sync_profile_identity(self):
+        """Derive ``token`` / ``email`` from the active profile's saved session."""
+        name = self.active_profile
+        state = self.profiles.load_state(name) if name else None
+        session = extract_session(state) if state else None
+        if session:
+            try:
+                self.token = json.dumps(session)
+            except Exception:
+                self.token = session.get("access_token", "") or ""
+        else:
+            self.token = ""
+        self.email = (extract_email(state) if state else "") or ""
+        if name and self.email:
+            try:
+                self.profiles.set_email(name, self.email)
+            except Exception:
+                pass
+
+    def profile_state_path(self, name=None):
+        name = name or self.active_profile
+        return self.profiles.storage_path(name) if name else None
+
+    def switch_profile(self, name):
+        """Change the active account.
+
+        Exactly one account is signed in at a time and downloads never span
+        accounts concurrently, so switching simply tears the old session down.
+        A mounted drive or queued batch belongs to the old account, so both are
+        cleared rather than silently re-pointed at the new one.
+        """
+        if name == self.active_profile:
+            return True
+        if not self.profiles.exists(name):
+            raise ValueError(f"Unknown profile: {name}")
+
+        try:
+            if str(self.mount_manager.status_snapshot().get("status", "")).lower() == "mounted":
+                self.mount_manager.unmount_async(self)
+        except Exception:
+            pass
+
+        self.stop_session()
+        self.drop_vfs()
+        with self.lock:
+            self.queue = []
+            self._queue_index = {}
+            self.active_downloads = {}
+            self.status = "idle"
+            self.error_message = ""
+
+        self.active_profile = name
+        try:
+            self.profiles.set_active(name)
+        except Exception:
+            pass
+        self._sync_profile_identity()
+
+        # Fall back to the global path so an account without its own does not
+        # inherit whatever the previous account happened to use.
+        entry = self.profiles.get(name) or {}
+        self.dest_dir = entry.get("dest_dir") or self.global_dest_dir
+        self.save_settings()
+        self.add_log(f"[{time.strftime('%H:%M:%S')}] Switched to profile '{name}'.")
+
+        # Populate the queue for the new account right away. Without this the
+        # dashboard stays on "Queue is empty" until the user clicks Start
+        # download - confusing, because nothing visually connects the switch
+        # to the missing data.
+        try:
+            trigger_torrent_scan()
+        except Exception as e:
+            self.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Could not auto-scan after switch: {e}")
+        return True
+
+    def start_add_profile(self, name, browser_type=None):
+        """Begin an interactive sign-in that creates (or refreshes) a profile."""
+        if not valid_name(name):
+            raise ValueError(
+                "Profile names may only contain letters, digits, '.', '_' and '-'."
+            )
+        if self._login_flow.get("active"):
+            raise RuntimeError("A sign-in is already in progress.")
+        if self.profiles.exists(name):
+            raise ValueError(f"A profile named '{name}' already exists.")
+
+        self.profiles.add(name)
+        state_path = self.profiles.storage_path(name)
+        browser = browser_type or self.browser_type
+        flow = self._login_flow
+        flow.update({"active": True, "message": "Opening a browser window...",
+                     "profile": name, "ok": None, "cancel": False})
+
+        def on_status(text):
+            flow["message"] = text
+
+        def worker():
+            try:
+                from torbox_downloader.browser_session import interactive_login
+                ok, msg = interactive_login(
+                    state_path,
+                    browser_type=browser,
+                    is_cancelled=lambda: flow["cancel"],
+                    on_status=on_status,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                ok, msg = False, str(e)
+            flow["ok"] = bool(ok)
+            flow["message"] = msg
+            flow["active"] = False
+            if ok:
+                try:
+                    self.profiles.set_email(name, extract_email(self.profiles.load_state(name)) or "")
+                except Exception:
+                    pass
+                self.add_log(f"[{time.strftime('%H:%M:%S')}] Signed in to profile '{name}'.")
+            else:
+                try:
+                    if not self.profiles.has_state(name):
+                        self.profiles.remove(name)
+                except Exception:
+                    pass
+                self.add_log(f"[{time.strftime('%H:%M:%S')}] Sign-in for '{name}' failed: {msg}")
+
+        threading.Thread(target=worker, name="ProfileLogin", daemon=True).start()
+        return True
+
+    def cancel_add_profile(self):
+        self._login_flow["cancel"] = True
+        self._login_flow["message"] = "Cancelling..."
+        return True
+
+    def login_flow_snapshot(self):
+        flow = self._login_flow
+        return {"active": bool(flow["active"]), "message": flow["message"],
+                "profile": flow["profile"], "ok": flow["ok"]}
 
     def clear_logs(self):
         with self.lock:
@@ -431,7 +621,10 @@ class AppState:
             "watch_mode": watch_mode,
             "watch_interval": watch_interval,
             "mount": self.mount_manager.status_snapshot(),
-            "mount_drive_letter": self.mount_drive_letter
+            "mount_drive_letter": self.mount_drive_letter,
+            "active_profile": self.active_profile,
+            "profiles": self.profiles.list(),
+            "login": self.login_flow_snapshot()
         }
 
 app_state = AppState()
@@ -492,6 +685,29 @@ def scan_torrents_background():
             app_state.handle_token_expired()
         else:
             app_state.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Background scan failed: {e}")
+
+
+def trigger_torrent_scan():
+    """Kick off a background scan, deduplicated so repeated clicks don't stack workers.
+
+    Returns True when a new scan was started, False when one was already in
+    flight (the caller can use that to show feedback like "already scanning").
+    """
+    with app_state.lock:
+        if app_state._scan_in_flight:
+            return False
+        app_state._scan_in_flight = True
+
+    def worker():
+        try:
+            scan_torrents_background()
+        finally:
+            with app_state.lock:
+                app_state._scan_in_flight = False
+
+    threading.Thread(target=worker, name="TorrentScan", daemon=True).start()
+    return True
+
 
 def downloader_worker(url, dest_dir, delay, headless, browser_type, token, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, disk_profile="auto", write_buffer_mb=0):
     app_state.set_status("scanning")
@@ -908,6 +1124,15 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(app_state.get_serializable_state()).encode("utf-8"))
             return
 
+        if self.path.startswith("/api/profiles"):
+            self._send_json({
+                "success": True,
+                "active": app_state.active_profile,
+                "profiles": app_state.profiles.list(),
+                "login": app_state.login_flow_snapshot(),
+            })
+            return
+
         if self.path.startswith("/api/stream/library"):
             # Root torrent listing for the Stream tab. Metadata only: no links.
             try:
@@ -1016,6 +1241,20 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": dest_err}).encode("utf-8"))
                 return
 
+            # Switching accounts stops the session, so it runs outside the state
+            # lock that switch_profile() takes itself.
+            if "active_profile" in params:
+                requested = str(params["active_profile"]).strip()
+                if requested and requested != app_state.active_profile:
+                    try:
+                        app_state.switch_profile(requested)
+                    except Exception as e:
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                        return
+
             with app_state.lock:
                 if "token" in params:
                     new_token = params["token"].strip()
@@ -1025,8 +1264,24 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                         token_updated = True
                         with open("token.txt", "w", encoding="utf-8") as f:
                             f.write(app_state.token)
+                        # A pasted token is imported into a profile so the
+                        # browser's own refresh can keep it alive from here on.
+                        try:
+                            if not app_state.active_profile:
+                                app_state.profiles.add("default", email=app_state.email)
+                                app_state.active_profile = "default"
+                                app_state.profiles.set_active("default")
+                        except Exception:
+                            pass
                 if "dest_dir" in params and not dest_err:
                     app_state.dest_dir = params["dest_dir"].strip()
+                    try:
+                        if app_state.active_profile:
+                            app_state.profiles.set_dest_dir(app_state.active_profile, app_state.dest_dir)
+                        else:
+                            app_state.global_dest_dir = app_state.dest_dir
+                    except Exception:
+                        pass
                 if "delay" in params:
                     app_state.delay = int(params["delay"])
                 if "max_parallel_files" in params:
@@ -1086,6 +1341,67 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path.startswith("/api/refresh_torrents"):
+            started = trigger_torrent_scan()
+            self._send_json({"success": True, "started": bool(started),
+                             "in_flight": bool(app_state._scan_in_flight)})
+            return
+
+        elif self.path.startswith("/api/profiles/add"):
+            name = str(params.get("name", "")).strip()
+            if not name:
+                self._send_json({"success": False, "error": "A profile name is required."})
+                return
+            try:
+                app_state.start_add_profile(name)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)})
+                return
+            self._send_json({"success": True, "login": app_state.login_flow_snapshot()})
+            return
+
+        elif self.path.startswith("/api/profiles/remove"):
+            name = str(params.get("name", "")).strip()
+            if not name:
+                self._send_json({"success": False, "error": "A profile name is required."})
+                return
+            try:
+                was_active = (name == app_state.active_profile)
+                if was_active:
+                    app_state.stop_session()
+                    app_state.drop_vfs()
+                app_state.profiles.remove(name)
+                if was_active:
+                    names = app_state.profiles.names()
+                    app_state.active_profile = names[0] if names else None
+                    app_state._sync_profile_identity()
+                    app_state.save_settings()
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)})
+                return
+            self._send_json({"success": True, "active": app_state.active_profile,
+                             "profiles": app_state.profiles.list()})
+            return
+
+        elif self.path.startswith("/api/profiles/select"):
+            name = str(params.get("name", "")).strip()
+            if not name:
+                self._send_json({"success": False, "error": "A profile name is required."})
+                return
+            try:
+                app_state.switch_profile(name)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)})
+                return
+            self._send_json({"success": True, "active": app_state.active_profile,
+                             "profiles": app_state.profiles.list()})
+            return
+
+        elif self.path.startswith("/api/profiles/cancel_login"):
+            app_state.cancel_add_profile()
+            self._send_json({"success": True, "login": app_state.login_flow_snapshot()})
             return
 
         elif self.path.startswith("/api/stream/list"):
@@ -1451,6 +1767,14 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
             app_state.stop_session()
             app_state.drop_vfs()
 
+            # Sign the active profile out. Dropping its saved session is what
+            # actually forgets the account; the profile entry itself stays.
+            try:
+                if app_state.active_profile and app_state.profiles.has_state(app_state.active_profile):
+                    os.remove(app_state.profiles.storage_path(app_state.active_profile))
+            except Exception:
+                pass
+
             if os.path.exists("token.txt"):
                 try:
                     os.remove("token.txt")
@@ -1467,7 +1791,14 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
-def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chromium", headless=True, port=8000):
+def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chromium", headless=True, port=8000, profile=None):
+    if profile:
+        try:
+            if not app_state.profiles.exists(profile):
+                app_state.profiles.add(profile)
+            app_state.switch_profile(profile)
+        except Exception as e:
+            print(f"[!] Could not select profile '{profile}': {e}")
     if token:
         app_state.token = token
         app_state.email = extract_email_from_token(token)
@@ -1486,14 +1817,21 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
 
     # Initialize shared browser session
     if app_state.token:
-        app_state.get_or_create_session()
-        
-        # Pre-populate list on startup
-        t = threading.Thread(
-            target=scan_torrents_background,
-            daemon=True
-        )
-        t.start()
+        try:
+            app_state.get_or_create_session()
+        except Exception as e:
+            # Most often the saved session has gone stale. Say what to do
+            # rather than taking the whole app down before the UI is up.
+            print(f"[!] Could not start the browser session: {e}")
+            print("    Sign in again with:  python main.py --login <profile-name>")
+            app_state.stop_session()
+        else:
+            # Pre-populate list on startup
+            t = threading.Thread(
+                target=scan_torrents_background,
+                daemon=True
+            )
+            t.start()
 
     # Start watch mode polling loop
     t_watch = threading.Thread(target=watch_mode_loop, name="TorboxWatchThread", daemon=True)
