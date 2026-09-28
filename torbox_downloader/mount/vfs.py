@@ -97,15 +97,23 @@ class VfsIsADirectory(VfsError):
 
 
 class FileEntry:
-    __slots__ = ("name", "display_name", "size_str", "size_bytes", "selector", "torrent", "cdn_url", "cdn_url_expires")
+    __slots__ = ("name", "display_name", "size_str", "size_bytes", "selector", "torrent",
+                 "torrent_id", "file_id", "cdn_url", "cdn_url_expires")
 
-    def __init__(self, name, display_name, size_str, selector, torrent):
+    def __init__(self, name, display_name, size_str, selector, torrent,
+                 torrent_id=None, file_id=None, size_bytes=None):
         self.name = name                    # original scraped filename
         self.display_name = display_name    # sanitized, unique among siblings
         self.size_str = size_str or "Unknown"
-        self.size_bytes = parse_size_to_bytes(self.size_str) or 0
+        # Prefer an exact byte count when the backend supplies one; fall back
+        # to parsing the display string for browser-built trees.
+        self.size_bytes = size_bytes or parse_size_to_bytes(self.size_str) or 0
         self.selector = selector
         self.torrent = torrent              # owning TorrentDir
+        # Exact identifiers, when the backend provides them. These replace
+        # name-and-size guessing when resolving a link.
+        self.torrent_id = torrent_id
+        self.file_id = file_id
         self.cdn_url = None
         self.cdn_url_expires = 0
 
@@ -262,8 +270,11 @@ class TorboxVfs:
                 name=name,
                 display_name=sanitize_fs_name(name),
                 size_str=f.get("size", "Unknown"),
+                size_bytes=f.get("size_bytes"),
                 selector=f.get("selector"),
                 torrent=torrent_dir,
+                torrent_id=f.get("torrent_id"),
+                file_id=f.get("file_id"),
             ))
 
         torrent_dir.expanded = True
@@ -420,7 +431,8 @@ class TorboxVfs:
 
         # Expanding a torrent and generating its link must be atomic: another
         # caller (the downloader, another stream click) could navigate the
-        # page in between and leave the row we want off-screen.
+        # page in between and leave the row we want off-screen. The lock is
+        # None on the HTTP backend, which is thread-safe and holds no page.
         with browser_op(self._browser_lock, self._browser_op_timeout,
                         "resolve a download link"):
             # The browser session can only hold one expanded torrent at a
@@ -433,7 +445,15 @@ class TorboxVfs:
                     raise VfsError(
                         f"Could not expand torrent '{torrent.original_name}': {e}") from e
             try:
-                url = session.generate_download_link(node.name, node.size_str, node.selector)
+                # Exact identifiers when the backend supplied them; the
+                # name/size/selector form is the browser backend's contract.
+                if node.file_id is not None and node.torrent_id is not None:
+                    url = session.generate_download_link(
+                        node.name, node.size_str, node.selector,
+                        file_id=node.file_id, torrent_id=node.torrent_id)
+                else:
+                    url = session.generate_download_link(
+                        node.name, node.size_str, node.selector)
             except Exception as e:
                 raise VfsError(f"Link generation failed for '{node.name}': {e}") from e
             if not url:

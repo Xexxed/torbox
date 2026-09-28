@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 # Size of each block written to the client by the Stream content proxy.
 STREAM_BLOCK_BYTES = 1024 * 1024
 
+# Queue statuses that mean a transfer is still running. Rows in these states
+# survive a rescan even if the scan no longer lists the torrent, so a cache
+# expiring mid-download cannot orphan a running transfer.
+_IN_FLIGHT_STATUSES = frozenset({"downloading", "downloading_file"})
+
 
 def _fmt_speed(bps: float) -> str:
     """Format bytes-per-second as a human-readable string. Centralised here to
@@ -120,6 +125,20 @@ class AppState:
         self.browser_op_lock = threading.Lock()
         self.fetch_lock = self.browser_op_lock
         self.browser_op_lock_timeout_s = 60.0
+        # How fetches reach TorBox. "http" talks to the TorBox API directly and
+        # never starts a browser; "browser" drives the SPA with Playwright.
+        # Free accounts can use the HTTP backend -- the TorBox site itself
+        # authenticates them against its API with the Supabase session token.
+        self.fetch_backend = "http"
+        self.link_concurrency = 6
+        # Torrents whose files cannot be fetched (expired, incomplete, stalled)
+        # are left out of the library, because TorBox answers requestdl with
+        # HTTP 500 for them. Only meaningful on the http backend; the browser
+        # scraper never reports a download_state to filter on.
+        self.show_uncached_torrents = False
+        self.hidden_torrents = 0
+        self.hidden_states = {}
+        self._session_backend = None
         self.token = ""
         self.email = ""
         # `dest_dir` is the *effective* path (what the UI shows and uses);
@@ -236,6 +255,15 @@ class AppState:
                             self.browser_op_lock_timeout_s = max(1.0, float(data["browser_op_lock_timeout_s"]))
                         except (TypeError, ValueError):
                             pass
+                    if "fetch_backend" in data and data["fetch_backend"] in ("http", "browser"):
+                        self.fetch_backend = data["fetch_backend"]
+                    if "link_concurrency" in data:
+                        try:
+                            self.link_concurrency = max(1, min(12, int(data["link_concurrency"])))
+                        except (TypeError, ValueError):
+                            pass
+                    if "show_uncached_torrents" in data:
+                        self.show_uncached_torrents = bool(data["show_uncached_torrents"])
                     if "active_profile" in data:
                         self.active_profile = str(data["active_profile"]).strip() or None
             except Exception:
@@ -255,6 +283,9 @@ class AppState:
                     "watch_interval": self.watch_interval,
                     "mount_drive_letter": self.mount_drive_letter,
                     "browser_op_lock_timeout_s": self.browser_op_lock_timeout_s,
+                    "fetch_backend": self.fetch_backend,
+                    "link_concurrency": self.link_concurrency,
+                    "show_uncached_torrents": self.show_uncached_torrents,
                     "active_profile": self.active_profile
                 }, f)
         except Exception:
@@ -288,25 +319,61 @@ class AppState:
                 pass
         self.add_log(f"[{time.strftime('%H:%M:%S')}] WARNING: Session token has expired. Gracefully logged out.")
 
+    def op_lock(self):
+        """The lock to hand to `browser_op`, or None when it protects nothing.
+
+        The browser backend needs it: every operation mutates one shared page,
+        so two callers can interleave and corrupt each other's view. The HTTP
+        backend has no shared page and is thread-safe, so taking the lock would
+        only serialise link generation, folder expansion and stream resolution
+        behind each other for no benefit. `browser_op(None, ...)` is a no-op.
+        """
+        return None if self.fetch_backend == "http" else self.browser_op_lock
+
     def get_or_create_session(self, token=None, browser_type=None, headless=None):
         with self.session_lock:
+            if self.session and self._session_backend != self.fetch_backend:
+                # The backend was switched underneath us; the old session is
+                # the wrong kind of object now.
+                try:
+                    self.session.stop()
+                except Exception:
+                    pass
+                self.session = None
+                self.drop_vfs()
             if not self.session:
-                from torbox_downloader.browser_session import TorboxBrowserSession
                 name = self.active_profile
                 # A saved session is preferred over any pasted token: it carries
                 # a refresh token, so it survives restarts on its own.
                 state = self.profiles.load_state(name) if name else None
-                state_path = self.profile_state_path(name)
                 tok = token or self.token
-                if not state and not tok:
-                    return None
-                b_type = browser_type or self.browser_type
-                h_less = headless if headless is not None else self.headless
-                self.session = TorboxBrowserSession(
-                    None if state else tok, b_type, h_less,
-                    storage_state=state, state_path=state_path,
-                )
-                self.session.start()
+
+                if self.fetch_backend == "http":
+                    from torbox_downloader.api_session import TorboxApiSession
+                    if not state and not tok:
+                        return None
+                    self.session = TorboxApiSession(
+                        token=None if state else tok,
+                        profile=name if state else None,
+                        profile_store=self.profiles,
+                        link_concurrency=self.link_concurrency,
+                        show_uncached=self.show_uncached_torrents,
+                    )
+                    self.session.start()
+                else:
+                    from torbox_downloader.browser_session import TorboxBrowserSession
+                    if not state and not tok:
+                        return None
+                    b_type = browser_type or self.browser_type
+                    h_less = headless if headless is not None else self.headless
+                    self.session = TorboxBrowserSession(
+                        None if state else tok, b_type, h_less,
+                        storage_state=state, state_path=self.profile_state_path(name),
+                    )
+                    self.session.start()
+                self._session_backend = self.fetch_backend
+                logger.info("Fetch backend: %s (profile: %s)",
+                            self.fetch_backend, name or "pasted token")
             return self.session
 
     def stop_session(self):
@@ -317,6 +384,7 @@ class AppState:
                 except Exception:
                     pass
                 self.session = None
+                self._session_backend = None
 
     def get_vfs(self):
         """Return the shared TorboxVfs for the current session, creating it on
@@ -337,7 +405,7 @@ class AppState:
                 rebuilt = current is not None
                 current = TorboxVfs(
                     session,
-                    browser_lock=self.browser_op_lock,
+                    browser_lock=self.op_lock(),
                     browser_op_timeout=self.browser_op_lock_timeout_s,
                 )
                 self._vfs = current
@@ -516,20 +584,53 @@ class AppState:
                 self.error_message = error
 
     def update_queue(self, torrents):
+        """Replace the queue from a fresh scan, without losing live downloads.
+
+        A torrent can stop being listed mid-transfer -- its TorBox cache expires
+        while files are still transferring -- and a plain rebuild would drop its
+        row, orphaning `_queue_index` and making the progress bar vanish under a
+        running download. Entries that are actively transferring are therefore
+        carried over, with their live progress, even when the scan omits them.
+        """
         with self.lock:
-            self.queue = []
-            self._queue_index = {}
+            previous = {e["name"]: e for e in self.queue}
+            queue = []
+            seen = set()
             for t in torrents:
+                # The HTTP backend reports real per-torrent progress and ETA;
+                # file dicts (and the browser backend) carry neither, so the
+                # previous all-zero defaults still apply to them.
+                progress = t.get("progress")
+                try:
+                    progress = max(0, min(100, int(progress)))
+                except (TypeError, ValueError):
+                    progress = 0
                 entry = {
                     "name": t["name"],
                     "path": "",
                     "size": t["size"],
                     "status": "queued",
-                    "progress": 0,
-                    "speed": "0 KB/s"
+                    "progress": progress,
+                    "speed": _fmt_speed(t.get("download_speed") or 0),
+                    "eta": t.get("eta"),
+                    "download_state": t.get("download_state"),
                 }
-                self._queue_index[t["name"]] = len(self.queue)
-                self.queue.append(entry)
+                prior = previous.get(t["name"])
+                if prior and prior.get("status") in _IN_FLIGHT_STATUSES:
+                    # A rescan must not reset a download that is already moving.
+                    entry["status"] = prior["status"]
+                    entry["progress"] = prior["progress"]
+                    entry["speed"] = prior["speed"]
+                    entry["eta"] = prior.get("eta")
+                seen.add(t["name"])
+                queue.append(entry)
+
+            for name, prior in previous.items():
+                if name not in seen and prior.get("status") in _IN_FLIGHT_STATUSES:
+                    queue.append(prior)
+
+            self.queue = queue
+            self._queue_index = {e["name"]: i for i, e in enumerate(queue)}
 
     def update_file_progress(self, filename, status, downloaded, total, speed_bytes):
         with self.lock:
@@ -576,6 +677,9 @@ class AppState:
             write_buffer_mb = self.write_buffer_mb
             watch_mode = self.watch_mode
             watch_interval = self.watch_interval
+            show_uncached = self.show_uncached_torrents
+            hidden_torrents = self.hidden_torrents
+            hidden_states = dict(self.hidden_states)
 
         # Serve free-space at most once every 5 s to avoid a filesystem syscall
         # on every /api/status poll (frontend polls every ~500 ms).
@@ -624,6 +728,9 @@ class AppState:
             "mount_drive_letter": self.mount_drive_letter,
             "active_profile": self.active_profile,
             "profiles": self.profiles.list(),
+            "show_uncached_torrents": show_uncached,
+            "hidden_torrents": hidden_torrents,
+            "hidden_states": hidden_states,
             "login": self.login_flow_snapshot()
         }
 
@@ -672,11 +779,29 @@ def scan_torrents_background():
         # and the except path below runs `handle_token_expired()`.
 
         torrents = session.scan_torrents()
+        # Record what the downloadable filter removed so the UI can explain an
+        # empty list instead of claiming the account has nothing.
+        hidden = 0
+        if hasattr(session, "hidden_summary"):
+            hidden, states = session.hidden_summary()
+            app_state.hidden_torrents = hidden
+            app_state.hidden_states = states
         if torrents:
             app_state.update_queue(torrents)
             app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Successfully scraped {len(torrents)} active torrents from Torbox.")
+            if hidden:
+                breakdown = ", ".join(f"{s} x{c}" for s, c in sorted(states.items()))
+                app_state.add_log(
+                    f"[{time.strftime('%H:%M:%S')}] INFO: Hid {hidden} torrent(s) "
+                    f"that are not downloadable yet ({breakdown}).")
         else:
-            app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Checked Torbox download queue: no active torrents found.")
+            app_state.update_queue([])
+            if hidden:
+                app_state.add_log(
+                    f"[{time.strftime('%H:%M:%S')}] INFO: No downloadable torrents; "
+                    f"{hidden} torrent(s) are still cached, expired or incomplete.")
+            else:
+                app_state.add_log(f"[{time.strftime('%H:%M:%S')}] INFO: Checked Torbox download queue: no active torrents found.")
             
         with app_state.lock:
             if app_state.status == "error":
@@ -764,7 +889,7 @@ def downloader_worker(url, dest_dir, delay, headless, browser_type, token, targe
             session=session,
             disk_profile=disk_profile,
             buffer_mb=(write_buffer_mb or None),
-            browser_lock=app_state.browser_op_lock,
+            browser_lock=app_state.op_lock(),
             browser_op_timeout=app_state.browser_op_lock_timeout_s
         )
         app_state.set_status("finished")
@@ -1223,6 +1348,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/settings"):
             token_updated = False
             dest_err = None
+            rescan_requested = False
 
             if "dest_dir" in params:
                 new_dest = params["dest_dir"].strip()
@@ -1308,7 +1434,37 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                     elif len(letter) == 1 and letter.isalpha():
                         app_state.mount_drive_letter = letter
                     app_state.mount_manager.set_preferred_letter(app_state.mount_drive_letter)
+                if "fetch_backend" in params:
+                    backend = str(params["fetch_backend"]).strip().lower()
+                    if backend not in ("http", "browser"):
+                        raise ValueError("fetch_backend must be 'http' or 'browser'")
+                    if backend != app_state.fetch_backend:
+                        app_state.fetch_backend = backend
+                        # Force a fresh session of the right kind on next use.
+                        app_state.stop_session()
+                        app_state.drop_vfs()
+                        app_state.add_log(
+                            f"[{time.strftime('%H:%M:%S')}] INFO: "
+                            f"Fetch backend switched to '{backend}'.")
+                if "link_concurrency" in params:
+                    try:
+                        app_state.link_concurrency = max(1, min(12, int(params["link_concurrency"])))
+                    except (TypeError, ValueError):
+                        pass
+                if "show_uncached_torrents" in params:
+                    app_state.show_uncached_torrents = bool(params["show_uncached_torrents"])
+                    rescan_requested = True
                 app_state.save_settings()
+
+            # Outside the lock: trigger_torrent_scan() re-acquires app_state.lock
+            # and threading.Lock is not reentrant, so calling it inside would
+            # deadlock the request.
+            if rescan_requested:
+                with app_state.session_lock:
+                    live = app_state.session
+                if live is not None and hasattr(live, "show_uncached"):
+                    live.show_uncached = app_state.show_uncached_torrents
+                trigger_torrent_scan()
             
             if token_updated:
                 try:
@@ -1504,7 +1660,6 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": "Missing token or torrent_name"}).encode("utf-8"))
                 return
                 
-            from main import get_torrent_files_structure
             if not app_state.fetch_lock.acquire(blocking=False):
                 self.send_response(429)
                 self.send_header("Content-Type", "application/json")
@@ -1556,8 +1711,11 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 if not session:
                     raise RuntimeError("No valid session token provided.")
                 
-                # Expand torrent if not current
-                if session.current_torrent_name != torrent_name or "download" not in session.page.url:
+                # Expand torrent if the session is not already showing it.
+                # Asked through the session rather than by touching page state,
+                # which is not safe from this thread.
+                view = session.viewing_torrent_name() or {}
+                if view.get("torrent") != torrent_name or not view.get("on_download_view"):
                     session.fetch_structure(torrent_name)
                     
                 download_url = session.generate_download_link(name, size, selector)
@@ -1793,7 +1951,7 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
-def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chromium", headless=True, port=8000, profile=None):
+def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chromium", headless=True, port=8000, profile=None, fetch_backend=None, link_concurrency=None, show_uncached=None):
     if profile:
         try:
             if not app_state.profiles.exists(profile):
@@ -1814,17 +1972,27 @@ def start_gui_server(token="", dest_dir="downloads", delay=5, browser_type="chro
         
     app_state.browser_type = browser_type
     app_state.headless = headless
+    # CLI overrides win over settings.json, so a one-off run can pick a backend.
+    if fetch_backend in ("http", "browser"):
+        app_state.fetch_backend = fetch_backend
+    if link_concurrency:
+        try:
+            app_state.link_concurrency = max(1, min(12, int(link_concurrency)))
+        except (TypeError, ValueError):
+            pass
+    if show_uncached is not None:
+        app_state.show_uncached_torrents = bool(show_uncached)
 
     sys.stdout = LogRedirector(app_state)
 
-    # Initialize shared browser session
-    if app_state.token:
+    # Bring up the session for the selected backend.
+    if app_state.token or app_state.profiles.has_state(app_state.active_profile or ""):
         try:
             app_state.get_or_create_session()
         except Exception as e:
             # Most often the saved session has gone stale. Say what to do
             # rather than taking the whole app down before the UI is up.
-            print(f"[!] Could not start the browser session: {e}")
+            print(f"[!] Could not start the fetch session ({app_state.fetch_backend}): {e}")
             print("    Sign in again with:  python main.py --login <profile-name>")
             app_state.stop_session()
         else:

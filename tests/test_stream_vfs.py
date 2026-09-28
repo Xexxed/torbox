@@ -61,7 +61,7 @@ class TestResolveLink(unittest.TestCase):
         vfs, session = make_vfs()
         vfs.resolve_link("/Torrent One/Sub Dir/b.mkv")
         # Original (unsanitized) name + selector, not the display name.
-        self.assertIn(("b.mkv", "2GB", "s2"), session.generated)
+        self.assertIn(("b.mkv", "2GB", "s2", None, None), session.generated)
 
 
 class TestReaderCache(unittest.TestCase):

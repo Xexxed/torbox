@@ -53,7 +53,13 @@ from torbox_downloader.mount.vfs import TorboxVfs
 
 
 class FakeSession:
-    """Mimics the parts of TorboxBrowserSession the VFS talks to."""
+    """Mimics the parts of a TorBox session the VFS talks to.
+
+    Works for both backends: `generate_download_link` accepts the optional
+    file_id/torrent_id keyword that the HTTP backend prefers, and records
+    which form was used so tests can assert the VFS passes exact identifiers
+    when it has them.
+    """
 
     def __init__(self, torrents=None, structures=None, cdn_base="http://cdn.test"):
         self.torrents = torrents or []
@@ -71,11 +77,14 @@ class FakeSession:
         self.current_torrent_name = name
         return list(self.structures.get(name, []))
 
-    def generate_download_link(self, name, size, selector):
+    def generate_download_link(self, name, size, selector, file_id=None, torrent_id=None):
         from urllib.parse import quote
 
-        self.generated.append((name, size, selector))
-        return f"{self.cdn_base}/{quote(name)}"
+        self.generated.append((name, size, selector, file_id, torrent_id))
+        return f"{self.cdn_base}/{quote(name or '')}"
+
+    def viewing_torrent_name(self):
+        return {"torrent": self.current_torrent_name, "on_download_view": True}
 
 
 def make_vfs(cdn_base="http://cdn.test"):
@@ -261,7 +270,7 @@ class TestVfs(unittest.TestCase):
             data = reader.read_range(0, 16)
             self.assertEqual(data, payload)
             # Link generation used the original (unsanitized) names + selector.
-            self.assertIn(("b.mkv", "16B", "s2"), session.generated)
+            self.assertIn(("b.mkv", "16B", "s2", None, None), session.generated)
 
     def test_total_bytes_aggregated(self):
         vfs, _session = make_vfs()
@@ -397,8 +406,8 @@ class TestDavProviderE2E(unittest.TestCase):
         # Point every generated link at the local fixture blob regardless of name.
         original_session = cls.vfs._session
 
-        def fixed_link(name, size, selector):
-            original_session.generated.append((name, size, selector))
+        def fixed_link(name, size, selector, file_id=None, torrent_id=None):
+            original_session.generated.append((name, size, selector, file_id, torrent_id))
             return cls.remote.url
 
         original_session.generate_download_link = fixed_link
@@ -469,7 +478,7 @@ class TestWinfspOperations(unittest.TestCase):
         self.vfs, _session = make_streaming_vfs(base, len(self.payload))
         session = self.vfs._session
 
-        def fixed_link(name, size, selector):
+        def fixed_link(name, size, selector, file_id=None, torrent_id=None):
             return self.remote.url
 
         session.generate_download_link = fixed_link
