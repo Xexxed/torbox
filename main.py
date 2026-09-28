@@ -179,7 +179,6 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
 
             batched = (
                 _is_http_session(session)
-                and hasattr(session, "prefetch_links")
                 and all(f.get("torrent_id") is not None and f.get("file_id") is not None
                         for _, f in pending)
             )
@@ -327,8 +326,15 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
 
 
 def _is_http_session(session):
-    """True when the session is the browser-free API backend."""
-    return hasattr(session, "prefetch_links")
+    """True when the session is the browser-free API backend.
+
+    Duck-typed on a capability rather than an isinstance check, so main.py
+    never has to import the HTTP module -- which matters because the browser
+    backend must run without it. `callable` rather than `hasattr`, so a
+    session that merely names the attribute without implementing it is not
+    mistaken for the HTTP backend.
+    """
+    return callable(getattr(session, "prefetch_links", None))
 
 
 def _profile_session_kwargs(profile):

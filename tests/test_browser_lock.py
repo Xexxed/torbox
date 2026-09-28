@@ -33,13 +33,13 @@ class _ConcurrencySession(FakeSession):
         self.max_active = 0
         self._guard = threading.Lock()
 
-    def generate_download_link(self, name, size, selector):
+    def generate_download_link(self, name, size, selector, file_id=None, torrent_id=None):
         with self._guard:
             self._active += 1
             self.max_active = max(self.max_active, self._active)
         try:
             time.sleep(0.05)   # widen the window for overlap to show up
-            return super().generate_download_link(name, size, selector)
+            return super().generate_download_link(name, size, selector, file_id, torrent_id)
         finally:
             with self._guard:
                 self._active -= 1
@@ -134,6 +134,98 @@ class TestVfsUsesInjectedLock(unittest.TestCase):
         for t in threads:
             t.join(timeout=10)
         self.assertEqual(session.max_active, 1)
+
+
+class TestVfsWithoutLock(unittest.TestCase):
+    """The HTTP backend holds no page, so it passes no lock at all.
+
+    This is the mechanism that removes the serialization: with browser_lock
+    None, `browser_op` is the no-op it documents itself as, so concurrent
+    resolves actually overlap instead of queueing.
+    """
+
+    def test_resolve_does_not_block_on_a_held_lock(self):
+        session = _ConcurrencySession(
+            torrents=[{"name": "T", "size": "2GB"}],
+            structures={"T": [
+                {"name": "a.mkv", "path": ["T"], "size": "1GB", "selector": "sa"},
+                {"name": "b.mkv", "path": ["T"], "size": "1GB", "selector": "sb"},
+            ]},
+        )
+        lock = threading.Lock()
+        vfs = TorboxVfs(session, browser_lock=None, browser_op_timeout=0.05)
+        vfs.scan()
+
+        # Hold a lock the VFS was never given: it must not matter.
+        lock.acquire()
+        try:
+            threads = [
+                threading.Thread(target=vfs.resolve_link, args=(path,))
+                for path in ("/T/a.mkv", "/T/b.mkv")
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            self.assertFalse(any(t.is_alive() for t in threads),
+                             "resolves must not block when no lock is supplied")
+            self.assertGreater(session.max_active, 1,
+                               "resolves should overlap without a lock")
+        finally:
+            lock.release()
+
+    def test_a_none_lock_never_raises_browser_busy(self):
+        vfs = TorboxVfs(FakeSession(), browser_lock=None, browser_op_timeout=0.0)
+        vfs.scan()
+        with browser_op(vfs._browser_lock, vfs._browser_op_timeout, "test"):
+            pass  # must not raise
+
+
+class TestFileIdPlumbing(unittest.TestCase):
+    """The VFS must address files exactly when the backend supplies ids."""
+
+    def _vfs(self):
+        session = FakeSession(
+            torrents=[{"name": "T", "size": "2GB"}],
+            structures={"T": [
+                {"name": "a.mkv", "path": ["T"], "size": "1GB", "selector": "sa",
+                 "size_bytes": 1073741824, "torrent_id": 7, "file_id": 0},
+                {"name": "b.mkv", "path": ["T"], "size": "1GB", "selector": "sb",
+                 "size_bytes": 1073741824, "torrent_id": 7, "file_id": 2},
+            ]},
+        )
+        return session, TorboxVfs(session)
+
+    def test_resolve_passes_exact_ids(self):
+        session, vfs = self._vfs()
+        vfs.scan()
+        vfs.resolve_link("/T/b.mkv")
+        # recorded as (name, size, selector, file_id, torrent_id)
+        self.assertEqual(session.generated[-1], ("b.mkv", "1GB", "sb", 2, 7))
+
+    def test_a_file_id_of_zero_is_still_passed_through(self):
+        session, vfs = self._vfs()
+        vfs.scan()
+        vfs.resolve_link("/T/a.mkv")
+        self.assertEqual(session.generated[-1], ("a.mkv", "1GB", "sa", 0, 7))
+
+    def test_size_bytes_prefers_the_exact_count(self):
+        _session, vfs = self._vfs()
+        vfs.scan()
+        node = vfs._resolve("/T/b.mkv")
+        self.assertEqual(node.size_bytes, 1073741824)
+
+    def test_browser_style_entries_still_fall_back_to_name_and_size(self):
+        session = FakeSession(
+            torrents=[{"name": "T", "size": "2GB"}],
+            structures={"T": [
+                {"name": "a.mkv", "path": ["T"], "size": "1GB", "selector": "sa"},
+            ]},
+        )
+        vfs = TorboxVfs(session)
+        vfs.scan()
+        vfs.resolve_link("/T/a.mkv")
+        self.assertEqual(session.generated[-1], ("a.mkv", "1GB", "sa", None, None))
 
 
 if __name__ == "__main__":

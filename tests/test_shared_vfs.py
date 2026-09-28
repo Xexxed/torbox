@@ -17,7 +17,7 @@ import unittest
 
 
 class _FakeSession:
-    """Minimal stand-in for TorboxBrowserSession (no Playwright)."""
+    """Minimal stand-in for a TorBox session (no Playwright, no network)."""
 
     def __init__(self, name="fake"):
         self.name = name
@@ -33,9 +33,12 @@ class _FakeSession:
         self.current_torrent_name = torrent_name
         return [{"name": "movie.mkv", "path": [torrent_name], "size": "1 GB", "selector": "sel"}]
 
-    def generate_download_link(self, name, size, selector):
-        self.link_calls.append((name, size, selector))
+    def generate_download_link(self, name, size, selector, file_id=None, torrent_id=None):
+        self.link_calls.append((name, size, selector, file_id, torrent_id))
         return f"https://cdn.example/{name}?s={selector}"
+
+    def viewing_torrent_name(self):
+        return {"torrent": self.current_torrent_name, "on_download_view": True}
 
     def stop(self):
         pass
