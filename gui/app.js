@@ -1038,7 +1038,10 @@ function fetchStatus() {
             document.getElementById('queue-count').textContent = `${state.queue.length} total`;
 
             // 2. Render Torrent Queue
-            renderQueue(state.queue, state.token_set);
+            renderQueue(state.queue, state.token_set, {
+                hidden_torrents: state.hidden_torrents,
+                hidden_states: state.hidden_states,
+            });
 
             // 3. Render Logs Console
             renderLogs(state.logs, state.active_downloads);
@@ -1163,6 +1166,25 @@ const QUEUE_EMPTY_SIGNED_IN_HTML = `
         </div>
     </div>`;
 
+// Shown when the account has torrents but none of them can actually be
+// fetched yet. Distinct from "queue is empty", which implies nothing to do.
+function queueEmptyFilteredHtml(hiddenCount, reasons) {
+    const breakdown = reasons.length
+        ? reasons.map(([state, count]) => `${escapeHtml(state)} (${count})`).join(', ')
+        : 'not yet cached';
+    return `
+    <div class="empty-state">
+        <div class="empty-icon-tile">
+            <svg viewBox="0 0 24 24" width="26" height="26" class="empty-icon"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        </div>
+        <p>No downloadable torrents</p>
+        <div class="empty-steps">
+            <div class="empty-step"><span class="empty-step-key">01</span><span>${hiddenCount} torrent${hiddenCount === 1 ? '' : 's'} hidden: ${breakdown}.</span></div>
+            <div class="empty-step"><span class="empty-step-key">02</span><span>TorBox can only serve files it has cached. A torrent shows up here once it finishes downloading.</span></div>
+        </div>
+    </div>`;
+}
+
 const QUEUE_EMPTY_HTML = `
     <div class="empty-state">
         <div class="empty-icon-tile">
@@ -1273,15 +1295,27 @@ function updateQueueItem(el, item) {
     }
 }
 
-function renderQueue(queue, signedIn) {
+function renderQueue(queue, signedIn, hidden) {
     const container = document.getElementById('queue-container');
     if (!container) return;
 
     if (!queue || queue.length === 0) {
-        const want = signedIn ? QUEUE_EMPTY_SIGNED_IN_HTML : QUEUE_EMPTY_HTML;
-        if (!container.querySelector('.empty-state')) {
+        const hiddenCount = (hidden && hidden.hidden_torrents) || 0;
+        const reasons = hidden && hidden.hidden_states ? Object.entries(hidden.hidden_states) : [];
+        const want = hiddenCount > 0
+            ? queueEmptyFilteredHtml(hiddenCount, reasons)
+            : (signedIn ? QUEUE_EMPTY_SIGNED_IN_HTML : QUEUE_EMPTY_HTML);
+        // Re-render when the *reason* changes, not just on first paint, so
+        // switching the filter off replaces the message instead of leaving a
+        // stale explanation on screen.
+        const key = hiddenCount > 0 ? `filtered:${hiddenCount}` : (signedIn ? 'in' : 'out');
+        const existing = container.querySelector('.empty-state');
+        if (!existing) {
+            container.innerHTML = want;
+        } else if (existing.dataset.emptyKey !== key) {
             container.innerHTML = want;
         }
+        container.querySelector('.empty-state').dataset.emptyKey = key;
         return;
     }
 

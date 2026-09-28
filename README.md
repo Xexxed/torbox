@@ -31,6 +31,26 @@ own numeric `id`, its `size` and its torrent-root-relative `name`. Folder struct
 therefore recovered by splitting a string rather than by traversing a DOM, and a file is
 addressed exactly by `(torrent_id, file_id)` instead of by guessing from its name and size.
 
+**Only downloadable torrents are listed.** TorBox can only serve files it has actually
+cached, and `requestdl` answers `HTTP 500 DATABASE_ERROR` for a torrent it has not — or no
+longer has. Measured on the live API:
+
+| `download_state` | `requestdl` |
+|---|---|
+| `cached` | 200, resolves |
+| `completed` | 200, resolves |
+| `expired` | 500 `DATABASE_ERROR` |
+| `incomplete` | 500 `DATABASE_ERROR` |
+| `stalled (no seeds)` | no files at all |
+
+So anything outside `{cached, completed}` is filtered out at `scan_torrents()`, which every
+surface goes through — the dashboard, the Stream tab, the drive mount and the CLI. Listing a
+torrent that cannot produce a link is worse than not listing it. Set
+`show_uncached_torrents` to `true` (or pass `--show-uncached`) to see the full library.
+
+If TorBox ever renames `download_state`, the filter hides everything and logs an error
+saying so, rather than leaving you with a silently empty library.
+
 What that removes:
 
 - No Chromium process, so no browser memory or CPU while the app runs.
@@ -98,6 +118,7 @@ with a one-time `api_key`, and runs the download pipeline in the background. Use
 |---|---|
 | `--fetch-backend` | `http` (default) calls the TorBox API with no browser; `browser` drives the site with Playwright |
 | `--link-concurrency` | Parallel download-link requests on the `http` backend (default 6) |
+| `--show-uncached` | Also list torrents TorBox cannot serve yet (hidden by default) |
 | `--no-headless` | Show the browser window (needed for a first manual login) |
 | `--token`, `-t` | Supply the `torbox_session_token` directly, skipping the login redirect |
 | `--dir` | Destination for downloads (default `downloads`) |
@@ -302,6 +323,7 @@ Alongside the usual token and destination directory, the dashboard exposes:
 |---|---|
 | `fetch_backend` | `http` (default) or `browser`. Switching drops the current session and the shared VFS, so the next operation builds the right kind of object. |
 | `link_concurrency` | Parallel `requestdl` requests on the `http` backend, 1–12 (default 6). |
+| `show_uncached_torrents` | Show torrents TorBox cannot serve yet (default `false`). See *How it talks to TorBox*. `http` backend only — the browser scraper never reports a `download_state` to filter on. |
 | `browser_op_lock_timeout_s` | How long a *browser* operation waits for the shared lock before failing with "browser is busy". Default 60 s. Ignored on the `http` backend, which passes no lock. |
 
 **Rollback:** set `fetch_backend` to `browser` in `settings.json` and restart. No code
@@ -354,6 +376,11 @@ file on the browser backend, and cancellation.
 `tests/test_browser_lock.py` covers both sides of the lock: mutual exclusion and
 `BrowserBusyError` when a lock is supplied, and overlap plus `file_id` plumbing when
 `None` is supplied.
+
+`tests/test_queue_update.py` covers the rescan path: a torrent whose cache expires
+mid-transfer keeps its queue row and its live progress instead of being dropped, terminal
+rows are cleared normally, the name→index map stays consistent, and
+`trigger_torrent_scan()` cannot be called from inside `app_state.lock`.
 
 ## More detail
 

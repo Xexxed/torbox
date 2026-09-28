@@ -90,7 +90,7 @@ TORRENT = {
     "size": 3221225472,
     "progress": 0.5,
     "eta": 120,
-    "download_state": "downloading",
+    "download_state": "cached",
     "download_finished": False,
     "download_speed": 1048576,
     "files": [
@@ -99,6 +99,15 @@ TORRENT = {
         {"id": 3, "name": "Extras/Sub/deep.srt", "short_name": "deep.srt", "size": 4096},
         {"id": 4, "name": "\u00e9\u00e0 \u30d5\u30a1\u30a4\u30eb.bin", "size": 8192},
     ],
+}
+
+# download_state -> (files, can requestdl resolve it), measured on the live API.
+STATE_MATRIX = {
+    "cached": 218,
+    "completed": 83,
+    "expired": 1,        # requestdl answers 500 DATABASE_ERROR
+    "incomplete": 22,    # requestdl answers 500 DATABASE_ERROR
+    "stalled (no seeds)": 0,
 }
 
 
@@ -150,6 +159,20 @@ class ApiSessionTestCase(unittest.TestCase):
                         lambda url, q, h, m: ok("https://cdn.example/dld/abc"))
         return TorboxApiSession(token=live_session(), http=self.http, **kwargs)
 
+    def serve_states(self):
+        """Answer mylist with one torrent per state in STATE_MATRIX."""
+        rows = [dict(TORRENT, id=i, name=f"T-{state}", download_state=state,
+                     files=[{"id": i * 10 + 1, "name": "a.mkv", "short_name": "a.mkv",
+                             "size": 10}])
+                for i, state in enumerate(STATE_MATRIX)]
+
+        def mylist(url, q, headers, method):
+            if q and q.get("id"):
+                return ok(dict(TORRENT))
+            return ok(rows)
+
+        self.http.route("/torrents/mylist", mylist)
+
 
 class TestHelpers(unittest.TestCase):
     def test_format_size_matches_downloader_units(self):
@@ -189,7 +212,7 @@ class TestScanAndStructure(ApiSessionTestCase):
         first = torrents[0]
         self.assertEqual(first["progress"], 50)
         self.assertEqual(first["eta"], 120)
-        self.assertEqual(first["download_state"], "downloading")
+        self.assertEqual(first["download_state"], "cached")
         self.assertEqual(first["download_speed"], 1048576)
         self.assertEqual(first["size"], "3.00 GB")
         self.assertEqual(first["size_bytes"], 3221225472)
@@ -287,6 +310,92 @@ class TestScanAndStructure(ApiSessionTestCase):
         self.assertEqual(view["torrent"], "Example Pack")
         # No page exists here, so the cached structure is always live.
         self.assertTrue(view["on_download_view"])
+
+
+class TestDownloadableFilter(ApiSessionTestCase):
+    """Only torrents whose files can actually be fetched are listed.
+
+    Measured on the live API: requestdl returns HTTP 500 DATABASE_ERROR for
+    expired and incomplete torrents, and a stalled torrent has no files at all.
+    """
+
+    def test_only_cached_and_completed_are_listed(self):
+        session = self.make_session()
+        self.serve_states()
+        names = {t["name"] for t in session.scan_torrents()}
+        self.assertEqual(names, {"T-cached", "T-completed"})
+
+    def test_hidden_states_are_reported_with_counts(self):
+        session = self.make_session()
+        self.serve_states()
+        session.scan_torrents()
+        total, states = session.hidden_summary()
+        self.assertEqual(total, 3)
+        self.assertEqual(states["expired"], 1)
+        self.assertEqual(states["incomplete"], 1)
+        self.assertEqual(states["stalled (no seeds)"], 1)
+
+    def test_show_uncached_lists_everything(self):
+        session = self.make_session(show_uncached=True)
+        self.serve_states()
+        names = {t["name"] for t in session.scan_torrents()}
+        self.assertEqual(len(names), len(STATE_MATRIX))
+        self.assertEqual(session.hidden_summary()[0], 0)
+
+    def test_the_flag_can_be_toggled_on_a_live_session(self):
+        session = self.make_session()
+        self.serve_states()
+        self.assertEqual(len(session.scan_torrents()), 2)
+        session.show_uncached = True
+        self.assertEqual(len(session.scan_torrents()), len(STATE_MATRIX))
+
+    def test_a_missing_state_is_hidden_and_counted(self):
+        session = self.make_session()
+        self.http.route("/torrents/mylist", lambda *a: ok([
+            dict(TORRENT, name="NoState", download_state=None)]))
+        self.assertEqual(session.scan_torrents(), [])
+        total, states = session.hidden_summary()
+        self.assertEqual(total, 1)
+        self.assertEqual(states, {"unknown": 1})
+
+    def test_an_unfamiliar_state_is_logged_loudly(self):
+        # A rename must not silently empty the library with no explanation.
+        session = self.make_session()
+        self.http.route("/torrents/mylist", lambda *a: ok([
+            dict(TORRENT, name="Weird", download_state="some_new_state")]))
+        with self.assertLogs("torbox_downloader.api_session", level="WARNING") as logs:
+            session.scan_torrents()
+        self.assertTrue(any("some_new_state" in line for line in logs.output))
+
+    def test_hiding_the_whole_library_is_logged_as_an_error(self):
+        session = self.make_session()
+        self.http.route("/torrents/mylist", lambda *a: ok([
+            dict(TORRENT, name="A", download_state="expired"),
+            dict(TORRENT, name="B", download_state="incomplete")]))
+        with self.assertLogs("torbox_downloader.api_session", level="ERROR") as logs:
+            self.assertEqual(session.scan_torrents(), [])
+        self.assertTrue(any("renamed download_state" in line for line in logs.output))
+
+    def test_a_known_unavailable_state_is_not_treated_as_unknown(self):
+        session = self.make_session()
+        self.http.route("/torrents/mylist", lambda *a: ok([
+            dict(TORRENT, name="A", download_state="expired")]))
+        session.scan_torrents()
+        # No warning about an unrecognised state, and no "library emptied" error.
+        self.assertEqual(session.hidden_summary(), (1, {"expired": 1}))
+
+    def test_a_hidden_torrent_cannot_be_expanded(self):
+        session = self.make_session()
+        self.serve_states()
+        session.scan_torrents()
+        with self.assertRaises(api_session.ApiError):
+            session.fetch_structure("T-expired")
+
+    def test_a_visible_torrent_still_expands(self):
+        session = self.make_session()
+        self.serve_states()
+        session.scan_torrents()
+        self.assertEqual(len(session.fetch_structure("T-cached")), 1)
 
 
 class TestLinkGeneration(ApiSessionTestCase):

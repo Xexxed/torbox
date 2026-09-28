@@ -71,6 +71,25 @@ ANON_KEY_SEED = (
 DEFAULT_LINK_CONCURRENCY = 6
 MAX_LINK_CONCURRENCY = 12
 
+# The only states whose files can actually be fetched, measured against the
+# live API on 2026-09-28:
+#   cached     -> requestdl 200, CDN link resolves
+#   completed  -> requestdl 200, CDN link resolves
+#   expired    -> requestdl 500 DATABASE_ERROR
+#   incomplete -> requestdl 500 DATABASE_ERROR
+#   stalled    -> no files at all
+# Anything outside this set is hidden, because a torrent shown in the list
+# that cannot produce a link is worse than a torrent that is simply absent.
+DOWNLOADABLE_STATES = frozenset({"cached", "completed"})
+
+# States already known to be undownloadable. Tracked separately so that a
+# state TorBox has *added* can be told apart from one we deliberately hide:
+# a rename then logs loudly instead of silently emptying the library.
+KNOWN_UNAVAILABLE_STATES = frozenset({
+    "expired", "incomplete", "stalled", "stalled (no seeds)",
+    "uploader_stalled", "checking", "downloading", "uploading", "queued",
+})
+
 # Matches the substring that gui_server.py and main.py already grep for when
 # deciding that a session is dead and should be logged out.
 SESSION_EXPIRED_SENTINEL = "session token has expired or is invalid"
@@ -409,10 +428,14 @@ class TorboxApiSession:
     """
 
     def __init__(self, token=None, profile=None, profile_store=None,
-                 base_url=API_BASE, http=None, link_concurrency=DEFAULT_LINK_CONCURRENCY):
+                 base_url=API_BASE, http=None, link_concurrency=DEFAULT_LINK_CONCURRENCY,
+                 show_uncached=False):
         self.base_url = base_url.rstrip("/")
         self.current_torrent_name = None
         self.link_concurrency = max(1, min(MAX_LINK_CONCURRENCY, int(link_concurrency)))
+        # False hides torrents whose files cannot be fetched. See
+        # DOWNLOADABLE_STATES.
+        self.show_uncached = bool(show_uncached)
         store = profile_store
         if store is None and profile:
             store = profiles_mod.ProfileStore()
@@ -424,6 +447,8 @@ class TorboxApiSession:
         self._structures = {}
         self._warned_compat = False
         self._warned_backend = False
+        self.hidden_torrents = 0
+        self.hidden_states = {}
         self._closed = False
 
     # --- lifecycle ----------------------------------------------------
@@ -525,16 +550,31 @@ class TorboxApiSession:
     # --- the contract -------------------------------------------------
 
     def scan_torrents(self):
-        """List the account's torrents.
+        """List the account's downloadable torrents.
 
         Returns one dict per torrent with the ``name``/``size`` pair the rest of
         the app expects, plus the progress fields the browser scraper had no way
         to obtain.
+
+        Torrents whose ``download_state`` is not in ``DOWNLOADABLE_STATES`` are
+        left out: TorBox answers ``requestdl`` with HTTP 500 for those, so
+        listing them would offer files that cannot be fetched. Every consumer
+        goes through here -- the dashboard, the Stream tab, the drive mount and
+        the CLI -- so filtering once keeps them all in agreement. Pass
+        ``show_uncached=True`` to see the full library regardless.
         """
         data = self._payload(self._request("/torrents/mylist", {"limit": 1000}), "the torrent list")
         torrents = []
+        hidden = {}
+        total = 0
         for item in data or []:
             if not isinstance(item, dict) or not item.get("name"):
+                continue
+            total += 1
+            state = item.get("download_state")
+            if not self.show_uncached and state not in DOWNLOADABLE_STATES:
+                label = state or "unknown"
+                hidden[label] = hidden.get(label, 0) + 1
                 continue
             progress = item.get("progress")
             try:
@@ -548,16 +588,50 @@ class TorboxApiSession:
                 "size_bytes": item.get("size") or 0,
                 "progress": max(0, min(100, percent)),
                 "eta": item.get("eta"),
-                "download_state": item.get("download_state"),
+                "download_state": state,
                 "download_finished": bool(item.get("download_finished")),
                 "download_speed": item.get("download_speed") or 0,
                 "file_count": len(item.get("files") or []),
             })
         torrents.sort(key=lambda t: (t["id"] is None, t["id"] or 0), reverse=True)
+        self._record_hidden(hidden, total, len(torrents))
         with self._lock:
             self._torrents = torrents
             self._structures.clear()
         return torrents
+
+    def _record_hidden(self, hidden, total, shown):
+        """Remember and log what the filter removed.
+
+        Two failure modes are worth being loud about: a state TorBox has added
+        that we do not recognise, and a filter that hid the entire library --
+        both point at a renamed or newly-populated field rather than at a
+        genuinely empty account.
+        """
+        with self._lock:
+            self.hidden_torrents = sum(hidden.values())
+            self.hidden_states = dict(hidden)
+        if not hidden:
+            return
+        breakdown = ", ".join(f"{state} x{count}" for state, count in sorted(hidden.items()))
+        unfamiliar = {s: c for s, c in hidden.items() if s not in KNOWN_UNAVAILABLE_STATES}
+        if unfamiliar:
+            logger.warning(
+                "Hid %d torrent(s) in an unrecognised download_state (%s). If these "
+                "are actually downloadable, add the state to DOWNLOADABLE_STATES.",
+                sum(unfamiliar.values()), breakdown)
+        if total and not shown:
+            logger.error(
+                "The downloadable filter hid all %d torrent(s) (%s). This usually "
+                "means TorBox renamed download_state, not that the account is empty.",
+                total, breakdown)
+        else:
+            logger.info("Hid %d non-downloadable torrent(s): %s", sum(hidden.values()), breakdown)
+
+    def hidden_summary(self):
+        """``(count, {state: count})`` for the most recent scan, for the UI."""
+        with self._lock:
+            return self.hidden_torrents, dict(self.hidden_states)
 
     def _torrent_for(self, name):
         with self._lock:

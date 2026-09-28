@@ -372,7 +372,7 @@ def _profile_api_kwargs(profile):
     return {"profile": profile, "profile_store": store}
 
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S, profile=None, fetch_backend="http", link_concurrency=6):
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S, profile=None, fetch_backend="http", link_concurrency=6, show_uncached=False):
     """
     Runs the full automation workflow:
     1. Obtains a session (HTTP API or browser, per `fetch_backend`).
@@ -386,6 +386,7 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
             from torbox_downloader.api_session import TorboxApiSession
             print("Using the TorBox API backend (no browser)...")
             local_session = TorboxApiSession(token=token, link_concurrency=link_concurrency,
+                                             show_uncached=show_uncached,
                                              **_profile_api_kwargs(profile))
         else:
             from torbox_downloader.browser_session import TorboxBrowserSession
@@ -671,6 +672,8 @@ if __name__ == '__main__':
                         help="How to reach TorBox. 'http' calls the TorBox API directly and needs no browser (default: http); 'browser' drives the site with Playwright.")
     parser.add_argument('--link-concurrency', type=int, default=6,
                         help="Parallel download-link requests when using the http backend (default: 6)")
+    parser.add_argument('--show-uncached', action='store_true',
+                        help="Also list torrents TorBox cannot serve yet (expired, incomplete, stalled). Hidden by default because requestdl fails on them.")
     
     args = parser.parse_args()
 
@@ -698,7 +701,7 @@ if __name__ == '__main__':
     # Launch GUI by default unless --no-gui is specified
     if args.gui:
         from gui_server import start_gui_server
-        start_gui_server(token=token_val, dest_dir=args.dir, delay=args.delay, browser_type=args.browser, headless=args.headless, profile=args.profile, fetch_backend=args.fetch_backend, link_concurrency=args.link_concurrency)
+        start_gui_server(token=token_val, dest_dir=args.dir, delay=args.delay, browser_type=args.browser, headless=args.headless, profile=args.profile, fetch_backend=args.fetch_backend, link_concurrency=args.link_concurrency, show_uncached=args.show_uncached)
     else:
         run_downloader(
             url=args.url,
@@ -712,5 +715,6 @@ if __name__ == '__main__':
             buffer_mb=args.write_buffer_mb,
             profile=args.profile,
             fetch_backend=args.fetch_backend,
-            link_concurrency=args.link_concurrency
+            link_concurrency=args.link_concurrency,
+            show_uncached=args.show_uncached
         )
