@@ -1,5 +1,92 @@
 # HTTP Fetch Architecture: replace headless-browser scraping with direct TorBox HTTP calls
 
+## Implementation outcome
+
+Implemented on `New-fetch-Arch` in four commits. Stages 1–5 and the post-implementation
+items are done; Stage 6 (`user/refreshtoken`, which rotates the account's API key) was
+deliberately **not** run, and Stage 7 (deleting the browser backend) is not started.
+
+### Measured, on the real free account
+
+Same 218-file torrent, same machine, back to back. Browser figures for link generation are
+sampled over 5 files and extrapolated; the HTTP figure in the table is *sequential*, so it
+is a conservative floor — the downloader uses the 6-worker batch measured at 51 ms/file.
+
+| Stage | HTTP | Browser | Ratio |
+|---|---|---|---|
+| session start | 0.000 s | 2.199 s | — |
+| `scan_torrents` | 0.63 s | 4.45 s | 7x |
+| `fetch_structure` (218 files) | 0.16 s | 0.92 s | 6x |
+| download link, sequential | 0.55 s | 2.06 s | 4x |
+| download link, as the downloader runs it (batched) | 0.051 s | 2.06 s | 40x |
+| all 218 links | 11.1 s | ~449 s | 40x |
+| **RSS growth** | **+6 MB** | **+717 MB** | **120x** |
+
+The memory figure is the answer to the question this plan was written for. Everything after
+sign-in is a `requests` session.
+
+### Verified end to end
+
+- 292 tests pass, no network required except where a test opts in.
+- GUI server on the `http` backend: scan, 218-file structure, link generated and CDN `HEAD`
+  200, VFS link resolved, rescan, settings switch — and `playwright` never enters
+  `sys.modules`.
+- A real download through `main.run_downloader`: 175,335 bytes written, matching the API's
+  `size_bytes` exactly, at exactly the folder path the API reported, in 2.3 s.
+- GUI server on the `browser` backend: `TorboxBrowserSession` built, op lock retained,
+  scanned and expanded 218 files, returned no `file_id`; switching back to `http` at runtime
+  swapped the session and rebuilt the VFS.
+
+### Divergences from the plan
+
+1. **`viewing_torrent_name()` returns a dict, not a string.** §2.7 said it would return
+   `current_torrent_name`. It returns `{"torrent", "on_download_view"}` because the
+   condition it replaces was two-part — `session.current_torrent_name != torrent_name`
+   *and* `"download" not in session.page.url` — and the second half can only be read on the
+   Playwright worker thread. Both backends now answer both halves on their own thread.
+2. **The anon key is tried without network.** §1.5 said to re-derive it on first call,
+   which put a network round trip in startup and made the key untestable offline. It is now
+   seeded, returned offline, and re-derived only after GoTrue rejects it with 400/401/403.
+3. **The `fetch_lock` guards in `/api/fetch_structure` and `/api/generate_link` were left
+   alone.** The plan removed the `browser_op` lock but said nothing about these. They are
+   request-level double-submit guards, and at ~50 ms per call their serialization costs
+   nothing. Removing them would change 429 semantics for no gain.
+4. **`format_size` never emits TB.** `downloader.parse_size_to_bytes` only understands
+   GB/MB/KB/B, so a 2 TB torrent reports as ~2048 GB. Documented on the function.
+5. **`_is_http_session` uses `callable()`, not `hasattr()`.** A session that names
+   `prefetch_links` without implementing it would otherwise be mistaken for the HTTP
+   backend. Found by a test, not by inspection.
+6. **No `--target` CLI flag was added.** The CLI has no way to select a torrent, so
+   verifying the CLI download path meant driving `run_downloader` in-process with
+   `selected_files`. Adding the flag would be a feature, not part of this refactor.
+
+### Findings that were not in the plan
+
+- **TorBox ships files with `id: 0`.** At least one file in a real 218-file torrent has
+  `id: 0`, and a truthiness check silently dropped a 1.79 GB file from the tree. `file_id=0`
+  addresses that single file, not the whole torrent — only `zip_link=true` does that — which
+  was confirmed by inspecting the returned `Content-Disposition` and length. Ids are now
+  never tested for truthiness, and `test_structure_keeps_a_file_whose_id_is_zero` covers it.
+- **`requestdl` returns HTTP 500 `DATABASE_ERROR` for torrents that are not cached.**
+  `cached` and `completed` torrents resolve cleanly; `expired`, `incomplete` and
+  `stalled (no seeds)` ones do not. This is server-side and the browser backend hits it
+  identically, so it is not a regression — but 5xx bodies now carry the server's own
+  `error`/`detail` text, because an opaque status code told the user nothing.
+- **`fetch_structure` matches torrent names exactly.** `run_downloader` filters by
+  substring and then passes the exact name, so the two agree; recorded because it is an
+  interface fact a caller could trip over.
+
+### Still outstanding
+
+- Stage 6: `POST /v1/api/user/refreshtoken` for a long-lived API key. **Mutates the
+  account by rotating its API key, so it needs explicit approval and was not run.**
+- Stage 7: deleting `browser_session.py` and `detector.py` and demoting Playwright to an
+  optional login-only extra. Deliberately deferred until the HTTP path has been used in
+  anger.
+- The free-plan JWT path is undocumented by TorBox. If they close it, the HTTP backend
+  stops working and `fetch_backend=browser` is the only recourse. This risk is unchanged by
+  anything in the implementation and cannot be engineered away.
+
 ## Scope and evidence
 
 Branch: `New-fetch-Arch`. This document is an implementation plan, not a claim that it is implemented or tested.
@@ -25,7 +112,9 @@ Branch: `New-fetch-Arch`. This document is an implementation plan, not a claim t
 
 **Explicitly NOT established:**
 
-- No measurement of the current browser path's wall-clock or RSS was taken. Chromium's memory cost is stated from general knowledge, not from this machine. The comparison in *Goals* is therefore a projection, not a benchmark.
+- No measurement of the current browser path's wall-clock or RSS was taken at the time of
+  review. **Since implemented** — see *Implementation outcome* above, which records both
+  backends measured back to back on the same 218-file torrent.
 - Rate-limit behaviour under sustained load was not tested. 40 parallel `requestdl` calls succeeded, which is far below the documented 300/min ceiling.
 - The `anon` key was extracted from the live bundle today. Whether TorBox rotates it, and how a rotation would present, is unknown.
 - Whether the free-plan JWT path stays open is not something TorBox documents or guarantees.
@@ -317,7 +406,7 @@ generate_download_link(...)  GET requestdl?torrent_id&file_id&token  -> CDN url
 - **No automatic browser fallback.** Chosen deliberately; it means a silent upstream change surfaces as an error rather than a slow success.
 - **No progress reporting for in-flight downloads.** `download_speed` and `eta` come from the server's view at scan time and are not polled during a transfer. Live progress still comes from the existing per-file byte counters.
 - **The 6-worker default is a guess.** It is 12x under the documented ceiling but TorBox has an open complaint about `requestdl` failures under load that was not reproduced here.
-- **No measurement of the current browser path.** The performance comparison is a projection.
+- **No measurement of the current browser path.** **Resolved** — both backends were measured back to back; see *Implementation outcome*.
 - **Streaming, WinFsp and WebDAV are not otherwise touched.** They consume the seam and gain concurrency, nothing more.
 - Open question: should `zip_link=true` be exposed to download a whole torrent as one archive? It exists in the API and would cut `requestdl` calls from N to 1, at the cost of a large temporary file. Deliberately deferred.
 
@@ -329,26 +418,32 @@ Stages 1–4 are risk-ordered. Stages 1 and 2 ship together. **Do not start Stag
 - [ ] **Stage 2 — `TorboxApiSession`.** All five methods against the real account, plus `viewing_torrent_name`. Roll back to Stage 1 alone (dead code, no behavior change) if anything is wrong here.
 - [ ] **Stage 3 — Wiring.** `fetch_backend` setting, backend-aware `get_or_create_session`, `browser_op_lock = None` on HTTP, lazy Playwright import, delete dead code. Verify both backends end-to-end before continuing. Roll back to Stage 2 by setting `fetch_backend=browser`.
 - [ ] **Stage 4 — Consumers.** `main.py` prefetch, `vfs.py` file_id plumbing. Roll back to Stage 3 by reverting these two files; the seam is unchanged so the app still works.
-- [ ] **Stage 5 — GUI progress.** `update_queue` fields and the three front-end lines. Purely additive; no rollback needed.
-- [ ] **Stage 6 — Optional, needs explicit approval.** Evaluate `POST /v1/api/user/refreshtoken` for a long-lived key. **This rotates the account API key and must not be run without asking.**
+- [x] **Stage 5 — GUI progress.** `update_queue` fields and the three front-end lines. Purely additive; no rollback needed.
+- [ ] **Stage 6 — Optional, needs explicit approval.** Evaluate `POST /v1/api/user/refreshtoken` for a long-lived key. **This rotates the account API key and must not be run without asking.** Not run; the free-plan refresh path works and is covered by tests.
 - [ ] **Stage 7 — Only after Stages 1-6 are verified in production.** Consider deleting `browser_session.py` and `detector.py` and dropping Playwright to a login-only extra.
 
 ## Required verification
 
-The following are required tests, not tests already executed. Mocked and fake-server tests first, real integration second.
+The following were required tests. **Checked items were actually executed**; unchecked items
+have not been and remain outstanding. Mocked and fake-server tests first, real integration
+second.
 
 **Isolation rules for everything below:** tests run against `tempfile.mkdtemp` directories, in-memory fakes and injected transports; they never touch the real `profiles/` directory, the real `settings.json`, or production URLs. Any test that must change an env var snapshots it and restores it in `finally`, asserting restoration on both the success and failure paths.
 
-- [ ] `tests/test_api_session.py` — path derivation (nested, flat, unicode), `short_name` fallback, `selector is None`, `size` string, `mylist?id=` dict shape, `requestdl` params, one-retry-on-401, sentinel on second 401, single-flight refresh under 20 threads, anon-key seed and re-derivation.
-- [ ] `tests/test_browser_lock.py` — extend: `browser_op(None, ...)` is a no-op and never raises `BrowserBusyError`.
-- [ ] `tests/test_mount.py`, `tests/test_shared_vfs.py` — extend `FakeSession` with `file_id`/`torrent_id` and `viewing_torrent_name`; assert stream resolution matches the downloader by `file_id`.
-- [ ] Regression: `tests/test_detector.py` and `tests/test_browser_session.py` pass unchanged, proving the browser backend is intact.
-- [ ] Regression: `tests/test_profiles.py` passes unchanged, proving profile persistence is intact.
-- [ ] `python -m unittest discover tests` passes with networking disabled.
-- [ ] Real integration, manually, once: sign in, scan, expand a torrent, link all 218 files, download one file, stream one file, mount the drive, unmount. Compare against the same sequence on `fetch_backend=browser`.
-- [ ] Real integration: kill the app mid-download, restart, confirm resume by size.
-- [ ] Real integration: leave the app idle past the 1 h token expiry, confirm a later operation refreshes without user action.
-- [ ] Measure and record: peak RSS and wall-clock for a full 218-file link pass on both backends. This is the number that justifies the change, and it does not exist yet.
+- [x] `tests/test_api_session.py` — path derivation (nested, flat, unicode), `short_name` fallback, `selector is None`, `size` string, `mylist?id=` dict shape, `requestdl` params, one-retry-on-401, sentinel on second 401, single-flight refresh under 20 threads, anon-key seed and re-derivation, 5xx detail retention, the `id: 0` file, the escape-hatch log firing once.
+- [x] `tests/test_browser_lock.py` — extend: `browser_op(None, ...)` is a no-op and never raises `BrowserBusyError`; concurrent resolves overlap with no lock; `file_id` plumbing including `id: 0`; browser-style fallback.
+- [x] `tests/test_mount.py`, `tests/test_shared_vfs.py` — extend `FakeSession` with `file_id`/`torrent_id` and `viewing_torrent_name`.
+- [x] `tests/test_pipeline_links.py` — the batched producer: one prefetch per torrent, exact ids, per-file retry for stragglers, one call per file on the browser backend, cancellation, skipping complete files.
+- [x] Regression: `tests/test_detector.py` and `tests/test_browser_session.py` pass unchanged, proving the browser backend is intact.
+- [x] Regression: `tests/test_profiles.py` passes unchanged, proving profile persistence is intact.
+- [x] `python -m unittest` over all 17 modules: 292 tests pass, 1 skipped (needs FFmpeg).
+- [x] Real integration: GUI server on `http` — scan, 218-file structure, link generated with CDN `HEAD` 200, VFS link resolved, rescan, settings switch, and `playwright` absent from `sys.modules`.
+- [x] Real integration: GUI server on `browser` — session built, lock retained, 218 files expanded, no `file_id` returned, and a runtime switch back to `http` swaps the session and rebuilds the VFS.
+- [x] Real integration: a real download through `main.run_downloader` — 175,335 bytes at exactly the API's `size_bytes`, at exactly the API's folder path, 2.3 s, no browser.
+- [x] Measure and record: peak RSS and wall-clock on both backends. Done — +6 MB vs +717 MB, and 11.1 s vs ~449 s for a 218-file link pass.
+- [ ] Real integration: mount the drive and unmount against a live CDN file. The VFS link path is verified; WinFsp and WebDAV mounting have not been exercised against a live link.
+- [ ] Real integration: kill the app mid-download, restart, confirm resume by size. The resume check is unchanged and unit-covered, but not run live.
+- [ ] Real integration: leave the app idle past the 1 h token expiry, confirm a later operation refreshes without user action. The refresh itself is tested (single-flight, write-back, cookie preservation) and a 43-minute-old token was loaded successfully during verification, but the full hour boundary has not been waited out.
 
 ## Post-implementation additions
 
