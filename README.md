@@ -4,15 +4,74 @@ A web-GUI front end for [TorBox](https://torbox.app): browse your torrents, down
 them to disk with a folder structure that mirrors the torrent, mount the library as a
 virtual drive, and stream media straight from the browser.
 
-The browser is driven by Playwright against the TorBox download page, so everything the
-tool does — listing torrents, expanding a file tree, generating a download link — happens
-through one real signed-in session rather than an API.
+By default it talks to the TorBox API directly — no browser process runs after sign-in.
+A Playwright-driven browser backend is retained and can be switched back on at any time.
+
+## How it talks to TorBox
+
+Two backends, selected by the `fetch_backend` setting. **`http` is the default.**
+
+### `http` (default) — the TorBox API, no browser
+
+torbox.app is itself a client of the TorBox API at `api.torbox.app`, and its own bundle
+authenticates **free** accounts against it with the Supabase session token already in
+`localStorage["sb-db-auth-token"]` — a real API key is only read for paid plans. This app
+takes the same path, so **no Pro plan and no API key are required.**
+
+Three calls replace all scraping:
+
+| Operation | Call |
+|---|---|
+| List torrents | `GET /v1/api/torrents/mylist?limit=1000` |
+| Expand a torrent | `GET /v1/api/torrents/mylist?id=<torrent_id>` |
+| Download link | `GET /v1/api/torrents/requestdl?torrent_id=&file_id=&token=` |
+
+`mylist` already returns each torrent's full `files` array, where every entry carries its
+own numeric `id`, its `size` and its torrent-root-relative `name`. Folder structure is
+therefore recovered by splitting a string rather than by traversing a DOM, and a file is
+addressed exactly by `(torrent_id, file_id)` instead of by guessing from its name and size.
+
+What that removes:
+
+- No Chromium process, so no browser memory or CPU while the app runs.
+- No DOM snapshot or BeautifulSoup parse per operation.
+- No global lock. The browser needed one shared lock because every operation mutated the
+  same page; the HTTP backend has no page, so link generation, folder expansion and stream
+  resolution now run concurrently instead of queueing behind a 60-second timeout.
+- Links for a whole torrent resolve in one parallel batch (`link_concurrency`, default 6)
+  rather than one page interaction per file.
+- Per-torrent **progress, ETA and state** come from the same response the list already
+  needs, so the dashboard can show them.
+
+Session lifetime is unchanged: TorBox signs in with Supabase, whose access token lasts
+about an hour. The browser used to renew that silently, so `TokenManager` now does it
+against `db.torbox.app`, collapsing concurrent callers onto a single exchange because
+GoTrue *rotates* the refresh token. Each profile still owns its own session, so accounts
+cannot invalidate one another.
+
+### `browser` — the original Playwright scraper
+
+Kept intact and reachable as an escape hatch. Set `fetch_backend` to `browser` in
+`settings.json` (or pass `--fetch-backend browser`) and restart. Behaviour is as it was,
+including the shared browser-op lock.
+
+This is not a fallback that engages automatically. If the HTTP path ever fails, the error
+surfaces with a log line telling you the setting to flip — one path stays live and
+testable rather than two that half-work.
+
+### What the HTTP backend does *not* do
+
+`interactive_login` still needs a real browser: Google OAuth and Cloudflare Turnstile
+cannot be driven headlessly. So `--login` and **Account → Add…** still open Chrome. That
+is the only time Playwright is used, and it is why the dependency stays in
+`requirements.txt`.
 
 ## Requirements
 
 - Python 3.10+
 - `pip install -r requirements.txt`
-- `playwright install chromium` (or `firefox` / `webkit`)
+- `playwright install chromium` (or `firefox` / `webkit`) — **only to sign in.** The
+  default fetch backend talks to the TorBox API directly and never starts a browser.
 
 Optional, Windows only: `winfspy` plus the WinFsp driver, needed for the native drive
 mount. Without it the app falls back to WebDAV over `net use`.
@@ -37,6 +96,8 @@ with a one-time `api_key`, and runs the download pipeline in the background. Use
 
 | Flag | Purpose |
 |---|---|
+| `--fetch-backend` | `http` (default) calls the TorBox API with no browser; `browser` drives the site with Playwright |
+| `--link-concurrency` | Parallel download-link requests on the `http` backend (default 6) |
 | `--no-headless` | Show the browser window (needed for a first manual login) |
 | `--token`, `-t` | Supply the `torbox_session_token` directly, skipping the login redirect |
 | `--dir` | Destination for downloads (default `downloads`) |
@@ -52,12 +113,16 @@ The app can hold several TorBox accounts and switch between them. One account is
 active at a time and downloads never span accounts concurrently, so a single
 browser session and the existing browser-op lock are shared by all of them.
 
-**A profile is not a token.** It is the browser's whole saved session, exported by
-Playwright as *storage state* — cookies plus `localStorage`. That distinction is
-the whole point: TorBox signs in with Supabase, whose page keeps a
+**A profile is not a token.** It is the account's whole saved session, exported by
+Playwright as *storage state* — cookies plus `localStorage`. That distinction is the
+whole point: TorBox signs in with Supabase, whose page keeps a
 `refresh_token` and silently exchanges it for a new `access_token` about every
-hour. Paste a token by hand and it expires; let the browser own the session and it
+hour. Paste a token by hand and it expires; let the app own the session and it
 renews itself indefinitely.
+
+The `http` backend reads that same file and does the hourly exchange itself, so
+the storage-state format is shared by both backends and existing profiles need
+no migration.
 
 | Path | What it holds |
 |---|---|
@@ -219,9 +284,10 @@ cases where that matters.
 - The image lightbox pages between the images in the current folder with the arrow keys.
   Each page resolves only the image it moves to.
 - If a link has gone stale, one forced re-resolve and retry happens automatically.
-- A second browser session is never opened: link generation is serialized behind a
-  per-operation lock, so a stream resolution can slip between a download's per-file
-  generations instead of waiting for the whole transfer.
+- Link generation is serialized behind a per-operation lock on the `browser` backend, so a
+  stream resolution can slip between a download's per-file generations instead of waiting
+  for the whole transfer. On the default `http` backend there is no lock at all: there is
+  no shared page to protect, so resolutions and downloads proceed concurrently.
 
 ### Development flag
 
@@ -230,9 +296,16 @@ frontend edits appear on reload without restarting the server. Unset it in norma
 
 ### Settings
 
-Alongside the usual token and destination directory, the dashboard exposes
-`browser_op_lock_timeout_s` — how long a browser operation waits for the shared lock
-before failing with a clear "browser is busy" error. The default is 60 seconds.
+Alongside the usual token and destination directory, the dashboard exposes:
+
+| Setting | Purpose |
+|---|---|
+| `fetch_backend` | `http` (default) or `browser`. Switching drops the current session and the shared VFS, so the next operation builds the right kind of object. |
+| `link_concurrency` | Parallel `requestdl` requests on the `http` backend, 1–12 (default 6). |
+| `browser_op_lock_timeout_s` | How long a *browser* operation waits for the shared lock before failing with "browser is busy". Default 60 s. Ignored on the `http` backend, which passes no lock. |
+
+**Rollback:** set `fetch_backend` to `browser` in `settings.json` and restart. No code
+change, no reinstall.
 
 ## Tests
 
@@ -269,8 +342,23 @@ rules, so the rail cannot silently regress to a single horizontal band.
 becomes a filename, so path traversal is rejected), wrapping a Supabase session as
 storage state, the save/load round trip, and migration of a legacy `token.txt`.
 
+`tests/test_api_session.py` covers the HTTP backend against an injected fake transport and
+a temp directory: path derivation, the id-0 file that a truthiness check would drop, the
+single-flight refresh under 20 threads, one-retry-on-401, and profile write-back
+preserving cookies and unrelated `localStorage` keys. No network, no browser.
+
+`tests/test_pipeline_links.py` covers the batched link producer: one prefetch call for a
+whole torrent, exact ids in the batch, per-file retry only for stragglers, one call per
+file on the browser backend, and cancellation.
+
+`tests/test_browser_lock.py` covers both sides of the lock: mutual exclusion and
+`BrowserBusyError` when a lock is supplied, and overlap plus `file_id` plumbing when
+`None` is supplied.
+
 ## More detail
 
 - `DISK_IO.md` — why the HDD disk profile exists and how it reduces seek thrashing.
+- `HTTP_FETCH_ARCH_IMPLEMENTATION_PLAN.md` — the design, evidence and staged rollout
+  behind the browser-free fetch backend.
 - `.kilo/plans/STREAMING_PAGE_IMPLEMENTATION_PLAN.md` — the design and staged rollout
   behind the Stream tab.

@@ -191,6 +191,22 @@ def format_size(num_bytes):
     return f"{value:.0f} B"
 
 
+def _detail(response):
+    """Append the server's own error text to a message, when it sent any.
+
+    A 500 from requestdl is usually "this file is not cached yet", and the body
+    says so. Without this the caller only sees an opaque status code.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    parts = [str(body.get(k)) for k in ("error", "detail") if body.get(k)]
+    return f": {' - '.join(parts)}" if parts else ""
+
+
 def _coerce_session(token):
     """Accept a Supabase session dict, a JSON string of one, or a bare JWT.
 
@@ -407,6 +423,7 @@ class TorboxApiSession:
         self._torrents = []
         self._structures = {}
         self._warned_compat = False
+        self._warned_backend = False
         self._closed = False
 
     # --- lifecycle ----------------------------------------------------
@@ -414,6 +431,8 @@ class TorboxApiSession:
     def start(self):
         """No browser to launch; validates the session instead."""
         self.tokens.access_token()
+        logger.info(
+            "TorBox HTTP backend ready (anon key source: %s).", anon_key_source())
         return self
 
     def stop(self):
@@ -463,19 +482,34 @@ class TorboxApiSession:
                 headers=headers, timeout=60,
             )
         except requests.RequestException as e:
-            raise ApiError(f"Could not reach the TorBox API: {e}") from e
+            raise self._fail(ApiError(f"Could not reach the TorBox API: {e}")) from e
 
         if response.status_code == 401 and not _retried:
             logger.info("TorBox rejected the token; refreshing and retrying once.")
             self.tokens.invalidate()
             return self._request(path, params=params, method=method, auth=auth, _retried=True)
         if response.status_code == 401:
-            raise SessionExpiredError("the API rejected the session twice")
+            raise self._fail(SessionExpiredError("the API rejected the session twice"))
         if response.status_code == 429:
-            raise RateLimitedError("TorBox rate limited this client")
+            raise self._fail(RateLimitedError("TorBox rate limited this client"))
         if response.status_code >= 500:
-            raise ApiError(f"TorBox API returned HTTP {response.status_code}")
+            raise self._fail(ApiError(
+                f"TorBox API returned HTTP {response.status_code}{_detail(response)}"))
         return response
+
+    def _fail(self, error):
+        """Log the escape hatch once, then hand the error on unchanged.
+
+        The HTTP backend deliberately has no automatic browser fallback, so the
+        first failure names the setting that gets the old behaviour back.
+        """
+        if not self._warned_backend and not isinstance(error, SessionExpiredError):
+            self._warned_backend = True
+            logger.error(
+                "TorBox HTTP backend failed: %s -- if this persists, set "
+                "fetch_backend to 'browser' in settings.json and restart to use "
+                "the Playwright backend instead.", error)
+        return error
 
     @staticmethod
     def _payload(response, what):

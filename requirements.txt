@@ -1,6 +1,10 @@
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 tqdm>=4.66.0
+# Login only. The default fetch backend talks to the TorBox API directly and
+# never launches a browser; Playwright is needed solely for the interactive
+# sign-in, because Google OAuth and Cloudflare Turnstile cannot be driven
+# headlessly. See "How it talks to TorBox" in README.md.
 playwright>=1.40.0
 winfspy>=0.8.4; sys_platform == "win32"
 wsgidav>=4.3.0

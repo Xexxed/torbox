@@ -351,6 +351,30 @@ class TestLinkGeneration(ApiSessionTestCase):
         with self.assertRaises(api_session.ApiError):
             session.scan_torrents()
 
+    def test_server_error_keeps_the_servers_own_explanation(self):
+        # A 500 from requestdl is usually "not cached yet", and the body says
+        # so. An opaque status code would be unactionable.
+        session = self.make_session()
+        self.http.route("/torrents/requestdl", lambda *a: FakeResponse(500, {
+            "success": False, "error": "DATABASE_ERROR",
+            "detail": "There was an error processing your request."}))
+        with self.assertRaises(api_session.ApiError) as ctx:
+            session.generate_download_link(None, file_id=1, torrent_id=42)
+        message = str(ctx.exception)
+        self.assertIn("500", message)
+        self.assertIn("DATABASE_ERROR", message)
+        self.assertIn("error processing your request", message)
+
+    def test_a_failure_names_the_browser_escape_hatch_once(self):
+        session = self.make_session()
+        self.http.route("/torrents/mylist", lambda *a: FakeResponse(500, {"detail": "boom"}))
+        with self.assertLogs("torbox_downloader.api_session", level="ERROR") as logs:
+            for _ in range(3):
+                with self.assertRaises(api_session.ApiError):
+                    session.scan_torrents()
+        hints = [line for line in logs.output if "fetch_backend" in line]
+        self.assertEqual(len(hints), 1, "the escape hatch must be logged once, not per call")
+
     def test_unsuccessful_body_reports_the_detail(self):
         session = self.make_session()
         self.http.route("/torrents/requestdl", lambda *a: FakeResponse(
