@@ -1183,11 +1183,41 @@ function queueDotClass(status) {
     return 'blue';
 }
 
+function formatEta(seconds) {
+    if (seconds === null || seconds === undefined || !isFinite(seconds) || seconds < 0) return '';
+    const s = Math.round(seconds);
+    if (s <= 0) return '';
+    if (s < 60) return `${s}s left`;
+    if (s < 3600) return `${Math.round(s / 60)}m left`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m left`;
+    return `${Math.round(s / 86400)}d left`;
+}
+
+// TorBox reports a server-side state per torrent (cached, downloading,
+// expired, incomplete). Surfaced next to the local queue status.
+function serverStateLabel(state) {
+    if (!state) return '';
+    const known = {
+        cached: 'cached',
+        downloading: 'downloading',
+        uploading: 'seeding',
+        completed: 'ready',
+        expired: 'expired',
+        incomplete: 'incomplete',
+        checking: 'checking',
+    };
+    return known[state] || state;
+}
+
 function queueItemHtml(item, index) {
     const isDownloading = item.status === 'downloading';
     const progressClass = item.status === 'failed' ? 'failed' : (isDownloading ? 'downloading' : '');
     const isSelected = item.name === selectedTorrentName;
-    const statusLabel = isDownloading ? `Downloading · ${item.speed || ''}` : item.status;
+    const serverState = serverStateLabel(item.download_state);
+    const eta = formatEta(item.eta);
+    let statusLabel = isDownloading ? `Downloading · ${item.speed || ''}` : item.status;
+    if (serverState && !isDownloading) statusLabel = `${statusLabel} · ${serverState}`;
+    if (eta && !isDownloading) statusLabel = `${statusLabel} · ${eta}`;
     const onclickName = item.name.replace(/'/g, "\\'");
 
     return `
@@ -1213,7 +1243,11 @@ function queueItemHtml(item, index) {
 function updateQueueItem(el, item) {
     const isDownloading = item.status === 'downloading';
     const progressClass = item.status === 'failed' ? 'failed' : (isDownloading ? 'downloading' : '');
-    const statusLabel = isDownloading ? `Downloading · ${item.speed || ''}` : item.status;
+    const serverState = serverStateLabel(item.download_state);
+    const eta = formatEta(item.eta);
+    let statusLabel = isDownloading ? `Downloading · ${item.speed || ''}` : item.status;
+    if (serverState && !isDownloading) statusLabel = `${statusLabel} · ${serverState}`;
+    if (eta && !isDownloading) statusLabel = `${statusLabel} · ${eta}`;
 
     el.classList.toggle('selected', item.name === selectedTorrentName);
 

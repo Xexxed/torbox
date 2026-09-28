@@ -271,6 +271,15 @@ class TorboxBrowserSession:
         """Thread-safe call to get raw page HTML content."""
         return self._send_command("get_page_content")
 
+    def viewing_torrent_name(self):
+        """Report which torrent the page is currently expanded on.
+
+        Answered on the worker thread, because reading ``page.url`` from a
+        request thread violates Playwright's thread affinity. Mirrors
+        ``TorboxApiSession.viewing_torrent_name``.
+        """
+        return self._send_command("viewing_torrent_name")
+
     # --- Worker Thread Implementation ---
 
     def _send_command(self, action, args=None, kwargs=None):
@@ -906,7 +915,14 @@ class TorboxBrowserSession:
             
         elif action == "get_page_content":
             return self.page.content()
-            
+
+        elif action == "viewing_torrent_name":
+            try:
+                on_download = "download" in (self.page.url or "").lower()
+            except Exception:
+                on_download = False
+            return {"torrent": self.current_torrent_name, "on_download_view": on_download}
+
         else:
             raise ValueError(f"Unknown action: {action}")
 

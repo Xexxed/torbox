@@ -430,12 +430,15 @@ class TorboxApiSession:
             self._structures = {}
 
     def viewing_torrent_name(self):
-        """Which torrent the structure cache was last populated for.
+        """Report which torrent the structure cache currently holds.
 
-        Replaces the old ``session.page.url`` check, which reached into
-        Playwright state from an unrelated thread.
+        Mirrors ``TorboxBrowserSession.viewing_torrent_name`` so callers can ask
+        without knowing the backend, and without reaching into browser state
+        from an unrelated thread the way the old ``session.page.url`` check did.
+
+        There is no page here, so the cache is always considered live.
         """
-        return self.current_torrent_name
+        return {"torrent": self.current_torrent_name, "on_download_view": True}
 
     def go_to_dashboard(self):
         """No-op: there is no page to navigate back to."""

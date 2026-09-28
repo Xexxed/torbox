@@ -281,9 +281,12 @@ class TestScanAndStructure(ApiSessionTestCase):
     def test_viewing_torrent_name_tracks_the_expanded_torrent(self):
         session = self.make_session()
         session.scan_torrents()
-        self.assertIsNone(session.viewing_torrent_name())
+        self.assertIsNone(session.viewing_torrent_name()["torrent"])
         session.fetch_structure("Example Pack")
-        self.assertEqual(session.viewing_torrent_name(), "Example Pack")
+        view = session.viewing_torrent_name()
+        self.assertEqual(view["torrent"], "Example Pack")
+        # No page exists here, so the cached structure is always live.
+        self.assertTrue(view["on_download_view"])
 
 
 class TestLinkGeneration(ApiSessionTestCase):

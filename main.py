@@ -16,11 +16,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    logger.error("Playwright is not installed. Please run: pip install playwright && playwright install")
-    sys.exit(1)
+
+def _require_playwright():
+    """Import Playwright, or explain how to get it.
+
+    Imported lazily because only the browser backend needs it: the HTTP
+    backend talks to the TorBox API directly and must run without a browser
+    installed at all.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.error(
+            "The browser backend needs Playwright. Run: "
+            "pip install playwright && playwright install chromium "
+            "(or switch fetch_backend to 'http')."
+        )
+        raise
+    return sync_playwright
 
 def download_files_pipeline(session, dest_dir, files_with_local_paths, max_parallel_files, status_update_callback=None, torrent_name_for_status=None, url=None, token=None, delay=0, parallel_connections=True, cancel_event=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S):
     from threading import Lock, Semaphore, Thread
@@ -121,44 +134,76 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
     prefetch_queue = queue.Queue(maxsize=max_workers + 2)
     slot = Semaphore(max_workers)
     
+    def resolve_link(f_info):
+        """One file's CDN link, with the existing 3-attempt retry kept."""
+        name = f_info['name']
+        size = f_info['size']
+        selector = f_info.get('selector')
+        file_id = f_info.get('file_id')
+        torrent_id = f_info.get('torrent_id')
+        for attempt in range(3):
+            if cancel_event and cancel_event.is_set():
+                return None
+            try:
+                # Hold the shared browser lock for just this one link
+                # generation so a Stream-page click can interleave
+                # between files instead of waiting for the whole batch.
+                # The lock is None on the HTTP backend, which needs no lock.
+                with browser_op(browser_lock, browser_op_timeout,
+                                "generate a download link"):
+                    if file_id is not None and torrent_id is not None:
+                        return session.generate_download_link(
+                            name, size, selector, file_id=file_id, torrent_id=torrent_id)
+                    return session.generate_download_link(name, size, selector)
+            except Exception as e:
+                print(f"    Link generation attempt {attempt + 1} failed: {e}")
+                time.sleep(2)
+        return None
+
     def link_producer():
         nonlocal torrent_success
         try:
+            # The HTTP backend can resolve many links at once, which is the
+            # whole point of dropping the browser: one round trip per file
+            # instead of a serialised page interaction.
+            pending = []
             for f_idx, f_info in enumerate(files_with_local_paths):
                 if cancel_event and cancel_event.is_set():
                     break
-                
-                name = f_info['name']
                 local_path = f_info['local_path']
-                selector = f_info['selector']
-                size = f_info['size']
-                
                 if os.path.exists(local_path):
-                    local_size = os.path.getsize(local_path)
-                    if is_file_size_matching(local_size, size):
+                    if is_file_size_matching(os.path.getsize(local_path), f_info['size']):
                         prefetch_queue.put((f_idx, f_info, "skip", None))
                         continue
-                        
-                print(f"  [{f_idx + 1}/{total_files}] Generating link for: {name} ({size})")
-                
-                download_url = None
-                # Retry generating link up to 3 times with backoff
-                for attempt in range(3):
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    try:
-                        # Hold the shared browser lock for just this one link
-                        # generation so a Stream-page click can interleave
-                        # between files instead of waiting for the whole batch.
-                        with browser_op(browser_lock, browser_op_timeout,
-                                        "generate a download link"):
-                            download_url = session.generate_download_link(name, size, selector)
-                        if download_url:
-                            break
-                    except Exception as e:
-                        print(f"    Link generation attempt {attempt + 1} failed: {e}")
-                    time.sleep(2)
-                    
+                pending.append((f_idx, f_info))
+
+            batched = (
+                _is_http_session(session)
+                and hasattr(session, "prefetch_links")
+                and all(f.get("torrent_id") is not None and f.get("file_id") is not None
+                        for _, f in pending)
+            )
+            resolved = {}
+            if batched and pending:
+                refs = [(f["torrent_id"], f["file_id"], f_idx) for f_idx, f in pending]
+                print(f"  Resolving {len(refs)} download link(s) in parallel...")
+                resolved = session.prefetch_links(refs, cancel_event=cancel_event)
+
+            for f_idx, f_info in pending:
+                if cancel_event and cancel_event.is_set():
+                    break
+                if batched:
+                    download_url = resolved.get(f_idx)
+                    if not download_url:
+                        # prefetch_links swallows per-file errors; retry the
+                        # stragglers individually so one bad file is not fatal.
+                        print(f"  [{f_idx + 1}/{total_files}] Retrying link for: {f_info['name']}")
+                        download_url = resolve_link(f_info)
+                else:
+                    print(f"  [{f_idx + 1}/{total_files}] Generating link for: "
+                          f"{f_info['name']} ({f_info['size']})")
+                    download_url = resolve_link(f_info)
+
                 if not download_url:
                     prefetch_queue.put((f_idx, f_info, "fail", None))
                 else:
@@ -281,22 +326,16 @@ def download_files_pipeline(session, dest_dir, files_with_local_paths, max_paral
     return torrent_success
 
 
-def get_torrent_files_structure(token, url, target_torrent_name, browser_type='chromium', headless=True):
-    from torbox_downloader.browser_session import TorboxBrowserSession
-    session = TorboxBrowserSession(token, browser_type, headless, download_url=url)
-    session.start()
-    try:
-        files = session.fetch_structure(target_torrent_name)
-        return files
-    finally:
-        session.stop()
+def _is_http_session(session):
+    """True when the session is the browser-free API backend."""
+    return hasattr(session, "prefetch_links")
 
 
 def _profile_session_kwargs(profile):
-    """Turn a profile name into TorboxBrowserSession kwargs.
+    """Resolve a profile name into session kwargs.
 
     A profile's saved storage state carries a refresh token, so it is preferred
-    over any pasted token: the browser keeps itself signed in from then on.
+    over any pasted token: the session keeps itself signed in from then on.
     """
     if not profile:
         return {}
@@ -312,29 +351,56 @@ def _profile_session_kwargs(profile):
     return {"storage_state": state, "state_path": store.storage_path(profile)}
 
 
-def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S, profile=None):
+def _profile_api_kwargs(profile):
+    """Same idea as _profile_session_kwargs, for the HTTP backend."""
+    if not profile:
+        return {}
+    from torbox_downloader.profiles import ProfileStore
+    store = ProfileStore()
+    if not store.exists(profile):
+        print(f"[!] Unknown profile '{profile}'. Known: {', '.join(store.names()) or 'none'}")
+        return {}
+    if not store.has_state(profile):
+        print(f"[!] Profile '{profile}' has no saved session. Run: python main.py --login {profile}")
+        return {}
+    return {"profile": profile, "profile_store": store}
+
+
+def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=None, delay=5, file_scraped_callback=None, status_update_callback=None, target_torrent_name=None, max_parallel_files=1, selected_files=None, parallel_connections=True, cancel_event=None, session=None, disk_profile="auto", buffer_mb=None, browser_lock=None, browser_op_timeout=DEFAULT_BROWSER_OP_TIMEOUT_S, profile=None, fetch_backend="http", link_concurrency=6):
     """
     Runs the full automation workflow:
-    1. Launches/uses TorboxBrowserSession.
-    2. Navigates to the page and parses the structure.
+    1. Obtains a session (HTTP API or browser, per `fetch_backend`).
+    2. Lists torrents and resolves each one's file structure.
     3. Recreates folder structure locally.
     4. Automates parallel prefetching downloads.
     """
     local_session = None
     if session is None:
-        from torbox_downloader.browser_session import TorboxBrowserSession
-        print(f"Launching clean {browser_type} context...")
-        local_session = TorboxBrowserSession(token, browser_type, headless, download_url=url,
-                                             **_profile_session_kwargs(profile))
+        if fetch_backend == "http":
+            from torbox_downloader.api_session import TorboxApiSession
+            print("Using the TorBox API backend (no browser)...")
+            local_session = TorboxApiSession(token=token, link_concurrency=link_concurrency,
+                                             **_profile_api_kwargs(profile))
+        else:
+            from torbox_downloader.browser_session import TorboxBrowserSession
+            print(f"Launching clean {browser_type} context...")
+            local_session = TorboxBrowserSession(token, browser_type, headless, download_url=url,
+                                                 **_profile_session_kwargs(profile))
         local_session.start()
         session = local_session
 
+    # The HTTP backend has no page, so the "are we already on a file list?"
+    # probe below is meaningless for it and is skipped entirely.
+    http_backend = _is_http_session(session)
+
     try:
-        print("Analyzing current page state...")
-        # Try to parse structure directly (if we are on the files list page already)
-        html_content = session.get_page_content()
-        detector = TorboxDetector(html_content)
-        files = detector.parse_structure()
+        files = []
+        if not http_backend:
+            print("Analyzing current page state...")
+            # Try to parse structure directly (if we are on the files list page already)
+            html_content = session.get_page_content()
+            detector = TorboxDetector(html_content)
+            files = detector.parse_structure()
 
         # If no files are detected, we check if we are on the dashboard with torrent cards
         if not files:
@@ -430,11 +496,15 @@ def run_downloader(url, dest_dir, headless=True, browser_type='chromium', token=
 
         if not files:
             print("[!] Could not detect any matching/selected files on the page.")
-            print("Please make sure you are on the Torbox torrent download detail page (files list visible) and have valid file selections.")
-            debug_file = "torbox_debug.html"
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(session.get_page_content())
-            print(f"Saved page HTML to {debug_file} for debugging.")
+            if http_backend:
+                print("The HTTP backend found no files to download. The torrent may "
+                      "have been removed, or it may not be cached yet.")
+            else:
+                print("Please make sure you are on the Torbox torrent download detail page (files list visible) and have valid file selections.")
+                debug_file = "torbox_debug.html"
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    f.write(session.get_page_content())
+                print(f"Saved page HTML to {debug_file} for debugging.")
             return
 
         print(f"Detected {len(files)} matching/selected files and folder structures:")
@@ -591,6 +661,10 @@ if __name__ == '__main__':
     parser.add_argument('--write-buffer-mb', type=float, default=None, help="Size of the in-memory write buffer per download stream, in MB (default: 8 on SSD, 32 on HDD)")
     parser.add_argument('--profile', '-p', type=str, default=None, help="Account profile to use (profiles live in profiles/). Defaults to the last active one.")
     parser.add_argument('--login', type=str, nargs='?', const='', default=None, metavar="NAME", help="Sign in to a Torbox account and save it as NAME. Omit NAME to pick or create one interactively.")
+    parser.add_argument('--fetch-backend', type=str, default='http', choices=['http', 'browser'],
+                        help="How to reach TorBox. 'http' calls the TorBox API directly and needs no browser (default: http); 'browser' drives the site with Playwright.")
+    parser.add_argument('--link-concurrency', type=int, default=6,
+                        help="Parallel download-link requests when using the http backend (default: 6)")
     
     args = parser.parse_args()
 
@@ -618,7 +692,7 @@ if __name__ == '__main__':
     # Launch GUI by default unless --no-gui is specified
     if args.gui:
         from gui_server import start_gui_server
-        start_gui_server(token=token_val, dest_dir=args.dir, delay=args.delay, browser_type=args.browser, headless=args.headless, profile=args.profile)
+        start_gui_server(token=token_val, dest_dir=args.dir, delay=args.delay, browser_type=args.browser, headless=args.headless, profile=args.profile, fetch_backend=args.fetch_backend, link_concurrency=args.link_concurrency)
     else:
         run_downloader(
             url=args.url,
@@ -630,5 +704,7 @@ if __name__ == '__main__':
             max_parallel_files=args.parallel_files,
             disk_profile=args.disk_profile,
             buffer_mb=args.write_buffer_mb,
-            profile=args.profile
+            profile=args.profile,
+            fetch_backend=args.fetch_backend,
+            link_concurrency=args.link_concurrency
         )
