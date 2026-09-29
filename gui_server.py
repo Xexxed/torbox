@@ -562,6 +562,26 @@ class AppState:
         self._login_flow["message"] = "Cancelling..."
         return True
 
+    def import_profile_session(self, name, payload):
+        """Add an account from a pasted session JSON, with no browser involved.
+
+        Synchronous on purpose: parsing plus one verification round trip is fast,
+        so the modal gets a definite answer instead of another poll cycle. The
+        user still has to say *which* account they are signing into, so this
+        never silently replaces an existing profile.
+        """
+        if self._login_flow.get("active"):
+            raise RuntimeError("A sign-in is already in progress.")
+        from torbox_downloader.session_import import import_session
+
+        result = import_session(self.profiles, name, payload)
+        self.add_log(
+            f"[{time.strftime('%H:%M:%S')}] Added profile '{name}' from a pasted "
+            f"session: {result['message']}"
+        )
+        result["profiles"] = self.profiles.list()
+        return result
+
     def login_flow_snapshot(self):
         flow = self._login_flow
         return {"active": bool(flow["active"]), "message": flow["message"],
@@ -1518,6 +1538,26 @@ class GUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": str(e)})
                 return
             self._send_json({"success": True, "login": app_state.login_flow_snapshot()})
+            return
+
+        elif self.path.startswith("/api/profiles/import"):
+            name = str(params.get("name", "")).strip()
+            payload = params.get("payload")
+            if not name:
+                self._send_json({"success": False, "error": "A profile name is required."})
+                return
+            if not isinstance(payload, str) or not payload.strip():
+                self._send_json({"success": False, "error": "Paste the session JSON first."})
+                return
+            try:
+                result = app_state.import_profile_session(name, payload)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)})
+                return
+            self._send_json({"success": True, "message": result["message"],
+                             "email": result.get("email", ""),
+                             "has_refresh_token": result.get("has_refresh_token", False),
+                             "profiles": result["profiles"]})
             return
 
         elif self.path.startswith("/api/profiles/remove"):

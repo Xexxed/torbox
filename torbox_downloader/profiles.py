@@ -334,6 +334,58 @@ def _iter_session_values(state):
                 yield item["value"]
 
 
+def write_session(state, session):
+    """Write ``session`` into a storage state's TorBox origin, in place.
+
+    The single definition of *where* the session lives in a storage state,
+    shared by ``TokenManager``'s hourly write-back and by the paste importer so
+    an imported account and a browser-signed-in one converge on the same file.
+
+    The origin that already holds a session key is preferred over the TorBox
+    one, because relocating a working account's session between origins is a
+    change nobody asked for; a state with neither gets a fresh TorBox origin.
+    Returns the state.
+    """
+    if not isinstance(state, dict):
+        return state
+    origins = state.setdefault("origins", [])
+    text = json.dumps(session)
+
+    for key in SESSION_STORAGE_KEYS:
+        for origin in origins:
+            if not isinstance(origin, dict):
+                continue
+            for item in origin.get("localStorage") or []:
+                if isinstance(item, dict) and item.get("name") == key:
+                    item["value"] = text
+
+    target = None
+    for origin in origins:
+        if not isinstance(origin, dict):
+            continue
+        if not isinstance(origin.get("localStorage"), list):
+            continue
+        if any(isinstance(i, dict) and i.get("name") in SESSION_STORAGE_KEYS
+               for i in origin["localStorage"]):
+            target = origin
+            break
+        if origin.get("origin") == ORIGIN and target is None:
+            target = origin
+    if target is None:
+        target = next((o for o in origins
+                       if isinstance(o, dict) and "torbox" in str(o.get("origin", ""))), None)
+    if target is None:
+        target = {"origin": ORIGIN, "localStorage": []}
+        origins.append(target)
+    entries = target.setdefault("localStorage", [])
+
+    present = {i.get("name") for i in entries if isinstance(i, dict)}
+    for key in SESSION_STORAGE_KEYS:
+        if key not in present:
+            entries.append({"name": key, "value": text})
+    return state
+
+
 def extract_session(state):
     """Pull the Supabase session dict out of a storage state, if present."""
     for value in _iter_session_values(state):

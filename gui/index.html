@@ -493,6 +493,27 @@
                         <svg viewBox="0 0 24 24" width="16" height="16" class="btn-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
                         <span>Sign in</span>
                     </button>
+
+                    <!-- Second route into the same thing: no browser at all. -->
+                    <div class="add-profile-divider"><span>or</span></div>
+                    <button class="btn btn-secondary btn-large" style="width: 100%;" id="add-profile-import-toggle" onclick="toggleImportPanel()">
+                        Paste a session JSON instead
+                    </button>
+                    <div id="add-profile-import-panel" style="display: none; margin-top: 16px;">
+                        <p class="hint-text" style="margin-bottom: 12px;">
+                            In a browser already signed in to torbox.app, open
+                            <strong>DevTools &rarr; Application &rarr; Local Storage &rarr; https://torbox.app</strong>
+                            and copy the value of <code>sb-db-auth-token</code>. A full Playwright
+                            storage-state export also works.
+                        </p>
+                        <textarea id="session-json-input" spellcheck="false" autocomplete="off"
+                                  placeholder='{ "access_token": "eyJ...", "refresh_token": "..." }'></textarea>
+                        <div class="import-session-actions">
+                            <input type="file" id="session-json-file" accept=".json,.txt,application/json,text/plain" onchange="loadSessionJsonFile(this)" />
+                            <button class="btn btn-primary" style="flex: 1;" id="add-profile-import-btn" onclick="startImportProfile()">Import</button>
+                        </div>
+                        <p class="hint-text" id="add-profile-import-status" style="margin-top: 10px;"></p>
+                    </div>
                 </div>
 
                 <div id="add-progress-container" style="display: none; margin-top: 10px;">

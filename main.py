@@ -654,6 +654,53 @@ def run_login_wizard(name_hint="", browser="chromium", timeout_s=300.0):
     return 1
 
 
+def run_session_import(name, path=None):
+    """Add an account from a saved session JSON, with no browser involved.
+
+    The counterpart to ``run_login_wizard`` for a machine that cannot put a
+    human in front of a browser: feed it the JSON the signed-in page already
+    holds and it writes the same profile file the sign-in wizard would.
+
+    ``path`` is a file to read; without one the JSON is read from stdin, so
+    ``pbpaste | python main.py --import-session backup`` works. Returns a
+    process exit code.
+    """
+    from torbox_downloader.profiles import ProfileStore
+    from torbox_downloader.session_import import import_session
+
+    store = ProfileStore()
+    try:
+        if path:
+            # utf-8-sig, not utf-8: Windows editors and PowerShell's Out-File
+            # prepend a BOM, which would otherwise reach the parser.
+            with open(path, "r", encoding="utf-8-sig") as f:
+                payload = f.read()
+        elif not sys.stdin.isatty():
+            payload = sys.stdin.read()
+        else:
+            print("Give a file to read, or pipe the JSON in:\n"
+                  "  python main.py --import-session backup session.json\n"
+                  "  pbpaste | python main.py --import-session backup")
+            return 1
+    except OSError as e:
+        print("[!] Could not read the session: %s" % e)
+        return 1
+
+    try:
+        result = import_session(store, name, payload)
+    except Exception as e:
+        print("[!] %s" % e)
+        return 1
+
+    print("Saved profile '%s'%s. %s"
+          % (name, " (%s)" % result["email"] if result.get("email") else "",
+             result["message"]))
+    if not result["has_refresh_token"]:
+        print("[!] That session has no refresh token, so it stops working in about an hour.")
+    print("Use it with:  python main.py --profile %s" % name)
+    return 0
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Torbox Folder-Structure Downloader GUI")
     parser.add_argument('--url', type=str, default="https://torbox.app/download", help="URL of the Torbox download page (default: https://torbox.app/download)")
@@ -668,6 +715,9 @@ if __name__ == '__main__':
     parser.add_argument('--write-buffer-mb', type=float, default=None, help="Size of the in-memory write buffer per download stream, in MB (default: 8 on SSD, 32 on HDD)")
     parser.add_argument('--profile', '-p', type=str, default=None, help="Account profile to use (profiles live in profiles/). Defaults to the last active one.")
     parser.add_argument('--login', type=str, nargs='?', const='', default=None, metavar="NAME", help="Sign in to a Torbox account and save it as NAME. Omit NAME to pick or create one interactively.")
+    parser.add_argument('--import-session', type=str, nargs='*', default=None, metavar=("NAME", "FILE"),
+                        help="Add an account from a saved session JSON instead of signing in. "
+                             "Reads FILE, or stdin when it is piped.")
     parser.add_argument('--fetch-backend', type=str, default='http', choices=['http', 'browser'],
                         help="How to reach TorBox. 'http' calls the TorBox API directly and needs no browser (default: http); 'browser' drives the site with Playwright.")
     parser.add_argument('--link-concurrency', type=int, default=6,
@@ -682,6 +732,14 @@ if __name__ == '__main__':
     if args.login is not None:
         # `--login` with no NAME starts the interactive chooser.
         sys.exit(run_login_wizard(args.login, browser=args.browser))
+
+    # The browser-free equivalent: a session JSON the user already has.
+    if args.import_session is not None:
+        if not args.import_session:
+            print("--import-session needs a profile NAME.")
+            sys.exit(1)
+        sys.exit(run_session_import(args.import_session[0],
+                                    args.import_session[1] if len(args.import_session) > 1 else None))
 
     # Check for token file
     token_val = args.token

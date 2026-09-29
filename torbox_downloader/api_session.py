@@ -293,6 +293,24 @@ class TokenManager:
             self._profile_name, max(0.0, self._state[2] - time.time()) / 60.0,
         )
 
+    def session(self):
+        """The current session as a dict, in the shape TorBox stores it.
+
+        This is the canonical payload: ``session_import`` writes the very same
+        thing when it normalises a pasted session, so an imported account and a
+        browser-signed-in one are byte-for-byte equivalent after the first
+        rotation.
+        """
+        access, refresh, expires = self._state
+        if not access:
+            return None
+        return {
+            "access_token": access,
+            "refresh_token": refresh,
+            "expires_at": expires or jwt_expiry(access) or 0.0,
+            "token_type": "bearer",
+        }
+
     def _persist(self):
         """Write the rotated session back to the profile, atomically.
 
@@ -301,33 +319,15 @@ class TokenManager:
         """
         if self._profile_store is None or not self._profile_name:
             return
-        access, refresh, _ = self._state
-        if not access:
+        session = self.session()
+        if not session:
             return
         state = self._profile_store.load_state(self._profile_name)
         if not isinstance(state, dict):
             return
-        payload = json.dumps({
-            "access_token": access,
-            "refresh_token": refresh,
-            "expires_at": time.time() + 3600.0,
-            "token_type": "bearer",
-        })
-        for origin in state.get("origins") or []:
-            if not isinstance(origin, dict):
-                continue
-            entries = origin.get("localStorage")
-            if not isinstance(entries, list):
-                continue
-            touched = False
-            for item in entries:
-                if isinstance(item, dict) and item.get("name") in profiles_mod.SESSION_STORAGE_KEYS:
-                    item["value"] = payload
-                    touched = True
-            if not touched:
-                entries.append({"name": profiles_mod.SESSION_STORAGE_KEYS[0], "value": payload})
         try:
-            self._profile_store.save_state(self._profile_name, state)
+            self._profile_store.save_state(
+                self._profile_name, profiles_mod.write_session(state, session))
         except Exception as e:
             # A persistence failure must never abort a download; the in-memory
             # token is still valid for this run.

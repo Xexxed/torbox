@@ -402,6 +402,90 @@ body {
     box-shadow: var(--ring);
 }
 
+/* --- Paste-a-session alternative to the browser sign-in --- */
+
+.add-profile-divider {
+    align-items: center;
+    color: var(--text-secondary);
+    display: flex;
+    font-size: 11px;
+    gap: 12px;
+    letter-spacing: 0.06em;
+    margin: 18px 0 14px;
+    text-transform: uppercase;
+}
+
+.add-profile-divider::before,
+.add-profile-divider::after {
+    background: var(--border-color);
+    content: "";
+    flex: 1;
+    height: 1px;
+}
+
+#add-profile-import-panel textarea {
+    background: var(--bg-inset);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    box-sizing: border-box;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    height: 110px;
+    line-height: 1.5;
+    outline: none;
+    padding: 10px 12px;
+    resize: vertical;
+    width: 100%;
+    transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out;
+}
+
+#add-profile-import-panel textarea:focus {
+    border-color: rgba(4, 191, 138, 0.55);
+    box-shadow: var(--ring);
+}
+
+#add-profile-import-panel code {
+    color: var(--accent-emerald-bright);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+
+.import-session-actions {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+#add-profile-import-status {
+    min-height: 1em;
+}
+
+#add-profile-import-status.import-failed {
+    color: var(--accent-red);
+}
+
+#add-profile-import-status.import-ok {
+    color: var(--accent-emerald-bright);
+}
+
+/* An import that saved but cannot renew itself. It worked, but it will not
+   work again in an hour, and a green tick would hide that. */
+#add-profile-import-status.import-warn {
+    color: var(--accent-yellow);
+}
+
+/* The native file button is a poor fit for this panel, so only its label shows. */
+#session-json-file {
+    font-size: 11.5px;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+
 /* Sign-in progress: an indeterminate bar, since the wait is on a human. */
 #add-profile-progress-bar {
     background: linear-gradient(90deg, #069970, var(--accent-emerald-bright));

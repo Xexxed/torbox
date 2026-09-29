@@ -828,6 +828,7 @@ function openAddProfileModal() {
     document.getElementById('add-profile-setup').style.display = '';
     document.getElementById('add-progress-container').style.display = 'none';
     resetAddProfileProgress();
+    resetImportPanel();
     const input = document.getElementById('profile-name-input');
     if (input) input.value = '';
     // The overlay is hidden via opacity + pointer-events until `.active`
@@ -837,6 +838,96 @@ function openAddProfileModal() {
     modal.style.display = 'flex';
     setTimeout(() => modal.classList.add('active'), 10);
     if (input) input.focus();
+}
+
+/** Collapse the paste panel and drop whatever was typed into it. */
+function resetImportPanel() {
+    const panel = document.getElementById('add-profile-import-panel');
+    if (panel) panel.style.display = 'none';
+    const box = document.getElementById('session-json-input');
+    if (box) box.value = '';
+    const file = document.getElementById('session-json-file');
+    if (file) file.value = '';
+    const toggle = document.getElementById('add-profile-import-toggle');
+    if (toggle) toggle.textContent = 'Paste a session JSON instead';
+    setImportStatus('');
+}
+
+function toggleImportPanel() {
+    const panel = document.getElementById('add-profile-import-panel');
+    if (!panel) return;
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : '';
+    const toggle = document.getElementById('add-profile-import-toggle');
+    if (toggle) toggle.textContent = open ? 'Paste a session JSON instead' : 'Hide the paste box';
+    if (!open) {
+        setImportStatus('');
+        const box = document.getElementById('session-json-input');
+        if (box) box.focus();
+    }
+}
+
+function setImportStatus(message, kind) {
+    const status = document.getElementById('add-profile-import-status');
+    if (!status) return;
+    status.textContent = message || '';
+    status.classList.remove('import-failed', 'import-ok', 'import-warn');
+    if (message && kind) status.classList.add(kind);
+}
+
+/** Fill the paste box from a file, so a large export need not be pasted. */
+function loadSessionJsonFile(input) {
+    const file = input && input.files && input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        const box = document.getElementById('session-json-input');
+        if (box) box.value = String(reader.result || '');
+        setImportStatus(`Loaded ${file.name}.`, 'import-ok');
+    };
+    reader.onerror = () => setImportStatus(`Could not read ${file.name}.`, 'import-failed');
+    reader.readAsText(file);
+}
+
+/**
+ * Add an account from a pasted session rather than a browser sign-in.
+ *
+ * Shares the name field with the sign-in path, so the account is named the
+ * same way either way. The server verifies the session before saving it, so a
+ * stale paste comes back as a readable error rather than a broken account.
+ */
+function startImportProfile() {
+    const name = ((document.getElementById('profile-name-input') || {}).value || '').trim();
+    const payload = ((document.getElementById('session-json-input') || {}).value || '').trim();
+    if (!name) {
+        showToast('error', 'Name required', 'Give the account a short name first.');
+        return;
+    }
+    if (!payload) {
+        setImportStatus('Paste the session JSON first.', 'import-failed');
+        return;
+    }
+    const btn = document.getElementById('add-profile-import-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    setImportStatus('Verifying the session with TorBox…');
+    postForm('/api/profiles/import', { name, payload })
+        .then(data => {
+            if (!data.success) {
+                setImportStatus(data.error || 'That session could not be imported.', 'import-failed');
+                return;
+            }
+            // A payload with no refresh token is saved and works, but only for
+            // about an hour -- so it gets a warning colour, not a green tick.
+            const durable = data.has_refresh_token !== false;
+            setImportStatus(data.message || 'Imported.', durable ? 'import-ok' : 'import-warn');
+            showToast(durable ? 'success' : 'warning', 'Account added', data.message || '');
+            closeAddProfileModal();
+            fetchStatus();
+        })
+        .catch(err => setImportStatus(String(err), 'import-failed'))
+        .finally(() => {
+            if (btn) { btn.disabled = false; btn.textContent = 'Import'; }
+        });
 }
 
 /** Clear any previous failure state before a fresh attempt. */
@@ -858,6 +949,9 @@ function closeAddProfileModal() {
         modal.classList.remove('active');
         setTimeout(() => { modal.style.display = 'none'; }, 300);
     }
+    // A pasted session is a live credential: drop it as soon as the modal goes,
+    // rather than leaving it in the DOM until the next open.
+    resetImportPanel();
     if (profilePollTimer) { clearInterval(profilePollTimer); profilePollTimer = null; }
 }
 

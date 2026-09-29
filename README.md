@@ -127,6 +127,7 @@ with a one-time `api_key`, and runs the download pipeline in the background. Use
 | `--no-gui` | Run the CLI pipeline without the dashboard |
 | `--profile`, `-p` | Which account profile to use (default: the last active one) |
 | `--login NAME` | Open a browser, sign in once, and save that account as `NAME`, then exit |
+| `--import-session NAME [FILE]` | Save an account from a session JSON (stdin or `FILE`) instead, then exit |
 
 ## Accounts (profiles)
 
@@ -198,6 +199,43 @@ attaches to that instead, so you can also start Chrome yourself:
 Only if no real browser can be found does it fall back to launching its own
 Chrome / Edge / Chromium, which is the path Turnstile tends to block.
 `TORBOX_CDP_URL` overrides the attach target; `.chrome-debug/` is gitignored.
+
+### Adding an account without a browser
+
+If signing in from the machine is impractical, the account can be added by
+handing the app the session the browser already holds. Same profile file, same
+self-refreshing behaviour, no CDP and no Turnstile.
+
+**Paste cookies and it will not work.** TorBox signs in with Supabase, and the
+session lives in the page's *local storage*, not in a cookie. A dump of an
+account's cookies contains Cloudflare and analytics values and nothing that
+identifies a user. What identifies the user — and what carries the
+`refresh_token` — is this one value:
+
+> DevTools → **Application** → **Local Storage** → `https://torbox.app` →
+> `sb-db-auth-token` → copy the value
+
+The dashboard's **Add…** dialog has a **Paste a session JSON instead** box for
+exactly that, and a file picker for a large export. From a shell:
+
+```bash
+python main.py --import-session backup              # reads stdin
+python main.py --import-session backup session.json # or a file
+```
+
+Accepted shapes, in the order they are recognised: a full Playwright
+storage-state export (`{"cookies": [...], "origins": [...]}`), a local-storage
+map (`{"sb-db-auth-token": "..."}`), a bare Supabase session
+(`{"access_token": ..., "refresh_token": ...}`), and finally a bare JWT — which
+works but carries no refresh token, so it stops in about an hour and is labelled
+as such. Cookie lists and cookies.txt are parsed only to be **rejected with an
+explanation**, because accepting them would produce an account that appears to
+work and then dies.
+
+The session is checked against GoTrue *before* it is saved, so a stale paste
+fails immediately with the reason instead of becoming a broken account. A
+network failure is not treated as a bad paste: the import goes through and says
+it could not check.
 
 The refreshed session is written back while the app runs, so accounts stay signed
 in across restarts. A pre-existing `token.txt` is imported into the `default`
@@ -363,6 +401,16 @@ rules, so the rail cannot silently regress to a single horizontal band.
 `tests/test_profiles.py` covers the account store: name validation (a profile name
 becomes a filename, so path traversal is rejected), wrapping a Supabase session as
 storage state, the save/load round trip, and migration of a legacy `token.txt`.
+
+`tests/test_session_import.py` covers the pasted-session route: every accepted
+payload shape, and — the part that matters — that a cookie list, a cookies-only
+storage state and a cookies.txt body are all *refused with an explanation*
+rather than saved into an account that dies in an hour. It also pins that a
+rotation happening during verification lands in the saved file, that the
+account's email survives it, that a network failure does not block the import
+while a rejected token does, and that an imported profile then survives a normal
+`TokenManager` cycle. The last class drives the real request handler over
+loopback, through the real API-key gate.
 
 `tests/test_api_session.py` covers the HTTP backend against an injected fake transport and
 a temp directory: path derivation, the id-0 file that a truthiness check would drop, the
